@@ -1,0 +1,6 @@
+{
+  "name": "Paxth QA Engine",
+  "description": "Internal ecommerce catalog QA automation app for managing attribute sets and mapping rules.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

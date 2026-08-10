@@ -1,0 +1,38 @@
+--- server.ts
++++ server.ts
+@@ -49,6 +49,36 @@
+     }
+   });
+ 
++  // LLM Proxy endpoint to bypass CORS
++  app.post("/api/chat", async (req, res) => {
++    try {
++      const { baseUrl, apiKey, payload } = req.body;
++      if (!baseUrl || !payload) {
++        return res.status(400).json({ error: "baseUrl and payload are required" });
++      }
++
++      const response = await fetch(`${baseUrl}/chat/completions`, {
++        method: "POST",
++        headers: {
++          "Content-Type": "application/json",
++          ...(apiKey && { "Authorization": `Bearer ${apiKey}` })
++        },
++        body: JSON.stringify(payload)
++      });
++
++      if (!response.ok) {
++        const errorText = await response.text();
++        throw new Error(`LLM API returned ${response.status}: ${errorText}`);
++      }
++
++      const data = await response.json();
++      return res.json(data);
++    } catch (error: any) {
++      console.error("LLM Proxy error:", error.message);
++      return res.status(500).json({ error: "Failed to communicate with LLM API", details: error.message });
++    }
++  });
++
+   // Vite middleware for development
+   if (process.env.NODE_ENV !== "production") {
