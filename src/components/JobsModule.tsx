@@ -3,6 +3,15 @@ import { Play, StopCircle, CheckCircle, AlertCircle, Clock, Download, Eye, Trash
 import { useAppContext, Job } from "../context/AppContext";
 import { useSettings } from "../hooks/useSettings";
 import { useAttributeSets } from "../hooks/useAttributeSets";
+import {
+  getCommonAttributeSet,
+  getCommonHeaderOrder,
+  getCompletedJobSkuIds,
+  getExportColumns,
+  getJobRunStatus,
+  hasCompletedQa,
+  selectJobSkus,
+} from "../lib/jobRunState";
 import { cn } from "../lib/utils";
 import ExcelJS from "exceljs";
 import { saveAs } from "file-saver";
@@ -195,12 +204,12 @@ export function JobsModule() {
     
     for (const jobId of jobsToRun) {
       if (stopRequestedRef.current) break;
-      await runJob(jobId, true);
+      if (await runJob(jobId, true)) break;
     }
   };
 
-  const runJob = async (jobId: string, isSequential = false) => {
-    if (runningJobId && !isSequential) return;
+  const runJob = async (jobId: string, isSequential = false, skuId?: string): Promise<boolean> => {
+    if (runningJobId && !isSequential) return false;
     
     if (!settings.apiKey || !settings.baseUrl || !settings.modelName) {
       addNotification({
@@ -208,22 +217,23 @@ export function JobsModule() {
         title: "Missing API Settings",
         message: "Please configure LLM API settings in the LLM Settings module first."
       });
-      return;
+      return false;
     }
 
     const job = jobs.find(j => j.id === jobId);
-    if (!job) return;
+    if (!job) return false;
 
     setRunningJobId(jobId);
     setStopRequested(false);
     stopRequestedRef.current = false;
-    updateJob(jobId, { status: "running" });
+    await updateJob(jobId, { status: "running", error: null });
     
-    const allSkusInJob = job.skus.map(skuId => skuDataList.find(s => s.sku === skuId)).filter(Boolean) as any[];
-    const skusToProcess = allSkusInJob.filter(s => s.status !== "completed");
+    const allSkusInJob = job.skus.map((id) => skuDataList.find((sku) => sku.sku === id)).filter(Boolean) as typeof skuDataList;
+    const skusToProcess = selectJobSkus(allSkusInJob, skuId);
+    const processedSkuIds = new Set<string>();
     
     if (skusToProcess.length === 0) {
-      updateJob(jobId, { status: "completed" });
+      await updateJob(jobId, { status: "completed", error: null });
       addNotification({
         type: "info",
         title: "Job Already Completed",
@@ -232,7 +242,7 @@ export function JobsModule() {
       setRunningJobId(null);
       setStopRequested(false);
       stopRequestedRef.current = false;
-      return;
+      return false;
     }
     
     let currentIndex = 0;
@@ -262,7 +272,7 @@ export function JobsModule() {
           action: "Processing..."
         }));
         
-        updateSku(skuItem.sku, { status: "running" });
+        await updateSku(skuItem.sku, { status: "running", error: null });
         
         let attempts = 0;
         let success = false;
@@ -282,17 +292,17 @@ export function JobsModule() {
                 const data = await res.json();
                 if (res.ok) {
                   scrapedMarkdown = data.markdown;
-                  updateSku(skuItem.sku, { scraped_markdown: scrapedMarkdown, scrape_status: "success" });
+                  await updateSku(skuItem.sku, { scraped_markdown: scrapedMarkdown, scrape_status: "success" });
                 } else {
-                  updateSku(skuItem.sku, { scrape_status: "failed" });
+                  await updateSku(skuItem.sku, { scrape_status: "failed" });
                 }
               } catch (err) {
-                updateSku(skuItem.sku, { scrape_status: "failed" });
+                await updateSku(skuItem.sku, { scrape_status: "failed" });
               }
             }
             
             if (stopRequestedRef.current) {
-               updateSku(skuItem.sku, { status: "ready" });
+               await updateSku(skuItem.sku, { status: "ready" });
                break;
             }
 
@@ -513,7 +523,7 @@ ${skuItem.source.sap || "N/A"}`.trim();
               updated_at: new Date().toISOString()
             };
 
-            updateSku(skuItem.sku, { 
+            await updateSku(skuItem.sku, {
               status: qaResult.qa_status === "fail" ? "failed" : "completed", 
               raw_row: { ...skuItem.raw_row, qa_result: qaResult },
               qa_result: qaResult,
@@ -521,8 +531,9 @@ ${skuItem.source.sap || "N/A"}`.trim();
               last_job_id: job.id,
               tokensUsed,
               timeTaken: (skuItem.timeTaken || 0) + skuTimeTaken,
-              error: undefined
+              error: null
             });
+            processedSkuIds.add(skuItem.sku);
             
             totalJobTokens.prompt_tokens += tokensUsed.prompt_tokens || 0;
             totalJobTokens.completion_tokens += tokensUsed.completion_tokens || 0;
@@ -557,11 +568,12 @@ ${skuItem.source.sap || "N/A"}`.trim();
 
             if (attempts > maxRetries) {
               const skuTimeTaken = Date.now() - skuStartTime;
-              updateSku(skuItem.sku, { 
+              await updateSku(skuItem.sku, {
                 status: "failed",
                 timeTaken: (skuItem.timeTaken || 0) + skuTimeTaken,
                 error: errMsg
               });
+              processedSkuIds.add(skuItem.sku);
               hasError = true;
             } else {
               // Wait briefly before retrying, exponential backoff
@@ -593,27 +605,75 @@ ${skuItem.source.sap || "N/A"}`.trim();
     
     const jobTimeTaken = Date.now() - jobStartTime;
 
-    updateJob(jobId, { 
-      status: stopRequestedRef.current ? "pending" : (hasError ? "failed" : "completed"),
+    const wasStopped = stopRequestedRef.current;
+    const finalStatus = getJobRunStatus(allSkusInJob, processedSkuIds, hasError);
+    const finalError = finalStatus === "completed"
+      ? null
+      : finalStatus === "pending"
+        ? wasStopped
+          ? "Job stopped before all SKUs finished."
+          : "Some SKUs are still waiting to run."
+        : hasError
+          ? "Some SKUs failed to process."
+          : "Some SKUs still need attention.";
+
+    await updateJob(jobId, {
+      status: finalStatus,
       tokensUsed: finalTokens,
       timeTaken: (job.timeTaken || 0) + jobTimeTaken,
-      error: stopRequestedRef.current ? "Job stopped due to rate limit." : (hasError ? "Some SKUs failed to process." : undefined)
+      error: finalError
     });
     setRunningJobId(null);
     setStopRequested(false);
     stopRequestedRef.current = false;
     
     addNotification({
-      type: hasError ? "warning" : "success",
+      type: finalStatus === "completed" ? "success" : "warning",
       title: "Job Execution Finished",
-      message: `Job ${job.name} finished${hasError ? " with some errors" : " successfully"}.`
+      message: `Job ${job.name} ${finalStatus === "completed" ? "finished successfully" : finalStatus === "pending" ? wasStopped ? "was paused" : "still has SKUs to process" : "finished with some errors"}.`
     });
+    return wasStopped;
   };
 
-  const exportJobExcel = async (job: Job, issuesOnly: boolean = false) => {
+  const exportJobExcel = async (jobOrJobs: Job | Job[], issuesOnly: boolean = false) => {
     try {
-      let jobSkus = job.skus.map(s => skuDataList.find(item => item.sku === s)).filter(Boolean) as typeof skuDataList;
-      
+      const jobsToExport = (Array.isArray(jobOrJobs) ? jobOrJobs : [jobOrJobs])
+        .filter((job) => !Array.isArray(jobOrJobs) || job.status === "completed");
+      if (jobsToExport.length === 0) {
+        addNotification({
+          type: "warning",
+          title: "No Completed Jobs",
+          message: "Select at least one completed job to export."
+        });
+        return;
+      }
+
+      const skuIds = Array.isArray(jobOrJobs)
+        ? getCompletedJobSkuIds(jobsToExport)
+        : [...new Set(jobOrJobs.skus)];
+      const skuMap = new Map(skuDataList.map((sku) => [sku.sku, sku]));
+      const missingSkuIds = skuIds.filter((sku) => !skuMap.has(sku));
+      if (missingSkuIds.length > 0) {
+        addNotification({
+          type: "error",
+          title: "Export Failed",
+          message: `${missingSkuIds.length} SKU(s) no longer exist in the catalog: ${missingSkuIds.slice(0, 5).join(", ")}.`
+        });
+        return;
+      }
+
+      const allJobSkus = skuIds.map((sku) => skuMap.get(sku)!);
+      const attributeSet = getCommonAttributeSet(allJobSkus);
+      if (!attributeSet) {
+        addNotification({
+          type: "error",
+          title: "Cannot Export Jobs",
+          message: "The selected completed jobs contain multiple or missing attribute sets. All exported SKUs must use one non-empty attribute set."
+        });
+        return;
+      }
+
+      let jobSkus = allJobSkus;
       if (issuesOnly) {
         jobSkus = jobSkus.filter(sku => {
           const qa = sku.qa_result || (sku.raw_row && sku.raw_row.qa_result);
@@ -629,17 +689,18 @@ ${skuItem.source.sap || "N/A"}`.trim();
         return;
       }
 
+      const headerOrder = getCommonHeaderOrder(jobSkus);
+      if (!headerOrder || headerOrder.headers.length === 0) {
+        addNotification({
+          type: "error",
+          title: "Header Mismatch",
+          message: "The selected SKU files do not have the same original header order and cannot be exported together."
+        });
+        return;
+      }
+
       const workbook = new ExcelJS.Workbook();
       const sheet = workbook.addWorksheet(`QA Results`);
-
-      const originalHeaders = new Set<string>();
-      jobSkus.forEach(sku => {
-        if (sku.raw_row) {
-          Object.keys(sku.raw_row).forEach(k => {
-            if (k !== 'qa_result') originalHeaders.add(k);
-          });
-        }
-      });
 
       let maxIssues = 0;
       jobSkus.forEach(sku => {
@@ -649,22 +710,14 @@ ${skuItem.source.sap || "N/A"}`.trim();
         }
       });
 
-      const columns = Array.from(originalHeaders).map(h => ({ header: h, key: h, width: 20 }));
-      
-      const qaColumns = [
-        { header: 'qa_status', key: 'qa_status', width: 15 },
-        { header: 'qa_scrape_status', key: 'qa_scrape_status', width: 20 },
-        { header: 'job_error', key: 'job_error', width: 40 }
-      ];
-
-      for (let i = 1; i <= maxIssues; i++) {
-        qaColumns.push({ header: `Error ${i}`, key: `error_${i}`, width: 60 });
-      }
-
-      sheet.columns = [...columns, ...qaColumns] as any;
+      sheet.columns = getExportColumns(headerOrder.headers, maxIssues);
 
       jobSkus.forEach((sku) => {
-        const rowData: Record<string, any> = { ...(sku.raw_row || {}) };
+        const rowData: Record<string, any> = {};
+        headerOrder.headers.forEach((header, index) => {
+          const value = sku.raw_row?.[header];
+          rowData[`input_${index}`] = typeof value === "object" && value !== null ? JSON.stringify(value) : value;
+        });
         const qa = sku.qa_result || (sku.raw_row && sku.raw_row.qa_result);
         
         if (qa) {
@@ -682,16 +735,7 @@ ${skuItem.source.sap || "N/A"}`.trim();
         rowData.qa_scrape_status = sku.scrape_status;
         rowData.job_error = sku.error || '';
 
-        const cleanRowData: Record<string, any> = {};
-        Object.keys(rowData).forEach(key => {
-          if (typeof rowData[key] === 'object' && rowData[key] !== null) {
-            cleanRowData[key] = JSON.stringify(rowData[key]);
-          } else {
-            cleanRowData[key] = rowData[key];
-          }
-        });
-
-        const row = sheet.addRow(cleanRowData);
+        const row = sheet.addRow(rowData);
         
         if (qa && qa.issues && Array.isArray(qa.issues)) {
           qa.issues.forEach((issue: any, index: number) => {
@@ -714,7 +758,7 @@ ${skuItem.source.sap || "N/A"}`.trim();
                }
             }
 
-            const originalColIndex = sheet.columns.findIndex((c: any) => c.key === field);
+            const originalColIndex = headerOrder.headers.indexOf(field);
             if (originalColIndex >= 0) {
                const originalCell = row.getCell(originalColIndex + 1);
                originalCell.fill = {
@@ -731,13 +775,16 @@ ${skuItem.source.sap || "N/A"}`.trim();
       
       const buffer = await workbook.xlsx.writeBuffer();
       const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-      const filename = `${job.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_QA_Results.xlsx`;
+      const exportName = jobsToExport.length === 1 ? jobsToExport[0].name : `${attributeSet}_Combined`;
+      const filename = `${exportName.replace(/[^a-zA-Z0-9_-]/g, '_')}_QA_Results.xlsx`;
       saveAs(blob, filename);
 
       addNotification({
-        type: "success",
-        title: "Excel Exported",
-        message: `Successfully exported QA results for ${job.name}.`
+        type: headerOrder.legacy ? "warning" : "success",
+        title: headerOrder.legacy ? "Excel Exported with Header Warning" : "Excel Exported",
+        message: headerOrder.legacy
+          ? `Exported ${jobSkus.length} SKU(s), but exact header order cannot be guaranteed for legacy uploads.`
+          : `Successfully exported ${jobSkus.length} SKU(s) from ${jobsToExport.length} job(s).`
       });
       
     } catch(e) {
@@ -748,6 +795,19 @@ ${skuItem.source.sap || "N/A"}`.trim();
         message: "Failed to generate Excel file for job."
       });
     }
+  };
+
+  const exportSelectedJobs = () => {
+    const completedJobs = jobs.filter((job) => selectedJobs.has(job.id) && job.status === "completed");
+    if (completedJobs.length === 0) {
+      addNotification({
+        type: "warning",
+        title: "No Completed Jobs",
+        message: "Select at least one completed job to export."
+      });
+      return;
+    }
+    void exportJobExcel(completedJobs);
   };
 
   const getJobSkusList = (job: Job) => {
@@ -778,7 +838,10 @@ ${skuItem.source.sap || "N/A"}`.trim();
                   </p>
                 </div>
                 <button
-                  onClick={() => setStopRequested(true)}
+                  onClick={() => {
+                    setStopRequested(true);
+                    stopRequestedRef.current = true;
+                  }}
                   disabled={stopRequested}
                   className="flex items-center gap-2 px-4 py-2 text-[10px] uppercase font-bold text-red-600 border border-red-200 hover:bg-red-50 transition-colors rounded-sm bg-white disabled:opacity-50"
                 >
@@ -820,14 +883,23 @@ ${skuItem.source.sap || "N/A"}`.trim();
               )}
             </div>
             {selectedJobs.size > 0 && (
-              <button
-                onClick={runSelectedJobs}
-                disabled={!!runningJobId}
-                className="flex items-center gap-2 px-4 py-2 text-[11px] uppercase tracking-widest border border-[#1A1A1A] bg-[#1A1A1A] text-white hover:bg-black transition-colors rounded-sm disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <Play className="w-3.5 h-3.5" />
-                Run Selected ({selectedJobs.size})
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={exportSelectedJobs}
+                  className="flex items-center gap-2 px-4 py-2 text-[11px] uppercase tracking-widest border border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 transition-colors rounded-sm"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  Export Selected ({selectedJobs.size})
+                </button>
+                <button
+                  onClick={runSelectedJobs}
+                  disabled={!!runningJobId}
+                  className="flex items-center gap-2 px-4 py-2 text-[11px] uppercase tracking-widest border border-[#1A1A1A] bg-[#1A1A1A] text-white hover:bg-black transition-colors rounded-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  Run Selected ({selectedJobs.size})
+                </button>
+              </div>
             )}
           </div>
 
@@ -839,8 +911,7 @@ ${skuItem.source.sap || "N/A"}`.trim();
             )}
             {jobs.map((job) => {
               const jobSkus = getJobSkusList(job);
-              const completedCount = jobSkus.filter(s => s.status === 'completed').length;
-              const hasResults = completedCount > 0 || job.status === 'completed';
+              const completedCount = jobSkus.filter(hasCompletedQa).length;
 
               return (
                 <div key={job.id} className="bg-white border border-[#E5E2DE] rounded-sm p-5 flex items-center shadow-sm hover:border-[#1A1A1A]/30 transition-all gap-4">
@@ -895,17 +966,17 @@ ${skuItem.source.sap || "N/A"}`.trim();
                   </div>
 
                   <div className="flex items-center gap-2">
-                    {hasResults && (
-                      <>
-                        <button
-                          onClick={() => setSelectedJobToView(job)}
-                          className="flex items-center gap-1.5 px-3 py-2 text-[11px] uppercase font-bold text-[#1A1A1A] bg-[#F5F2EF] hover:bg-[#E5E2DE] transition-colors rounded-sm"
-                          title="View Outlined Issues & Breakdown"
-                        >
-                          <Eye className="w-3.5 h-3.5" />
-                          View Results
-                        </button>
+                    <button
+                      onClick={() => setSelectedJobToView(job)}
+                      className="flex items-center gap-1.5 px-3 py-2 text-[11px] uppercase font-bold text-[#1A1A1A] bg-[#F5F2EF] hover:bg-[#E5E2DE] transition-colors rounded-sm"
+                      title="View job details"
+                    >
+                      <Eye className="w-3.5 h-3.5" />
+                      View Job
+                    </button>
 
+                    {completedCount > 0 && (
+                      <>
                         <button
                           onClick={() => exportJobExcel(job)}
                           className="flex items-center gap-1.5 px-3 py-2 text-[11px] uppercase tracking-widest font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 transition-colors rounded-sm shadow-sm"
@@ -937,6 +1008,11 @@ ${skuItem.source.sap || "N/A"}`.trim();
 
                     <button
                       onClick={() => {
+                        setSelectedJobs((selected) => {
+                          const next = new Set(selected);
+                          next.delete(job.id);
+                          return next;
+                        });
                         removeJob(job.id);
                         addNotification({
                           type: "info",
@@ -968,7 +1044,7 @@ ${skuItem.source.sap || "N/A"}`.trim();
                 <div className="flex items-center gap-3">
                   <h3 className="font-serif text-2xl text-[#1A1A1A]">{selectedJobToView.name}</h3>
                   <span className="px-2 py-0.5 text-[10px] uppercase font-bold tracking-widest rounded-sm bg-emerald-100 text-emerald-900">
-                    QA Results
+                    Job Details
                   </span>
                 </div>
                 <p className="text-[11px] font-mono text-[#8C8882] mt-1 flex gap-3">
@@ -1050,6 +1126,17 @@ ${skuItem.source.sap || "N/A"}`.trim();
                       </div>
 
                       <div className="flex items-center gap-3">
+                        <button
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            runJob(selectedJobToView.id, false, sku.sku);
+                          }}
+                          disabled={!!runningJobId}
+                          className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold text-[#1A1A1A] bg-[#F5F2EF] hover:bg-[#E5E2DE] transition-colors rounded-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <Play className="w-3 h-3" />
+                          Rerun Q.A
+                        </button>
                         <span className="text-xs text-[#8C8882] italic max-w-xs truncate">
                           {qa?.summary || 'No QA run yet'}
                         </span>
@@ -1142,4 +1229,3 @@ ${skuItem.source.sap || "N/A"}`.trim();
     </div>
   );
 }
-

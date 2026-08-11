@@ -10,6 +10,7 @@ export interface SkuData {
     sap?: string;
     url?: string;
     fileName?: string;
+    headerOrder?: string[];
   };
   raw_row: Record<string, any>;
   status: QAStatus;
@@ -22,7 +23,7 @@ export interface SkuData {
     total_tokens: number;
   };
   timeTaken?: number;
-  error?: string;
+  error?: string | null;
   qa_result?: Record<string, any>;
   export_data?: Record<string, any>;
   last_job_id?: string;

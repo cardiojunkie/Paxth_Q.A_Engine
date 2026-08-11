@@ -5,7 +5,8 @@ import axios from "axios";
 import * as cheerio from "cheerio";
 import TurndownService from "turndown";
 import { launch } from "cloakbrowser";
-import { createServer as createViteServer } from "vite";
+import { captureDynamicTabs } from "./src/lib/captureDynamicTabs.js";
+import { isCompleteWebsiteDomain, normalizeWebsite } from "./src/lib/siteSelectorWebsite.js";
 import { db } from "./src/db/index.js";
 import { skuData, attributeSets, jobs, siteSelectors } from "./src/db/schema.js";
 import { eq, inArray, sql } from "drizzle-orm";
@@ -44,16 +45,15 @@ async function startServer() {
 
   // Auto-migrate tables on start
   if (db) {
-    (async () => {
-      const runMigrate = async (query: any) => {
-        try {
-          await db.execute(query);
-        } catch (e: any) {
-          // ignore migration step if constraint or column already modified
-        }
-      };
+    const runMigrate = async (query: any) => {
+      try {
+        await db.execute(query);
+      } catch (e: any) {
+        // ignore migration step if constraint or column already modified
+      }
+    };
 
-      await runMigrate(sql`
+    await runMigrate(sql`
         CREATE TABLE IF NOT EXISTS jobs (
           id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
@@ -65,21 +65,36 @@ async function startServer() {
           time_taken INTEGER,
           error TEXT
         );
-      `);
-      await runMigrate(sql`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_attribute_set_id_attribute_sets_id_fk;`);
-      await runMigrate(sql`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_attribute_set_id_fkey;`);
-      await runMigrate(sql`ALTER TABLE jobs ALTER COLUMN created_at TYPE TEXT USING created_at::text;`);
-      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attribute_set TEXT;`);
-      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS skus JSONB;`);
-      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';`);
-      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tokens_used JSONB;`);
-      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS time_taken INTEGER;`);
-      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS error TEXT;`);
-      await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS qa_result JSONB;`);
-      await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS export_data JSONB;`);
-      await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS last_job_id TEXT;`);
-      console.log("Database schema initialized.");
-    })();
+    `);
+    await runMigrate(sql`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_attribute_set_id_attribute_sets_id_fk;`);
+    await runMigrate(sql`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_attribute_set_id_fkey;`);
+    await runMigrate(sql`ALTER TABLE jobs ALTER COLUMN created_at TYPE TEXT USING created_at::text;`);
+    await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attribute_set TEXT;`);
+    await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS skus JSONB;`);
+    await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';`);
+    await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tokens_used JSONB;`);
+    await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS time_taken INTEGER;`);
+    await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS error TEXT;`);
+    await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS qa_result JSONB;`);
+    await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS export_data JSONB;`);
+    await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS last_job_id TEXT;`);
+    await runMigrate(sql`
+        CREATE TABLE IF NOT EXISTS site_selectors (
+          id TEXT PRIMARY KEY,
+          website TEXT NOT NULL,
+          selectors TEXT NOT NULL,
+          tab_selector TEXT,
+          tab_content_selector TEXT,
+          tab_wait_ms INTEGER,
+          enabled BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+    `);
+    await runMigrate(sql`ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_selector TEXT;`);
+    await runMigrate(sql`ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_content_selector TEXT;`);
+    await runMigrate(sql`ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_wait_ms INTEGER;`);
+    console.log("Database schema initialized.");
   }
 
   // --- SKU Data Endpoints ---
@@ -315,6 +330,116 @@ async function startServer() {
     }
   });
 
+  // --- Site Selector Endpoints ---
+  const matchesWebsite = (hostname: string, website: string) => {
+    const host = hostname.replace(/^www\./, "");
+    const prefix = normalizeWebsite(website);
+    return host === prefix || host.endsWith(`.${prefix}`);
+  };
+
+  const mapSiteSelector = (rule: typeof siteSelectors.$inferSelect) => ({
+    id: rule.id,
+    website: normalizeWebsite(rule.website),
+    selectors: rule.selectors,
+    tabSelector: rule.tabSelector || undefined,
+    tabContentSelector: rule.tabContentSelector || undefined,
+    tabWaitMs: rule.tabWaitMs ?? 300,
+    enabled: rule.enabled,
+    createdAt: rule.createdAt.getTime(),
+    updatedAt: rule.updatedAt.getTime(),
+  });
+
+  const parseSiteSelectorInput = (body: any) => {
+    const websiteInput = String(body?.website || "");
+    const website = normalizeWebsite(websiteInput);
+    const selectors = String(body?.selectors || "").trim();
+    const tabSelector = String(body?.tabSelector || "").trim() || null;
+    const tabContentSelector = String(body?.tabContentSelector || "").trim() || null;
+    const tabWaitMs = body?.tabWaitMs === undefined || body?.tabWaitMs === ""
+      ? 300
+      : Number(body.tabWaitMs);
+    let error = "";
+    if (!websiteInput.trim() || !selectors) error = "website and selectors are required";
+    else if (!isCompleteWebsiteDomain(websiteInput)) error = "website must be a complete domain, for example tcl.com";
+    else if (Boolean(tabSelector) !== Boolean(tabContentSelector)) {
+      error = "tabSelector and tabContentSelector must be provided together";
+    } else if (!Number.isInteger(tabWaitMs) || tabWaitMs < 0 || tabWaitMs > 10000) {
+      error = "tabWaitMs must be an integer from 0 to 10000";
+    }
+    return { website, selectors, tabSelector, tabContentSelector, tabWaitMs, error };
+  };
+
+  app.get("/api/site-selectors", async (req, res) => {
+    if (!db) return res.status(503).json({ error: "DB not connected" });
+    try {
+      res.json((await db.select().from(siteSelectors)).map(mapSiteSelector));
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/site-selectors", async (req, res) => {
+    if (!db) return res.status(503).json({ error: "DB not connected" });
+    const input = parseSiteSelectorInput(req.body);
+    if (!req.body?.id) return res.status(400).json({ error: "id is required" });
+    if (input.error) return res.status(400).json({ error: input.error });
+    try {
+      const now = new Date();
+      const duplicate = (await db.select().from(siteSelectors))
+        .find(rule => normalizeWebsite(rule.website) === input.website);
+      if (duplicate) return res.status(409).json({ error: `A rule for ${input.website} already exists` });
+      const rule = {
+        id: req.body.id,
+        website: input.website,
+        selectors: input.selectors,
+        tabSelector: input.tabSelector,
+        tabContentSelector: input.tabContentSelector,
+        tabWaitMs: input.tabWaitMs,
+        enabled: req.body.enabled !== false,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await db.insert(siteSelectors).values(rule);
+      res.status(201).json(mapSiteSelector(rule));
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.put("/api/site-selectors/:id", async (req, res) => {
+    if (!db) return res.status(503).json({ error: "DB not connected" });
+    const input = parseSiteSelectorInput(req.body);
+    if (input.error) return res.status(400).json({ error: input.error });
+    try {
+      const duplicate = (await db.select().from(siteSelectors))
+        .find(rule => rule.id !== req.params.id && normalizeWebsite(rule.website) === input.website);
+      if (duplicate) return res.status(409).json({ error: `A rule for ${input.website} already exists` });
+      const [updated] = await db.update(siteSelectors).set({
+        website: input.website,
+        selectors: input.selectors,
+        tabSelector: input.tabSelector,
+        tabContentSelector: input.tabContentSelector,
+        tabWaitMs: input.tabWaitMs,
+        enabled: req.body.enabled !== false,
+        updatedAt: new Date(),
+      }).where(eq(siteSelectors.id, req.params.id)).returning();
+      if (!updated) return res.status(404).json({ error: "Site selector rule not found" });
+      res.json(mapSiteSelector(updated));
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete("/api/site-selectors/:id", async (req, res) => {
+    if (!db) return res.status(503).json({ error: "DB not connected" });
+    try {
+      await db.delete(siteSelectors).where(eq(siteSelectors.id, req.params.id));
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // Scraping endpoint
   app.post("/api/scrape", async (req, res) => {
     try {
@@ -333,6 +458,19 @@ async function startServer() {
         return res.status(400).json({ error: "Invalid URL provided", details: url });
       }
 
+      const hostname = new URL(url).hostname.toLowerCase();
+      let selectorRule: typeof siteSelectors.$inferSelect | undefined;
+      if (db) {
+        try {
+          selectorRule = (await db.select().from(siteSelectors))
+            .filter(rule => rule.enabled && matchesWebsite(hostname, rule.website))
+            .sort((a, b) => normalizeWebsite(b.website).length - normalizeWebsite(a.website).length)[0];
+        } catch (e: any) {
+          console.error("Failed to load site selectors:", e.message);
+          return res.status(500).json({ error: "Failed to load site selector rules", details: e.message });
+        }
+      }
+
       let browser;
       try {
         // Fetch HTML with CloakBrowser
@@ -348,6 +486,24 @@ async function startServer() {
         } catch (e) {
           // Ignore timeout on networkidle
         }
+
+        if (selectorRule && Boolean(selectorRule.tabSelector) !== Boolean(selectorRule.tabContentSelector)) {
+          return res.status(422).json({ error: `Incomplete tab selector configuration for ${selectorRule.website}` });
+        }
+        if (selectorRule?.tabSelector && selectorRule.tabContentSelector) {
+          try {
+            await captureDynamicTabs(page, {
+              tabSelector: selectorRule.tabSelector,
+              panelSelector: selectorRule.tabContentSelector,
+              waitMs: selectorRule.tabWaitMs ?? 300,
+            });
+          } catch (error: any) {
+            return res.status(422).json({
+              error: `Could not capture specification tabs for ${selectorRule.website}`,
+              details: error.message || String(error),
+            });
+          }
+        }
         
         const html = await page.content();
         
@@ -356,8 +512,17 @@ async function startServer() {
         // Remove irrelevant elements
         $('header, footer, nav, aside, script, style, noscript, svg, [role="banner"], [role="contentinfo"], .related-products, .recommendations, .cookie-banner, .ads').remove();
 
-        // Get cleaned HTML
-        const cleanHtml = $.html();
+        let cleanHtml = $.html();
+        if (selectorRule) {
+          let selected;
+          try {
+            selected = $(selectorRule.selectors);
+          } catch {
+            return res.status(422).json({ error: `Invalid selector for ${selectorRule.website}` });
+          }
+          if (!selected.length) return res.status(422).json({ error: `Selector matched no content for ${selectorRule.website}` });
+          cleanHtml = selected.toString();
+        }
 
         // Convert to Markdown
         const turndownService = new TurndownService({
@@ -496,6 +661,7 @@ async function startServer() {
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",

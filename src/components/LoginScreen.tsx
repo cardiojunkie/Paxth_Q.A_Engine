@@ -56,8 +56,8 @@ export function LoginScreen() {
             P
           </div>
           <div>
-            <span className="font-serif italic text-xl tracking-tight text-[#1A1A1A]">Paxth QA Engine</span>
-            <span className="text-[10px] uppercase tracking-widest text-[#8C8882] block">Catalog QA & Automation</span>
+            <span className="font-serif italic text-xl tracking-tight text-[#1A1A1A]">Project 22</span>
+            <span className="text-[10px] uppercase tracking-widest text-[#8C8882] block">By Paxth Automation Solutions</span>
           </div>
         </div>
 

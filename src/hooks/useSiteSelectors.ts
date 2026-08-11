@@ -3,32 +3,7 @@ import { SiteSelectorRule } from "../types";
 
 const STORAGE_KEY = "qa-analyzer-site-selectors";
 
-export const DEFAULT_SITE_RULES: SiteSelectorRule[] = [
-  {
-    id: "rule-samsung-default",
-    website: "www.samsung.",
-    selectors: ".product-details, #specifications, .spec-table, .pdp-summary, div[class*='spec'], div[class*='feature']",
-    enabled: true,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  },
-  {
-    id: "rule-amazon-default",
-    website: "amazon.",
-    selectors: "#productDetails_db_sections, #techSpecSection, #feature-bullets, #productDescription",
-    enabled: true,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  },
-  {
-    id: "rule-apple-default",
-    website: "apple.com",
-    selectors: ".techspecs-section, .section-content, .overview-specs",
-    enabled: true,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  }
-];
+export const DEFAULT_SITE_RULES: SiteSelectorRule[] = [];
 
 export function useSiteSelectors() {
   const [rules, setRules] = useState<SiteSelectorRule[]>(() => {
@@ -58,7 +33,7 @@ export function useSiteSelectors() {
         return res.json();
       })
       .then((data) => {
-        if (isMounted && Array.isArray(data) && data.length > 0) {
+        if (isMounted && Array.isArray(data)) {
           setRules(data);
           localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
         }
@@ -91,59 +66,44 @@ export function useSiteSelectors() {
       updatedAt: Date.now(),
     };
 
-    setRules((prev) => [created, ...prev]);
-
     try {
-      await fetch("/api/site-selectors", {
+      const response = await fetch("/api/site-selectors", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(created),
       });
+      const saved = await response.json();
+      if (!response.ok) throw new Error(saved.error || "Failed to save site selector rule");
+      setRules((prev) => [saved, ...prev]);
     } catch (e) {
       console.error("Failed to save site selector rule to DB", e);
+      throw e;
     }
 
     return created;
   }, []);
 
   const updateRule = useCallback(async (id: string, updates: Partial<SiteSelectorRule>) => {
-    setRules((prev) =>
-      prev.map((r) => (r.id === id ? { ...r, ...updates, updatedAt: Date.now() } : r))
-    );
-
     try {
-      await fetch(`/api/site-selectors/${id}`, {
+      const response = await fetch(`/api/site-selectors/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(updates),
       });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Failed to update site selector rule");
+      setRules((prev) => prev.map((rule) => rule.id === id ? data : rule));
+      return data as SiteSelectorRule;
     } catch (e) {
       console.error("Failed to update site selector rule in DB", e);
+      throw e;
     }
   }, []);
 
   const toggleRule = useCallback(async (id: string) => {
-    let newEnabledState = true;
-    setRules((prev) =>
-      prev.map((r) => {
-        if (r.id === id) {
-          newEnabledState = !r.enabled;
-          return { ...r, enabled: newEnabledState, updatedAt: Date.now() };
-        }
-        return r;
-      })
-    );
-
-    try {
-      await fetch(`/api/site-selectors/${id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: newEnabledState }),
-      });
-    } catch (e) {
-      console.error("Failed to toggle site selector rule in DB", e);
-    }
-  }, []);
+    const rule = rules.find((item) => item.id === id);
+    if (rule) await updateRule(id, { ...rule, enabled: !rule.enabled });
+  }, [rules, updateRule]);
 
   const deleteRule = useCallback(async (id: string) => {
     setRules((prev) => prev.filter((r) => r.id !== id));

@@ -67,7 +67,7 @@ function MainLayout() {
     <div className="h-screen w-full bg-[#FDFCFB] flex flex-col font-sans text-[#1A1A1A] overflow-hidden">
       <nav className="h-20 border-b border-[#E5E2DE] px-8 sm:px-10 flex items-center justify-between shrink-0 bg-white">
         <div className="flex flex-col justify-center">
-          <span className="font-serif italic text-2xl tracking-tight leading-none">Paxth QA Engine</span>
+          <span className="font-serif italic text-2xl tracking-tight leading-none">Project 22</span>
           <div className="flex items-center gap-1.5 mt-1">
             <span className={cn(
               "w-2 h-2 rounded-full inline-block transition-all",

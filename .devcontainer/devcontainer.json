@@ -1,6 +1,10 @@
 {
   "name": "Ecommerce Catalogue QA Automation Platform",
-  "image": "mcr.microsoft.com/devcontainers/javascript-node:1-20-bullseye",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": "..",
+    "target": "system"
+  },
   "customizations": {
     "vscode": {
       "settings": {

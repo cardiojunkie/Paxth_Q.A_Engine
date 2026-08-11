@@ -5,6 +5,7 @@ import ExcelJS from "exceljs";
 import { saveAs } from "file-saver";
 import { useAppContext, Job } from "../context/AppContext";
 import { SkuData, QAStatus } from "../hooks/useCatalogData";
+import { getCommonAttributeSet } from "../lib/jobRunState";
 import { cn } from "../lib/utils";
 
 type FilterType = "all" | "ready" | "cannot_qa" | "completed" | "failed";
@@ -78,6 +79,7 @@ export function DashboardModule() {
     setIsScraping(true);
     const skusToProcess = skuDataList.filter(s => selectedSkus.has(s.sku));
     const failedSkus: string[] = [];
+    const scrapeErrors: string[] = [];
     
     setScrapeProgress({ current: 0, total: skusToProcess.length });
     
@@ -96,12 +98,16 @@ export function DashboardModule() {
           if (res.ok) {
             updateSku(skuItem.sku, { scraped_markdown: data.markdown, scrape_status: "success" });
           } else {
-            updateSku(skuItem.sku, { scrape_status: "failed" });
+            const error = data.error || "Scraping failed";
+            updateSku(skuItem.sku, { scrape_status: "failed", error });
             failedSkus.push(skuItem.sku);
+            scrapeErrors.push(`${skuItem.sku}: ${error}`);
           }
-        } catch (err) {
-          updateSku(skuItem.sku, { scrape_status: "failed" });
+        } catch (err: any) {
+          const error = err.message || "Scraping failed";
+          updateSku(skuItem.sku, { scrape_status: "failed", error });
           failedSkus.push(skuItem.sku);
+          scrapeErrors.push(`${skuItem.sku}: ${error}`);
         }
       } else {
         updateSku(skuItem.sku, { scrape_status: "skipped_no_url" });
@@ -117,7 +123,7 @@ export function DashboardModule() {
       addNotification({
         type: "warning",
         title: "Scraping Complete with Errors",
-        message: `${failedSkus.length} URL(s) could not be scraped automatically.`
+        message: `${failedSkus.length} URL(s) could not be scraped automatically. ${scrapeErrors[0] || ""}`
       });
     } else {
       addNotification({
@@ -132,6 +138,17 @@ export function DashboardModule() {
     if (selectedSkus.size === 0) return;
     
     const skusToProcess = skuDataList.filter(s => selectedSkus.has(s.sku));
+    const attributeSet = getCommonAttributeSet(skusToProcess);
+
+    if (!attributeSet) {
+      const selectedSets = [...new Set(skusToProcess.map((sku) => sku.attribute_set?.trim() ? sku.attribute_set : "(missing)"))];
+      addNotification({
+        type: "error",
+        title: "Cannot Create Job",
+        message: `Selected SKUs contain multiple or missing attribute sets (${selectedSets.join(", ")}). Choose SKUs with one non-empty attribute set.`
+      });
+      return;
+    }
     
     const invalidSkus = skusToProcess.filter(s => !s.scraped_markdown && !s.source.sap);
     
@@ -155,40 +172,22 @@ export function DashboardModule() {
       return;
     }
 
-    const grouped = skusToProcess.reduce((acc, sku) => {
-      const set = sku.attribute_set || "Uncategorized";
-      if (!acc[set]) acc[set] = [];
-      acc[set].push(sku.sku);
-      return acc;
-    }, {} as Record<string, string[]>);
-    
-    const newJobs: Job[] = [];
-    Object.keys(grouped).forEach(setName => {
-      const skus = grouped[setName];
-      const chunkSize = 10;
-      for (let i = 0; i < skus.length; i += chunkSize) {
-        const chunk = skus.slice(i, i + chunkSize);
-        const dateStr = new Date().toISOString().replace(/T/, '_').replace(/:/g, '-').split('.')[0];
-        const chunkIndex = Math.floor(i / chunkSize) + 1;
-        const totalChunks = Math.ceil(skus.length / chunkSize);
-        
-        newJobs.push({
-          id: `job_${dateStr}_${setName.replace(/[^a-zA-Z0-9]/g, '_')}_p${chunkIndex}`,
-          name: `Job for ${setName}${totalChunks > 1 ? ` (Part ${chunkIndex}/${totalChunks})` : ''}`,
-          createdAt: new Date().toISOString(),
-          attribute_set: setName,
-          skus: chunk,
-          status: "pending" as const
-        });
-      }
-    });
-    
-    addJobs(newJobs);
+    const createdAt = new Date().toISOString();
+    const job: Job = {
+      id: `job_${Date.now()}_${attributeSet.replace(/[^a-zA-Z0-9]/g, '_')}`,
+      name: `Job for ${attributeSet}`,
+      createdAt,
+      attribute_set: attributeSet,
+      skus: skusToProcess.map(sku => sku.sku),
+      status: "pending"
+    };
+
+    addJobs([job]);
     setSelectedSkus(new Set());
     addNotification({
       type: "success",
-      title: "Jobs Created",
-      message: `Created ${newJobs.length} new job(s). View them in the Jobs tab.`
+      title: "Job Created",
+      message: `Created one job with ${job.skus.length} SKU(s). View it in the Jobs tab.`
     });
   };
 
@@ -310,6 +309,13 @@ export function DashboardModule() {
         const workbook = XLSX.read(data, { type: "array" });
         const firstSheetName = workbook.SheetNames[0];
         const worksheet = workbook.Sheets[firstSheetName];
+        const [headerRow = []] = XLSX.utils.sheet_to_json<any[]>(worksheet, {
+          header: 1,
+          raw: false,
+          defval: "",
+          blankrows: false,
+        });
+        const headerOrder = headerRow.map(String);
         const jsonData = XLSX.utils.sheet_to_json<Record<string, any>>(worksheet);
 
         if (jsonData.length === 0) {
@@ -335,7 +341,7 @@ export function DashboardModule() {
           seenInFile.add(skuStr);
 
           const upload_attributes: Record<string, any> = {};
-          const source: { sap?: string; url?: string; fileName?: string } = { fileName: file.name };
+          const source: SkuData["source"] = { fileName: file.name, headerOrder };
           let attribute_set: string | undefined = undefined;
 
           for (const [key, value] of Object.entries(row)) {

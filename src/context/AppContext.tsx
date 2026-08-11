@@ -15,7 +15,7 @@ export interface Job {
     total_tokens: number;
   };
   timeTaken?: number;
-  error?: string;
+  error?: string | null;
 }
 
 export interface AppNotification {

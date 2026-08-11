@@ -10,6 +10,9 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
+    "test:job-state": "tsx src/lib/jobRunState.test.ts",
+    "test:site-selector": "tsx src/lib/siteSelectorWebsite.test.ts",
+    "test:tab-capture": "tsx src/lib/captureDynamicTabs.test.ts",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio"

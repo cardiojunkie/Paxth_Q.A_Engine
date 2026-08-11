@@ -4,7 +4,7 @@ A production-quality internal QA automation web application for ecommerce catalo
 
 ---
 
-## 📌 Executive Summary & Business Logic
+## 📌 Executive Summary & Business Logic.
 
 When uploading new catalog SKUs to ecommerce marketplaces or platforms, data inconsistencies, missing specs, typos, and unverified marketing claims lead to customer returns and delays. This platform automates the verification process:
 
@@ -219,6 +219,13 @@ Run this single command in your Codespaces terminal to install all dependencies 
 cp .env.example .env && npm install && npm run dev
 ```
 
+### Docker
+
+```bash
+docker build -t paxth-qa-engine .
+docker run --rm -p 3000:3000 --env-file .env paxth-qa-engine
+```
+
 This command will:
 1. Create your `.env` file from `.env.example`.
 2. Install all npm packages and requirements.
@@ -254,6 +261,9 @@ npm install
 
 # Start full-stack development server (Express backend + Vite React frontend on port 3000)
 npm run dev
+
+# Replace a stale instance of this project before starting
+./start.sh
 ```
 
 ### Production Build
