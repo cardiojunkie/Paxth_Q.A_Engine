@@ -95,7 +95,7 @@ export function ScraperModule() {
         </p>
       </header>
 
-      <div className="flex-1 flex flex-col p-10 overflow-hidden">
+      <div className="flex-1 flex flex-col p-10 overflow-y-auto min-h-0">
         <div className="flex gap-4 mb-6 shrink-0">
           <div className="flex-1 relative">
             <Globe className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8C8882]" />
@@ -208,7 +208,7 @@ export function ScraperModule() {
           </div>
         )}
 
-        <div className="flex-1 border border-[#E5E2DE] bg-white rounded-sm overflow-hidden flex flex-col relative">
+        <div className="flex-1 min-h-[28rem] border border-[#E5E2DE] bg-white rounded-sm overflow-hidden flex flex-col relative">
           {loading ? (
             <div className="absolute inset-0 flex items-center justify-center bg-white/50 z-10">
               <div className="flex flex-col items-center gap-4">

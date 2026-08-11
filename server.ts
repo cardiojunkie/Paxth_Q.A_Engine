@@ -5,8 +5,10 @@ import axios from "axios";
 import * as cheerio from "cheerio";
 import TurndownService from "turndown";
 import { launch } from "cloakbrowser";
+import { getBlockedScrapeReason } from "./src/lib/blockedScrapePage.js";
 import { captureDynamicTabs } from "./src/lib/captureDynamicTabs.js";
 import { isCompleteWebsiteDomain, normalizeWebsite } from "./src/lib/siteSelectorWebsite.js";
+import { loadLazyPageContent } from "./src/lib/loadLazyPageContent.js";
 import { db } from "./src/db/index.js";
 import { skuData, attributeSets, jobs, siteSelectors } from "./src/db/schema.js";
 import { eq, inArray, sql } from "drizzle-orm";
@@ -478,13 +480,31 @@ async function startServer() {
         const page = await browser.newPage();
         
         // Navigate and wait for network to be idle to ensure dynamic content loads
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        const navigationResponse = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         
         // Try to wait for network idle to get SPAs, but don't fail if it times out
         try {
           await page.waitForLoadState('networkidle', { timeout: 10000 });
         } catch (e) {
           // Ignore timeout on networkidle
+        }
+
+        let html = await page.content();
+        const blockedReason = getBlockedScrapeReason({
+          status: navigationResponse?.status(),
+          hostname,
+          html,
+        });
+        if (blockedReason) {
+          return res.status(502).json({
+            error: blockedReason,
+            details: "Use SAP or manually supplied source content for this QA run.",
+          });
+        }
+
+        if (/(^|\.)amazon\./i.test(hostname)) {
+          await loadLazyPageContent(page);
+          html = await page.content();
         }
 
         if (selectorRule && Boolean(selectorRule.tabSelector) !== Boolean(selectorRule.tabContentSelector)) {
@@ -503,9 +523,8 @@ async function startServer() {
               details: error.message || String(error),
             });
           }
+          html = await page.content();
         }
-        
-        const html = await page.content();
         
         const $ = cheerio.load(html);
 

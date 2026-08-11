@@ -47,7 +47,10 @@ export async function captureDynamicTabs(
   if (tabCount < 1 || tabCount > 50) throw new Error(`Expected 1-50 dynamic tabs, found ${tabCount}`);
 
   const initialPanelCount = await page.locator(panelSelector).count();
-  if (initialPanelCount !== 1) throw new Error(`Expected exactly one dynamic tab panel, found ${initialPanelCount}`);
+  const pairedPanels = initialPanelCount === tabCount && tabCount > 1;
+  if (initialPanelCount !== 1 && !pairedPanels) {
+    throw new Error(`Expected one shared panel or ${tabCount} paired panels, found ${initialPanelCount}`);
+  }
 
   const labels = await Promise.all(Array.from({ length: tabCount }, async (_, index) => {
     try {
@@ -56,7 +59,7 @@ export async function captureDynamicTabs(
       return `Tab ${index + 1}`;
     }
   }));
-  const captures: Array<{ label: string; html: string }> = [];
+  const captures: Array<{ index: number; label: string; html: string }> = [];
   const failures: string[] = [];
   const originalPath = pagePath(page.url());
 
@@ -70,8 +73,10 @@ export async function captureDynamicTabs(
 
       const panels = page.locator(panelSelector);
       const panelCount = await panels.count();
-      if (panelCount !== 1) throw new Error(`expected one panel, found ${panelCount}`);
-      captures.push({ label, html: await panels.nth(0).innerHTML() });
+      if (panelCount !== initialPanelCount) {
+        throw new Error(`expected ${initialPanelCount} panel${initialPanelCount === 1 ? "" : "s"}, found ${panelCount}`);
+      }
+      captures.push({ index, label, html: await panels.nth(pairedPanels ? index : 0).innerHTML() });
     } catch (error) {
       if (pagePath(page.url()) !== originalPath) throw error;
       failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
@@ -80,18 +85,34 @@ export async function captureDynamicTabs(
 
   if (!captures.length) throw new Error(`No dynamic tabs were captured${failures.length ? `: ${failures.join("; ")}` : ""}`);
 
-  const html = captures
-    .map(({ label, html: panelHtml }) => `<section data-specification-tab><h3>${escapeHtml(label)}</h3>${panelHtml}</section>`)
-    .join("")
-    + (failures.length
-      ? `<p role="alert">Specification tabs not captured: ${escapeHtml(failures.join("; "))}</p>`
-      : "");
+  const warning = failures.length
+    ? `<p role="alert">Specification tabs not captured: ${escapeHtml(failures.join("; "))}</p>`
+    : "";
   const finalPanels = page.locator(panelSelector);
   const finalPanelCount = await finalPanels.count();
-  if (finalPanelCount !== 1) throw new Error(`Cannot replace dynamic tab panel: found ${finalPanelCount}`);
-  await finalPanels.nth(0).evaluate((element, replacement) => {
-    element.innerHTML = replacement;
-  }, html);
+  if (finalPanelCount !== initialPanelCount) {
+    throw new Error(`Cannot replace dynamic tab panels: found ${finalPanelCount}`);
+  }
+
+  if (pairedPanels) {
+    const capturesByPanel = new Map(captures.map(capture => [capture.index, capture]));
+    for (let index = 0; index < initialPanelCount; index += 1) {
+      const capture = capturesByPanel.get(index);
+      const replacement = capture
+        ? `<section data-specification-tab><h3>${escapeHtml(capture.label)}</h3>${capture.html}</section>${capture === captures[0] ? warning : ""}`
+        : "";
+      await finalPanels.nth(index).evaluate((element, html) => {
+        element.innerHTML = html;
+      }, replacement);
+    }
+  } else {
+    const html = captures
+      .map(({ label, html: panelHtml }) => `<section data-specification-tab><h3>${escapeHtml(label)}</h3>${panelHtml}</section>`)
+      .join("") + warning;
+    await finalPanels.nth(0).evaluate((element, replacement) => {
+      element.innerHTML = replacement;
+    }, html);
+  }
 
   return { captured: captures.length, failures };
 }

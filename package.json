@@ -13,6 +13,8 @@
     "test:job-state": "tsx src/lib/jobRunState.test.ts",
     "test:site-selector": "tsx src/lib/siteSelectorWebsite.test.ts",
     "test:tab-capture": "tsx src/lib/captureDynamicTabs.test.ts",
+    "test:blocked-page": "tsx src/lib/blockedScrapePage.test.ts",
+    "test:lazy-content": "tsx src/lib/loadLazyPageContent.test.ts",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio"

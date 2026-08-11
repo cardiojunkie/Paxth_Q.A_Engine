@@ -80,6 +80,30 @@ try {
   assert.equal(browserHtml.match(/data-specification-tab/g)?.length, 2);
   assert.match(browserHtml, /<h3>First &amp; More<\/h3>.*First panel.*<h3>Second<\/h3>.*Second panel/s);
   assert.doesNotMatch(browserHtml, /Initial panel/);
+
+  const accordionFixture = `
+    <div id="details">
+      <button class="expander">Features</button><div class="content">Stale features</div>
+      <button class="expander">Measurements</button><div class="content">Stale measurements</div>
+    </div>
+    <script>
+      const details = ["<table><tr><th>Model</th><td>A1</td></tr></table>", "<p>Width: 10 cm</p>"];
+      document.querySelectorAll(".expander").forEach((button, index) => {
+        button.addEventListener("click", () => document.querySelectorAll(".content")[index].innerHTML = details[index]);
+      });
+    </script>
+  `;
+  await browserPage.goto(`data:text/html;charset=utf-8,${encodeURIComponent(accordionFixture)}`, { waitUntil: "domcontentloaded" });
+  assert.deepEqual(
+    await captureDynamicTabs(browserPage, { tabSelector: ".expander", panelSelector: ".content", waitMs: 0 }),
+    { captured: 2, failures: [] },
+  );
+  const accordionHtml = await browserPage.locator("#details").innerHTML();
+  assert.equal(accordionHtml.match(/data-specification-tab/g)?.length, 2);
+  assert.match(accordionHtml, /<h3>Features<\/h3>.*Model.*<h3>Measurements<\/h3>.*Width: 10 cm/s);
+  assert.equal(accordionHtml.match(/Model/g)?.length, 1);
+  assert.equal(accordionHtml.match(/Width: 10 cm/g)?.length, 1);
+  assert.doesNotMatch(accordionHtml, /Stale/);
 } finally {
   await browser.close();
 }
