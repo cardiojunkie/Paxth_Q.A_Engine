@@ -1,41 +1,63 @@
 import React, { useState } from 'react';
-import { Shield, Lock, User, Eye, EyeOff, ArrowRight, AlertCircle, Key, Sparkles, CheckCircle2 } from 'lucide-react';
+import { Shield, Lock, User, Eye, EyeOff, ArrowRight, AlertCircle, Key, CheckCircle2, Download } from 'lucide-react';
 import { useAppContext } from '../context/AppContext';
 
 export function LoginScreen() {
   const { login, addNotification } = useAppContext();
-  const [username, setUsername] = useState('Aswath');
-  const [password, setPassword] = useState('potusdown@2230');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [rememberMe, setRememberMe] = useState(true);
+  const [hasLegacyData] = useState(() => ["qa-analyzer-attribute-sets", "qa-analyzer-site-selectors", "qa-analyzer-settings"].some((key) => localStorage.getItem(key)));
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setIsLoading(true);
 
-    setTimeout(() => {
-      const result = login(username, password);
+    try {
+      const result = await login(username, password);
       setIsLoading(false);
 
       if (result.success) {
         addNotification({
           type: 'success',
-          title: 'Welcome back, Aswath',
-          message: 'Successfully authenticated as Administrator.'
+          title: 'Welcome back',
+          message: 'Successfully authenticated.'
         });
       } else {
         setError(result.error || 'Invalid credentials');
       }
-    }, 400);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
-  const fillDefaultCredentials = () => {
-    setUsername('Aswath');
-    setPassword('potusdown@2230');
-    setError(null);
+  const downloadLegacyBackup = () => {
+    const parse = (key: string, fallback: unknown) => {
+      try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); }
+      catch { return fallback; }
+    };
+    const rawSettings = parse("qa-analyzer-settings", {}) as Record<string, unknown>;
+    const { apiKey: _redacted, ...settings } = rawSettings;
+    const body = JSON.stringify({
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      attributeSets: parse("qa-analyzer-attribute-sets", []),
+      siteSelectors: parse("qa-analyzer-site-selectors", []),
+      settings,
+    }, null, 2);
+    if (new Blob([body]).size > 5 * 1024 * 1024) {
+      setError("Legacy browser data exceeds the 5 MiB backup limit.");
+      return;
+    }
+    const url = URL.createObjectURL(new Blob([body], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "paxth-legacy-browser-data.json";
+    link.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -83,7 +105,7 @@ export function LoginScreen() {
 
           {/* Error Banner */}
           {error && (
-            <div className="mb-6 p-3.5 bg-red-50 border border-red-200 rounded-sm text-red-700 text-xs flex items-start gap-2.5 animate-shake">
+            <div role="alert" className="mb-6 p-3.5 bg-red-50 border border-red-200 rounded-sm text-red-700 text-xs flex items-start gap-2.5 animate-shake">
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
               <div className="flex-1">
                 <span className="font-semibold block mb-0.5">Authentication Failed</span>
@@ -92,24 +114,17 @@ export function LoginScreen() {
             </div>
           )}
 
-          {/* Quick Preset Button */}
+          {/* Server-managed credential notice */}
           <div className="mb-6 bg-[#FDFCFB] border border-[#E5E2DE] p-3 rounded-sm flex items-center justify-between gap-3 text-xs">
             <div className="flex items-center gap-2 text-[#8C8882] overflow-hidden">
               <Key className="w-4 h-4 text-[#1A1A1A] shrink-0" />
-              <div className="truncate">
-                <span className="font-semibold text-[#1A1A1A]">Default Admin:</span>{' '}
-                <span className="font-mono text-[11px] bg-[#E5E2DE]/50 px-1 py-0.5 rounded text-[#1A1A1A]">Aswath</span>
-              </div>
+              <span>Credentials are verified securely by the server.</span>
             </div>
-            <button
-              type="button"
-              onClick={fillDefaultCredentials}
-              className="px-2.5 py-1 text-[11px] uppercase tracking-wider font-bold bg-[#1A1A1A] text-white rounded-sm hover:bg-[#333] transition-colors shrink-0 flex items-center gap-1"
-            >
-              <Sparkles className="w-3 h-3" />
-              Auto-fill
-            </button>
           </div>
+
+          {hasLegacyData && <button type="button" onClick={downloadLegacyBackup} className="mb-6 w-full flex items-center justify-center gap-2 border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+            <Download className="w-4 h-4" /> Download legacy browser-data backup
+          </button>}
 
           <form onSubmit={handleSubmit} className="space-y-5">
             {/* Username field */}
@@ -127,7 +142,8 @@ export function LoginScreen() {
                   required
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="e.g. Aswath"
+                  autoComplete="username"
+                  placeholder="Username"
                   className="w-full pl-10 pr-3.5 py-2.5 bg-white border border-[#E5E2DE] rounded-sm text-sm text-[#1A1A1A] placeholder-[#8C8882]/60 focus:outline-none focus:border-[#1A1A1A] focus:ring-1 focus:ring-[#1A1A1A] transition-all"
                 />
               </div>
@@ -148,6 +164,7 @@ export function LoginScreen() {
                   id="password-input"
                   type={showPassword ? 'text' : 'password'}
                   required
+                  autoComplete="current-password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••••••"
@@ -158,23 +175,11 @@ export function LoginScreen() {
                   onClick={() => setShowPassword(!showPassword)}
                   className="absolute inset-y-0 right-0 pr-3 flex items-center text-[#8C8882] hover:text-[#1A1A1A] transition-colors"
                   title={showPassword ? "Hide password" : "Show password"}
+                  aria-label={showPassword ? "Hide password" : "Show password"}
                 >
                   {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
               </div>
-            </div>
-
-            {/* Remember me */}
-            <div className="flex items-center justify-between pt-1">
-              <label className="flex items-center gap-2 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={rememberMe}
-                  onChange={(e) => setRememberMe(e.target.checked)}
-                  className="w-4 h-4 border-[#E5E2DE] text-[#1A1A1A] rounded-sm focus:ring-[#1A1A1A] accent-[#1A1A1A]"
-                />
-                <span className="text-xs text-[#8C8882]">Keep session signed in</span>
-              </label>
             </div>
 
             {/* Submit Button */}
@@ -194,16 +199,13 @@ export function LoginScreen() {
             </button>
           </form>
 
-          {/* Credentials Summary Box */}
+          {/* Session summary */}
           <div className="mt-8 pt-6 border-t border-[#E5E2DE] text-[11px] text-[#8C8882] space-y-2 bg-[#FDFCFB] -mx-8 -mb-8 p-6">
             <p className="font-semibold text-[#1A1A1A] flex items-center gap-1.5">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-              Default Administrator Credentials:
+              Secure server session
             </p>
-            <div className="font-mono text-[11px] bg-white border border-[#E5E2DE] p-2 rounded-sm space-y-1">
-              <div><span className="text-[#8C8882]">Admin User:</span> <strong className="text-[#1A1A1A]">Aswath</strong></div>
-              <div><span className="text-[#8C8882]">Password:</span> <strong className="text-[#1A1A1A]">potusdown@2230</strong></div>
-            </div>
+            <p>Your password is never stored in this browser.</p>
           </div>
         </div>
       </div>

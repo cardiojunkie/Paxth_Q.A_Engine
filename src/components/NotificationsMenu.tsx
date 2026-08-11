@@ -1,5 +1,5 @@
-import React, { useState, useRef, useEffect } from "react";
-import { Bell, Check, Trash2, Info, CheckCircle, AlertTriangle, XCircle } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { AlertTriangle, Bell, CheckCircle, Info, Trash2, XCircle } from "lucide-react";
 import { useAppContext } from "../context/AppContext";
 import { cn } from "../lib/utils";
 
@@ -33,6 +33,8 @@ export function NotificationsMenu() {
     <div className="relative" ref={menuRef}>
       <button
         onClick={() => setIsOpen(!isOpen)}
+        aria-label={`Notifications${unreadCount ? `, ${unreadCount} unread` : ''}`}
+        aria-expanded={isOpen}
         className="relative p-2 text-[#8C8882] hover:text-[#1A1A1A] hover:bg-[#F5F2EF] rounded-sm transition-colors"
       >
         <Bell className="w-5 h-5" />
@@ -48,6 +50,7 @@ export function NotificationsMenu() {
             {notifications.length > 0 && (
               <button 
                 onClick={clearNotifications}
+                aria-label="Clear all notifications"
                 className="text-[#8C8882] hover:text-red-600 transition-colors"
                 title="Clear all"
               >
@@ -63,39 +66,40 @@ export function NotificationsMenu() {
               </div>
             ) : (
               notifications.map((notification) => (
-                <div 
+                <button
+                  type="button"
                   key={notification.id} 
                   className={cn(
-                    "p-3 rounded-sm border transition-colors relative cursor-pointer",
+                    "p-3 rounded-sm border transition-colors relative w-full text-left",
                     notification.read 
                       ? "bg-transparent border-transparent opacity-70" 
                       : "bg-[#FDFCFB] border-[#E5E2DE] shadow-sm"
                   )}
                   onClick={() => markNotificationRead(notification.id)}
                 >
-                  <div className="flex gap-3 items-start">
-                    <div className="mt-0.5 shrink-0">
+                  <span className="flex gap-3 items-start">
+                    <span className="mt-0.5 shrink-0" aria-hidden="true">
                       {getIcon(notification.type)}
-                    </div>
-                    <div className="flex-1 pr-6">
-                      <h5 className={cn(
-                        "text-xs font-bold mb-1", 
+                    </span>
+                    <span className="flex-1 pr-6">
+                      <span className={cn(
+                        "text-xs font-bold mb-1 block",
                         !notification.read ? "text-[#1A1A1A]" : "text-[#8C8882]"
                       )}>
                         {notification.title}
-                      </h5>
-                      <p className="text-[11px] text-[#8C8882] leading-snug">
+                      </span>
+                      <span className="text-[11px] text-[#8C8882] leading-snug block">
                         {notification.message}
-                      </p>
+                      </span>
                       <span className="text-[9px] uppercase tracking-widest text-[#8C8882]/70 block mt-2">
                         {new Date(notification.timestamp).toLocaleTimeString()}
                       </span>
-                    </div>
-                  </div>
+                    </span>
+                  </span>
                   {!notification.read && (
-                    <div className="absolute top-3 right-3 w-1.5 h-1.5 rounded-full bg-blue-500"></div>
+                    <span aria-hidden="true" className="absolute top-3 right-3 w-1.5 h-1.5 rounded-full bg-blue-500" />
                   )}
-                </div>
+                </button>
               ))
             )}
           </div>

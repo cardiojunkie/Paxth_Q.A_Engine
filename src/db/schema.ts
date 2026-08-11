@@ -1,16 +1,4 @@
-import { pgTable, text, serial, timestamp, jsonb, boolean, integer, pgEnum } from 'drizzle-orm/pg-core';
-import { relations } from 'drizzle-orm';
-
-export const userRoleEnum = pgEnum('user_role', ['admin', 'user']);
-
-export const users = pgTable('users', {
-  id: text('id').primaryKey(),
-  username: text('username').notNull().unique(),
-  password: text('password').notNull(),
-  role: userRoleEnum('role').default('user').notNull(),
-  lastLogin: timestamp('last_login'),
-  createdAt: timestamp('created_at').defaultNow().notNull(),
-});
+import { boolean, integer, jsonb, pgEnum, pgTable, primaryKey, serial, text, timestamp } from 'drizzle-orm/pg-core';
 
 export const attributeSets = pgTable('attribute_sets', {
   id: text('id').primaryKey(),
@@ -25,11 +13,22 @@ export const jobs = pgTable('jobs', {
   name: text('name').notNull(),
   createdAt: text('created_at').notNull(),
   attributeSet: text('attribute_set'),
-  skus: jsonb('skus'),
-  status: text('status').default('pending').notNull(), // pending, running, completed, failed
+  skus: jsonb('skus').default([]).notNull(),
+  status: text('status').default('pending').notNull(),
   tokensUsed: jsonb('tokens_used'),
   timeTaken: integer('time_taken'),
   error: text('error'),
+  processedCount: integer('processed_count').default(0).notNull(),
+  totalCount: integer('total_count').default(0).notNull(),
+  currentSku: text('current_sku'),
+  stopRequested: boolean('stop_requested').default(false).notNull(),
+  leaseOwner: text('lease_owner'),
+  leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+  queuedAt: timestamp('queued_at', { withTimezone: true }),
+  startedAt: timestamp('started_at', { withTimezone: true }),
+  finishedAt: timestamp('finished_at', { withTimezone: true }),
+  runConfig: jsonb('run_config'),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
 export const qaStatusEnum = pgEnum('qa_status', ['pending', 'ready', 'cannot_qa', 'running', 'completed', 'failed']);
@@ -63,14 +62,32 @@ export const siteSelectors = pgTable('site_selectors', {
   tabContentSelector: text('tab_content_selector'),
   tabWaitMs: integer('tab_wait_ms'),
   enabled: boolean('enabled').default(true).notNull(),
-  createdAt: timestamp('created_at').defaultNow().notNull(),
-  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
-// Relationships
-export const skuDataRelations = relations(skuData, ({ one }) => ({
-  attributeSet: one(attributeSets, {
-    fields: [skuData.attributeSetId],
-    references: [attributeSets.id],
-  }),
-}));
+export const jobResults = pgTable('job_results', {
+  jobId: text('job_id').notNull().references(() => jobs.id, { onDelete: 'cascade' }),
+  sku: text('sku').notNull(),
+  inputSnapshot: jsonb('input_snapshot').notNull(),
+  status: text('status').default('pending').notNull(),
+  scrapedMarkdown: text('scraped_markdown'),
+  scrapeStatus: text('scrape_status'),
+  qaResult: jsonb('qa_result'),
+  exportData: jsonb('export_data'),
+  tokensUsed: jsonb('tokens_used'),
+  timeTaken: integer('time_taken'),
+  error: text('error'),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [primaryKey({ columns: [table.jobId, table.sku] })]);
+
+export const appSettings = pgTable('app_settings', {
+  id: integer('id').primaryKey().default(1),
+  ciphertext: text('ciphertext'),
+  iv: text('iv'),
+  authTag: text('auth_tag'),
+  keyVersion: integer('key_version').default(1).notNull(),
+  migrationVersion: text('migration_version').default('0000_vps_ready').notNull(),
+  legacyImportedAt: timestamp('legacy_imported_at', { withTimezone: true }),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});

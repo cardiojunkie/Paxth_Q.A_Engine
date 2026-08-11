@@ -1,34 +1,39 @@
-FROM mcr.microsoft.com/devcontainers/javascript-node:1-20-bullseye AS system
+FROM node:24-bookworm-slim AS system
 
-USER root
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libatspi2.0-0 \
-    libcups2 \
-    libgbm1 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxkbcommon0 \
-    libxrandr2 \
-  && rm -rf /var/lib/apt/lists/*
-
-USER node
 WORKDIR /app
+RUN chown node:node /app
+USER node
 
 FROM system AS build
-COPY --chown=node:node package*.json ./
+
+COPY --chown=node:node package.json package-lock.json ./
 RUN npm ci
-COPY --chown=node:node . ./
+COPY --chown=node:node . .
 RUN npm run build
 
-FROM system AS production
-ENV NODE_ENV=production
-COPY --chown=node:node package*.json ./
-RUN npm ci --omit=dev
+FROM node:24-bookworm-slim AS production
+
+ENV NODE_ENV=production \
+    HOME=/tmp \
+    PORT=3000 \
+    CLOAKBROWSER_CACHE_DIR=/var/cache/cloakbrowser \
+    CLOAKBROWSER_AUTO_UPDATE=false
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev \
+    && npx --no-install playwright-core install-deps chromium \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/* /root/.npm \
+    && install -d -o node -g node /var/cache/cloakbrowser
+
 COPY --from=build --chown=node:node /app/dist ./dist
+COPY --chown=node:node drizzle ./drizzle
+
+USER node
 EXPOSE 3000
-CMD ["node", "dist/server.cjs"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+
+CMD ["node", "dist/server/server.js"]

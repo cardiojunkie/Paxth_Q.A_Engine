@@ -1,6 +1,7 @@
-import React, { createContext, useContext, useState, useCallback, ReactNode, useEffect } from 'react';
-import { SkuData, QAStatus, useCatalogData } from '../hooks/useCatalogData';
-import { User, UserAccount } from '../types';
+import React, { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
+import { apiFetch } from "../lib/api";
+import { type SkuData, useCatalogData } from "../hooks/useCatalogData";
+import { type User } from "../types";
 
 export interface Job {
   id: string;
@@ -8,15 +9,17 @@ export interface Job {
   createdAt: string;
   attribute_set: string;
   skus: string[];
-  status: "pending" | "running" | "completed" | "failed";
-  tokensUsed?: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
+  status: "pending" | "queued" | "running" | "completed" | "completed_with_errors" | "failed" | "stopped";
+  progress?: { processed: number; total: number; currentSku?: string };
+  tokensUsed?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
   timeTaken?: number;
   error?: string | null;
+  queuedAt?: string | null;
+  startedAt?: string | null;
+  finishedAt?: string | null;
 }
+
+export type NewJob = Pick<Job, "name" | "attribute_set" | "skus">;
 
 export interface AppNotification {
   id: string;
@@ -29,28 +32,21 @@ export interface AppNotification {
 
 interface AppContextType {
   user: User | null;
-  login: (username: string, password: string) => { success: boolean; error?: string };
-  logout: () => void;
-
-  usersList: UserAccount[];
-  addUserAccount: (user: Omit<UserAccount, 'id' | 'createdAt'>) => { success: boolean; error?: string };
-  updateUserAccount: (id: string, updates: Partial<UserAccount>) => { success: boolean; error?: string };
-  deleteUserAccount: (id: string) => { success: boolean; error?: string };
-
+  isCheckingSession: boolean;
+  login: (username: string, password: string) => Promise<{ success: boolean; error?: string }>;
+  logout: () => Promise<void>;
   skuDataList: SkuData[];
-  addParsedData: (data: SkuData[]) => void;
-  updateSku: (sku: string, updates: Partial<SkuData>) => void;
-  deleteSku: (sku: string) => void;
-  clearData: () => void;
-  removeSkus: (skus: string[]) => void;
-  updateSkuStatus: (skus: string[], newStatus: QAStatus) => void;
+  addParsedData: (data: SkuData[]) => Promise<void>;
+  clearData: () => Promise<void>;
+  removeSkus: (skus: string[]) => Promise<void>;
   isLoadingSkuData: boolean;
-  
   jobs: Job[];
-  addJobs: (newJobs: Job[]) => void;
-  updateJob: (id: string, updates: Partial<Job>) => void;
-  removeJob: (id: string) => void;
-
+  addJob: (job: NewJob) => Promise<void>;
+  queueJobs: (ids: string[]) => Promise<void>;
+  stopJob: (id: string) => Promise<void>;
+  removeJob: (id: string) => Promise<void>;
+  getJobResults: (id: string) => Promise<SkuData[]>;
+  refreshJobs: () => Promise<void>;
   notifications: AppNotification[];
   addNotification: (notification: Omit<AppNotification, "id" | "timestamp" | "read">) => void;
   markNotificationRead: (id: string) => void;
@@ -58,281 +54,150 @@ interface AppContextType {
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
+type SessionResponse = { authenticated: true; username: string };
 
-const DEFAULT_ADMIN_USER = 'Aswath';
-const DEFAULT_ADMIN_PASS = 'potusdown@2230';
-const SESSION_STORAGE_KEY = 'paxth_qa_user_session';
-const USERS_STORAGE_KEY = 'paxth_qa_users_db_v1';
-
-const INITIAL_USERS: UserAccount[] = [
-  {
-    id: 'user-admin-default',
-    username: DEFAULT_ADMIN_USER,
-    password: DEFAULT_ADMIN_PASS,
-    role: 'admin',
-    createdAt: new Date().toISOString(),
+function removeLegacyCredentials() {
+  localStorage.removeItem("paxth_qa_user_session");
+  localStorage.removeItem("paxth_qa_users_db_v1");
+  localStorage.removeItem("lastFileName");
+  const rawSettings = localStorage.getItem("qa-analyzer-settings");
+  if (!rawSettings) return;
+  try {
+    const settings = JSON.parse(rawSettings);
+    delete settings.apiKey;
+    localStorage.setItem("qa-analyzer-settings", JSON.stringify(settings));
+  } catch {
+    localStorage.removeItem("qa-analyzer-settings");
   }
-];
+}
 
 export function AppProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(() => {
-    try {
-      const stored = localStorage.getItem(SESSION_STORAGE_KEY);
-      if (stored) {
-        return JSON.parse(stored) as User;
-      }
-    } catch (e) {
-      console.error('Failed to parse stored user session', e);
-    }
-    return null;
-  });
-
-  const [usersList, setUsersList] = useState<UserAccount[]>(() => {
-    try {
-      const storedUsers = localStorage.getItem(USERS_STORAGE_KEY);
-      if (storedUsers) {
-        const parsed = JSON.parse(storedUsers);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          // Ensure default admin exists if deleted accidentally or modified
-          const hasAdmin = parsed.some((u: UserAccount) => u.username.toLowerCase() === DEFAULT_ADMIN_USER.toLowerCase());
-          if (!hasAdmin) {
-            return [...INITIAL_USERS, ...parsed];
-          }
-          return parsed;
-        }
-      }
-    } catch (e) {
-      console.error('Failed to parse stored user database', e);
-    }
-    return INITIAL_USERS;
-  });
-
-  const { skuDataList, addParsedData, updateSkuStatus, updateSku, removeSkus, clearAllData, isLoading } = useCatalogData();
+  const [user, setUser] = useState<User | null>(null);
+  const [isCheckingSession, setIsCheckingSession] = useState(true);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const catalog = useCatalogData(Boolean(user));
 
-  // Fetch initial jobs from database
   useEffect(() => {
-    fetch('/api/jobs')
-      .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) {
-          setJobs(data);
-        }
-      })
-      .catch(err => {
-        console.error("Failed to fetch jobs from database", err);
-      });
+    removeLegacyCredentials();
+    apiFetch<SessionResponse>("/api/auth/session")
+      .then((session) => setUser({ username: session.username }))
+      .catch(() => setUser(null))
+      .finally(() => setIsCheckingSession(false));
   }, []);
 
-  // Persist users database changes
   useEffect(() => {
+    const unauthorize = () => setUser(null);
+    window.addEventListener("paxth:unauthorized", unauthorize);
+    return () => window.removeEventListener("paxth:unauthorized", unauthorize);
+  }, []);
+
+  const login = useCallback(async (username: string, password: string) => {
     try {
-      localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(usersList));
-    } catch (e) {
-      console.error('Failed to save users database', e);
-    }
-  }, [usersList]);
-
-  const login = useCallback((usernameInput: string, passwordInput: string) => {
-    const trimmedUsername = usernameInput.trim();
-    if (!trimmedUsername || !passwordInput) {
-      return { success: false, error: 'Please enter both username and password.' };
-    }
-
-    // Check against usersList
-    const matchedAccount = usersList.find(
-      u => u.username.toLowerCase() === trimmedUsername.toLowerCase() && u.password === passwordInput
-    );
-
-    if (matchedAccount) {
-      const authenticatedUser: User = {
-        username: matchedAccount.username,
-        role: matchedAccount.role,
-        loginTime: new Date().toISOString(),
-      };
-
-      // Update last login timestamp
-      setUsersList(prev => prev.map(u => u.id === matchedAccount.id ? { ...u, lastLogin: new Date().toISOString() } : u));
-
-      setUser(authenticatedUser);
-      try {
-        localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(authenticatedUser));
-      } catch (e) {
-        console.error('Failed to save user session', e);
-      }
+      await apiFetch("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ username: username.trim(), password }),
+      });
+      const session = await apiFetch<SessionResponse>("/api/auth/session");
+      setUser({ username: session.username });
       return { success: true };
-    }
-    
-    return { 
-      success: false, 
-      error: 'Invalid username or password. Please verify your credentials.' 
-    };
-  }, [usersList]);
-
-  const logout = useCallback(() => {
-    setUser(null);
-    try {
-      localStorage.removeItem(SESSION_STORAGE_KEY);
-    } catch (e) {
-      console.error('Failed to remove user session', e);
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : "Sign in failed." };
     }
   }, []);
 
-  const addUserAccount = useCallback((newUser: Omit<UserAccount, 'id' | 'createdAt'>) => {
-    const trimmedUsername = newUser.username.trim();
-    if (!trimmedUsername) {
-      return { success: false, error: 'Username cannot be empty.' };
-    }
-
-    if (!newUser.password || newUser.password.length < 4) {
-      return { success: false, error: 'Password must be at least 4 characters long.' };
-    }
-
-    // Check for existing duplicate username
-    const exists = usersList.some(u => u.username.toLowerCase() === trimmedUsername.toLowerCase());
-    if (exists) {
-      return { success: false, error: `A user with username "${trimmedUsername}" already exists.` };
-    }
-
-    const createdAccount: UserAccount = {
-      ...newUser,
-      username: trimmedUsername,
-      id: `user-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      createdAt: new Date().toISOString(),
-    };
-
-    setUsersList(prev => [createdAccount, ...prev]);
-    return { success: true };
-  }, [usersList]);
-
-  const updateUserAccount = useCallback((id: string, updates: Partial<UserAccount>) => {
-    if (updates.username) {
-      const trimmed = updates.username.trim();
-      const duplicate = usersList.some(u => u.id !== id && u.username.toLowerCase() === trimmed.toLowerCase());
-      if (duplicate) {
-        return { success: false, error: `Username "${trimmed}" is already taken.` };
-      }
-      updates.username = trimmed;
-    }
-
-    setUsersList(prev => prev.map(u => u.id === id ? { ...u, ...updates } : u));
-    return { success: true };
-  }, [usersList]);
-
-  const deleteUserAccount = useCallback((id: string) => {
-    const target = usersList.find(u => u.id === id);
-    if (!target) {
-      return { success: false, error: 'User not found.' };
-    }
-
-    // Do not allow deleting current logged in admin
-    if (user && target.username.toLowerCase() === user.username.toLowerCase()) {
-      return { success: false, error: 'You cannot delete your own active session account.' };
-    }
-
-    // Do not allow deleting default admin Aswath
-    if (target.username.toLowerCase() === DEFAULT_ADMIN_USER.toLowerCase()) {
-      return { success: false, error: `The default system administrator "${DEFAULT_ADMIN_USER}" cannot be deleted.` };
-    }
-
-    setUsersList(prev => prev.filter(u => u.id !== id));
-    return { success: true };
-  }, [usersList, user]);
-
-
-  const deleteSku = useCallback((sku: string) => {
-    removeSkus([sku]);
-  }, [removeSkus]);
-
-  const clearData = useCallback(async () => {
-    clearAllData();
-    setJobs([]);
+  const logout = useCallback(async () => {
     try {
-      await fetch('/api/jobs', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ all: true })
-      });
-    } catch(e) {
-      console.error("Failed to clear jobs in database", e);
-    }
-  }, [clearAllData]);
-
-  const addJobs = useCallback(async (newJobs: Job[]) => {
-    setJobs(prev => [...prev, ...newJobs]);
-    try {
-      await fetch('/api/jobs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newJobs)
-      });
-    } catch(e) {
-      console.error("Failed to add jobs to database", e);
+      await apiFetch("/api/auth/logout", { method: "POST", body: "{}" });
+    } finally {
+      setUser(null);
+      setJobs([]);
     }
   }, []);
 
-  const updateJob = useCallback(async (id: string, updates: Partial<Job>) => {
-    setJobs(prev => prev.map(job => job.id === id ? { ...job, ...updates } : job));
-    try {
-      await fetch(`/api/jobs/${id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates)
-      });
-    } catch(e) {
-      console.error("Failed to update job in database", e);
+  const refreshJobs = useCallback(async () => {
+    if (!user) return;
+    const nextJobs = await apiFetch<Job[]>("/api/jobs");
+    setJobs(nextJobs);
+    await catalog.refresh(true);
+  }, [user, catalog.refresh]);
+
+  useEffect(() => {
+    if (!user) {
+      setJobs([]);
+      return;
     }
-  }, []);
+    void refreshJobs().catch((error) => console.error("Failed to fetch jobs", error));
+    const timer = window.setInterval(() => {
+      void refreshJobs().catch((error) => console.error("Failed to poll jobs", error));
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [user, refreshJobs]);
+
+  const addJob = useCallback(async (newJob: NewJob) => {
+    await apiFetch("/api/jobs", { method: "POST", body: JSON.stringify(newJob) });
+    await refreshJobs();
+  }, [refreshJobs]);
+
+  const queueJobs = useCallback(async (ids: string[]) => {
+    await apiFetch("/api/jobs/run", { method: "POST", body: JSON.stringify({ ids }) });
+    await refreshJobs();
+  }, [refreshJobs]);
+
+  const stopJob = useCallback(async (id: string) => {
+    await apiFetch(`/api/jobs/${encodeURIComponent(id)}/stop`, { method: "POST", body: "{}" });
+    await refreshJobs();
+  }, [refreshJobs]);
 
   const removeJob = useCallback(async (id: string) => {
-    setJobs(prev => prev.filter(job => job.id !== id));
-    try {
-      await fetch(`/api/jobs/${id}`, {
-        method: 'DELETE'
-      });
-    } catch(e) {
-      console.error("Failed to remove job from database", e);
-    }
+    await apiFetch(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
+    setJobs((previous) => previous.filter((job) => job.id !== id));
   }, []);
+
+  const getJobResults = useCallback((id: string) =>
+    apiFetch<SkuData[]>(`/api/jobs/${encodeURIComponent(id)}/results`), []);
+
+  const clearData = useCallback(async () => {
+    await catalog.clearAllData();
+  }, [catalog.clearAllData]);
 
   const addNotification = useCallback((notification: Omit<AppNotification, "id" | "timestamp" | "read">) => {
-    setNotifications(prev => [
-      {
-        ...notification,
-        id: Math.random().toString(36).substring(2, 9),
-        timestamp: new Date().toISOString(),
-        read: false,
-      },
-      ...prev
-    ]);
+    setNotifications((previous) => [{
+      ...notification,
+      id: crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+      read: false,
+    }, ...previous]);
   }, []);
 
-  const markNotificationRead = useCallback((id: string) => {
-    setNotifications(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
-  }, []);
-
-  const clearNotifications = useCallback(() => {
-    setNotifications([]);
-  }, []);
-
-  return (
-    <AppContext.Provider value={{
-      user, login, logout,
-      usersList, addUserAccount, updateUserAccount, deleteUserAccount,
-      skuDataList, addParsedData, updateSku, deleteSku, clearData, removeSkus, updateSkuStatus, isLoadingSkuData: isLoading,
-      jobs, addJobs, updateJob, removeJob,
-      notifications, addNotification, markNotificationRead, clearNotifications
-    }}>
-      {children}
-    </AppContext.Provider>
-  );
+  return <AppContext.Provider value={{
+    user,
+    isCheckingSession,
+    login,
+    logout,
+    skuDataList: catalog.skuDataList,
+    addParsedData: catalog.addParsedData,
+    clearData,
+    removeSkus: catalog.removeSkus,
+    isLoadingSkuData: catalog.isLoading,
+    jobs,
+    addJob,
+    queueJobs,
+    stopJob,
+    removeJob,
+    getJobResults,
+    refreshJobs,
+    notifications,
+    addNotification,
+    markNotificationRead: (id) => setNotifications((previous) => previous.map((item) => item.id === id ? { ...item, read: true } : item)),
+    clearNotifications: () => setNotifications([]),
+  }}>
+    {children}
+  </AppContext.Provider>;
 }
 
 export function useAppContext() {
   const context = useContext(AppContext);
-  if (context === undefined) {
-    throw new Error('useAppContext must be used within an AppProvider');
-  }
+  if (!context) throw new Error("useAppContext must be used within an AppProvider");
   return context;
 }

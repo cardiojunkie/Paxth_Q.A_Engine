@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Paxth QA database backup daily
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 UTC
+RandomizedDelaySec=15m
+Persistent=true
+Unit=paxth-backup.service
+
+[Install]
+WantedBy=timers.target

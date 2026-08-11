@@ -8,17 +8,6 @@ export interface AttributeSet {
 
 export interface User {
   username: string;
-  role: 'admin' | 'user';
-  loginTime: string;
-}
-
-export interface UserAccount {
-  id: string;
-  username: string;
-  password?: string;
-  role: 'admin' | 'user';
-  createdAt: string;
-  lastLogin?: string;
 }
 
 export interface SiteSelectorRule {

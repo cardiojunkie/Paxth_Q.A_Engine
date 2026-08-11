@@ -1,13 +1,12 @@
-import React, { useState } from "react";
-import { Plus, LayoutTemplate, Pencil, Trash2, FileText, ChevronRight, X, Search } from "lucide-react";
-import { format } from "date-fns";
+import { useState } from "react";
+import { LayoutTemplate, Search } from "lucide-react";
 import { useAttributeSets } from "../hooks/useAttributeSets";
 import { AttributeSet } from "../types";
 import { AttributeSetEditor } from "./AttributeSetEditor";
 import { cn } from "../lib/utils";
 
 export function AttributeSetsModule() {
-  const { attributeSets, addSet, updateSet, deleteSet } = useAttributeSets();
+  const { attributeSets, isLoading, addSet, updateSet, deleteSet } = useAttributeSets();
   const [editingSet, setEditingSet] = useState<AttributeSet | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [editorError, setEditorError] = useState<string | null>(null);
@@ -17,33 +16,43 @@ export function AttributeSetsModule() {
     set.name.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  const handleCreate = (data: Omit<AttributeSet, "id" | "createdAt" | "updatedAt">) => {
+  const handleCreate = async (data: Omit<AttributeSet, "id" | "createdAt" | "updatedAt">) => {
     if (attributeSets.some(s => s.name.toLowerCase() === data.name.trim().toLowerCase())) {
       setEditorError("An attribute set with this name already exists.");
       return;
     }
     setEditorError(null);
-    addSet(data);
-    setIsCreating(false);
+    try {
+      await addSet(data);
+      setIsCreating(false);
+    } catch (error) {
+      setEditorError(error instanceof Error ? error.message : "Could not create attribute set.");
+    }
   };
 
-  const handleUpdate = (data: Omit<AttributeSet, "id" | "createdAt" | "updatedAt">) => {
+  const handleUpdate = async (data: Omit<AttributeSet, "id" | "createdAt" | "updatedAt">) => {
     if (editingSet) {
       if (attributeSets.some(s => s.id !== editingSet.id && s.name.toLowerCase() === data.name.trim().toLowerCase())) {
         setEditorError("An attribute set with this name already exists.");
         return;
       }
       setEditorError(null);
-      updateSet(editingSet.id, data);
-      setEditingSet(null);
+      try {
+        await updateSet(editingSet.id, data);
+        setEditingSet(null);
+      } catch (error) {
+        setEditorError(error instanceof Error ? error.message : "Could not update attribute set.");
+      }
     }
   };
 
-  const handleDelete = (id: string) => {
+  const handleDelete = async (id: string) => {
     setEditorError(null);
-    deleteSet(id);
-    if (editingSet?.id === id) {
-      setEditingSet(null);
+    try {
+      await deleteSet(id);
+      if (editingSet?.id === id) setEditingSet(null);
+    } catch (error) {
+      setEditorError(error instanceof Error ? error.message : "Could not delete attribute set.");
     }
   };
 
@@ -66,33 +75,34 @@ export function AttributeSetsModule() {
         </div>
         <div className="flex-1 overflow-y-auto px-8 pb-8 pt-2 min-h-0">
           <ul className="space-y-4">
-            {filteredSets.length === 0 ? (
+            {isLoading ? (
+              <li className="text-[10px] text-[#8C8882] uppercase tracking-widest" role="status">Loading sets…</li>
+            ) : filteredSets.length === 0 ? (
               <li className="text-[10px] text-[#8C8882] uppercase tracking-widest">No matching sets</li>
             ) : (
               filteredSets.map((set) => {
                 const originalIndex = attributeSets.findIndex(s => s.id === set.id);
                 return (
-                  <li 
-                    key={set.id} 
-                    className={cn(
-                      "flex flex-col cursor-pointer transition-colors",
-                      editingSet?.id === set.id ? "border-l-2 border-[#1A1A1A] pl-4 -ml-[18px]" : "opacity-40 hover:opacity-100"
-                    )}
-                    onClick={() => { setIsCreating(false); setEditingSet(set); setEditorError(null); }}
-                  >
-                    <span className={cn("text-[10px] mb-1 font-mono", editingSet?.id === set.id ? "text-[#1A1A1A]" : "text-[#8C8882]")}>
-                      {(originalIndex + 1).toString().padStart(2, '0')}
-                    </span>
-                <span className={cn("font-serif text-xl flex items-center gap-2", editingSet?.id === set.id && "font-bold")}>
-                  {set.name}
-                  {set.rulesMarkdown.trim().length > 0 && (
-                    <span className="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" title="Has mapping rules"></span>
-                  )}
-                </span>
-                {editingSet?.id === set.id && (
-                  <span className="text-[10px] uppercase tracking-tighter mt-1 text-[#8C8882]">Active</span>
-                )}
-              </li>
+                  <li key={set.id}>
+                    <button
+                      type="button"
+                      aria-pressed={editingSet?.id === set.id}
+                      className={cn(
+                        "flex flex-col text-left w-full transition-colors",
+                        editingSet?.id === set.id ? "border-l-2 border-[#1A1A1A] pl-4 -ml-[18px]" : "opacity-40 hover:opacity-100"
+                      )}
+                      onClick={() => { setIsCreating(false); setEditingSet(set); setEditorError(null); }}
+                    >
+                      <span className={cn("text-[10px] mb-1 font-mono", editingSet?.id === set.id ? "text-[#1A1A1A]" : "text-[#8C8882]")}>
+                        {(originalIndex + 1).toString().padStart(2, '0')}
+                      </span>
+                      <span className={cn("font-serif text-xl flex items-center gap-2", editingSet?.id === set.id && "font-bold")}>
+                        {set.name}
+                        {set.rulesMarkdown.trim().length > 0 && <><span aria-hidden="true" className="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" /><span className="sr-only">Has mapping rules</span></>}
+                      </span>
+                      {editingSet?.id === set.id && <span className="text-[10px] uppercase tracking-tighter mt-1 text-[#8C8882]">Active</span>}
+                    </button>
+                  </li>
                 );
               })
             )}

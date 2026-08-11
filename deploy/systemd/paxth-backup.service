@@ -1,0 +1,18 @@
+[Unit]
+Description=Back up the Paxth QA managed PostgreSQL database
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/paxth-qa
+Environment=BACKUP_DAILY_KEEP=7
+Environment=BACKUP_WEEKLY_KEEP=4
+ExecStart=/opt/paxth-qa/scripts/backup.sh /etc/paxth-qa/migrate.env /var/backups/paxth-qa
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

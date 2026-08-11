@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DATABASE_URL: postgresql://paxth:paxth@127.0.0.1:5432/paxth_test
+  DATABASE_MIGRATION_URL: postgresql://paxth:paxth@127.0.0.1:5432/paxth_test
+  PUBLIC_ORIGIN: https://qa.example.test
+  ADMIN_USERNAME: ci-admin
+  ADMIN_PASSWORD_SCRYPT: scrypt$131072$8$1$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  SESSION_SECRET: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  SETTINGS_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  CLOAKBROWSER_LICENSE_KEY: ci-config-validation-only
+  CLOAKBROWSER_AUTO_UPDATE: "false"
+  CLOAKBROWSER_CACHE_DIR: /tmp/cloakbrowser
+  CLOAKBROWSER_VERSION: 146.0.7680.177.5
+  NODE_ENV: test
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: paxth_test
+          POSTGRES_USER: paxth
+          POSTGRES_PASSWORD: paxth
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U paxth -d paxth_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm audit --omit=dev --audit-level=moderate
+      - run: npm run build
+      - run: npm run db:migrate
+      - run: npm run test:migrations
+        env:
+          PAXTH_RUN_DB_TESTS: "1"
+      - run: npm run test:api-db
+        env:
+          PAXTH_RUN_DB_TESTS: "1"
+      - run: npm run test:worker-db
+        env:
+          PAXTH_RUN_DB_TESTS: "1"
+      - run: bash -n scripts/*.sh
+
+      - name: Smoke-test production entrypoint
+        env:
+          NODE_ENV: production
+          PORT: "3000"
+        run: |
+          node dist/server/server.js >/tmp/paxth-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:3000/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/paxth-server.log
+          exit 1
+
+      - name: Build production image
+        run: docker build --tag paxth-ci:${{ github.sha }} .
+
+      - name: Smoke-test production image
+        run: |
+          docker run --detach --name paxth-ci --network host \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m,mode=1777 \
+            --env DATABASE_URL \
+            --env PUBLIC_ORIGIN \
+            --env ADMIN_USERNAME \
+            --env ADMIN_PASSWORD_SCRYPT \
+            --env SESSION_SECRET \
+            --env SETTINGS_ENCRYPTION_KEY \
+            --env CLOAKBROWSER_LICENSE_KEY \
+            --env CLOAKBROWSER_AUTO_UPDATE \
+            --env CLOAKBROWSER_CACHE_DIR \
+            --env CLOAKBROWSER_VERSION \
+            --env NODE_ENV=production \
+            paxth-ci:${{ github.sha }}
+          trap 'docker rm --force paxth-ci >/dev/null 2>&1 || true' EXIT
+          for _ in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:3000/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs paxth-ci
+          exit 1
+
+      - name: Validate Compose and Caddy configuration
+        env:
+          APP_IMAGE: ghcr.io/cardiojunkie/paxth-qa-engine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          APP_DOMAIN: qa.example.test
+          ACME_EMAIL: ci@example.test
+          RUNTIME_ENV_FILE: .env.example
+          MIGRATE_ENV_FILE: .env.example
+        run: |
+          docker compose config --quiet
+          docker run --rm \
+            --env APP_DOMAIN \
+            --env ACME_EMAIL \
+            --volume "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.11.4-alpine \
+            caddy validate --config /etc/caddy/Caddyfile
+
+  browser-smoke:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CLOAKBROWSER_AUTO_UPDATE: "false"
+      CLOAKBROWSER_CACHE_DIR: /tmp/cloakbrowser
+      CLOAKBROWSER_LICENSE_KEY: ${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
+      CLOAKBROWSER_VERSION: 146.0.7680.177.5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/cloakbrowser
+          key: cloakbrowser-${{ runner.os }}-${{ env.CLOAKBROWSER_VERSION }}-${{ hashFiles('package-lock.json') }}
+
+      - run: npm ci
+
+      - name: Install browser system libraries
+        run: sudo npx --no-install playwright-core install-deps chromium
+
+      - name: Launch licensed browser
+        run: |
+          test -n "$CLOAKBROWSER_LICENSE_KEY"
+          npx --no-install cloakbrowser install
+          node --input-type=module -e "import {launch} from 'cloakbrowser'; const browser=await launch({headless:true}); try { const page=await browser.newPage(); await page.goto('about:blank'); await page.close(); } finally { await browser.close(); }"

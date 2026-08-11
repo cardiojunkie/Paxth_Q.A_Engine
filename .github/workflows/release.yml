@@ -1,0 +1,120 @@
+name: Release image
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/cardiojunkie/paxth-qa-engine
+  DATABASE_URL: postgresql://paxth:paxth@127.0.0.1:5432/paxth_release
+  DATABASE_MIGRATION_URL: postgresql://paxth:paxth@127.0.0.1:5432/paxth_release
+  PUBLIC_ORIGIN: https://qa.example.test
+  ADMIN_USERNAME: release-admin
+  ADMIN_PASSWORD_SCRYPT: scrypt$131072$8$1$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  SESSION_SECRET: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  SETTINGS_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  CLOAKBROWSER_AUTO_UPDATE: "false"
+  CLOAKBROWSER_VERSION: 146.0.7680.177.5
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: paxth_release
+          POSTGRES_USER: paxth
+          POSTGRES_PASSWORD: paxth
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U paxth -d paxth_release"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate semantic version tag
+        shell: bash
+        run: '[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cloakbrowser
+          key: cloakbrowser-${{ runner.os }}-${{ env.CLOAKBROWSER_VERSION }}-${{ hashFiles('package-lock.json') }}
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm audit --omit=dev --audit-level=moderate
+      - run: npm run build
+      - run: npm run db:migrate
+
+      - name: Install browser system libraries
+        run: sudo npx --no-install playwright-core install-deps chromium
+
+      - name: Launch licensed browser
+        env:
+          CLOAKBROWSER_CACHE_DIR: ${{ runner.temp }}/cloakbrowser
+          CLOAKBROWSER_LICENSE_KEY: ${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
+        run: |
+          test -n "$CLOAKBROWSER_LICENSE_KEY"
+          npx --no-install cloakbrowser install
+          node --input-type=module -e "import {launch} from 'cloakbrowser'; const browser=await launch({headless:true}); try { const page=await browser.newPage(); await page.goto('about:blank'); await page.close(); } finally { await browser.close(); }"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: metadata
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=sha,prefix=sha-,format=long
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Create immutable deployment input
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir release
+          printf 'APP_IMAGE=%s@%s\nSOURCE_SHA=%s\nRELEASE_TAG=%s\n' "$IMAGE" "$DIGEST" "$GITHUB_SHA" "$GITHUB_REF_NAME" > release/release.env
+          printf 'Published %s@%s\n' "$IMAGE" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.ref_name }}
+          path: release/release.env
+          retention-days: 30

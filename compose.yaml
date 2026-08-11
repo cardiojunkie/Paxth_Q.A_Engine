@@ -1,0 +1,145 @@
+x-logging: &bounded-logging
+  driver: local
+  options:
+    max-size: 10m
+    max-file: "5"
+
+x-app-security: &app-security
+  user: "1000:1000"
+  read_only: true
+  init: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=512m,mode=1777
+  logging: *bounded-logging
+
+services:
+  migrate:
+    <<: *app-security
+    image: ${APP_IMAGE:?Set APP_IMAGE to the immutable GHCR image digest}
+    pull_policy: always
+    command: ["npm", "run", "db:migrate"]
+    env_file:
+      - ${MIGRATE_ENV_FILE:-/etc/paxth-qa/migrate.env}
+    environment:
+      NODE_ENV: production
+      NPM_CONFIG_CACHE: /tmp/npm-cache
+    networks:
+      - app
+    restart: "no"
+    mem_limit: 512m
+    pids_limit: 64
+
+  browser-init:
+    <<: *app-security
+    image: ${APP_IMAGE:?Set APP_IMAGE to the immutable GHCR image digest}
+    pull_policy: always
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        npx --no-install cloakbrowser install &&
+        node --input-type=module -e
+        "import {launch} from 'cloakbrowser'; const browser=await launch({headless:true}); try { const page=await browser.newPage(); await page.goto('about:blank'); await page.close(); } finally { await browser.close(); }"
+    env_file:
+      - ${RUNTIME_ENV_FILE:-/etc/paxth-qa/runtime.env}
+    environment:
+      CLOAKBROWSER_AUTO_UPDATE: "false"
+      CLOAKBROWSER_CACHE_DIR: /var/cache/cloakbrowser
+      HOME: /tmp
+      NPM_CONFIG_CACHE: /tmp/npm-cache
+    volumes:
+      - cloakbrowser_cache:/var/cache/cloakbrowser
+    networks:
+      - app
+    restart: "no"
+    mem_limit: 1g
+    pids_limit: 128
+    shm_size: 512m
+
+  app:
+    <<: *app-security
+    image: ${APP_IMAGE:?Set APP_IMAGE to the immutable GHCR image digest}
+    pull_policy: always
+    env_file:
+      - ${RUNTIME_ENV_FILE:-/etc/paxth-qa/runtime.env}
+    environment:
+      NODE_ENV: production
+      HOME: /tmp
+      PORT: "3000"
+      CLOAKBROWSER_AUTO_UPDATE: "false"
+      CLOAKBROWSER_CACHE_DIR: /var/cache/cloakbrowser
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      browser-init:
+        condition: service_completed_successfully
+    expose:
+      - "3000"
+    volumes:
+      - cloakbrowser_cache:/var/cache/cloakbrowser:ro
+    networks:
+      - app
+    restart: unless-stopped
+    stop_grace_period: 180s
+    mem_limit: 2500m
+    pids_limit: 256
+    shm_size: 512m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  caddy:
+    image: caddy:2.11.4-alpine
+    pull_policy: always
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?Set APP_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - app
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    logging: *bounded-logging
+    mem_limit: 256m
+    pids_limit: 64
+
+networks:
+  app:
+    name: paxth-qa-internal
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: paxthqa0
+
+volumes:
+  caddy_config:
+  caddy_data:
+  cloakbrowser_cache:

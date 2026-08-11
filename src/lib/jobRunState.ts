@@ -1,10 +1,3 @@
-export type JobSkuState = {
-  sku: string;
-  status: string;
-  qa_result?: unknown;
-  error?: string | null;
-};
-
 type AttributeSetItem = {
   attribute_set?: string | null;
 };
@@ -12,27 +5,6 @@ type AttributeSetItem = {
 type HeaderItem = {
   source?: { headerOrder?: string[] };
   raw_row?: Record<string, unknown>;
-};
-
-type JobItem = {
-  status: string;
-  skus: string[];
-};
-
-export const hasCompletedQa = (sku: JobSkuState) => !sku.error && (sku.status === "completed" || Boolean(sku.qa_result));
-
-export const selectJobSkus = <T extends JobSkuState>(skus: T[], skuId?: string) =>
-  skuId ? skus.filter((sku) => sku.sku === skuId) : skus.filter((sku) => !hasCompletedQa(sku));
-
-export const getJobRunStatus = (
-  skus: JobSkuState[],
-  processedSkuIds: Set<string>,
-  runHadError: boolean,
-) => {
-  if (runHadError) return "failed" as const;
-
-  const remaining = skus.filter((sku) => !processedSkuIds.has(sku.sku) && !hasCompletedQa(sku));
-  return remaining.some((sku) => sku.status === "failed") ? "failed" : remaining.length ? "pending" : "completed";
 };
 
 export const getCommonAttributeSet = (items: AttributeSetItem[]) => {
@@ -66,10 +38,6 @@ export const getCommonHeaderOrder = (items: HeaderItem[]) => {
     legacy: true,
   };
 };
-
-export const getCompletedJobSkuIds = (items: JobItem[]) => [
-  ...new Set(items.filter((item) => item.status === "completed").flatMap((item) => item.skus)),
-];
 
 export const getExportColumns = (headers: string[], maxIssues: number) => [
   ...headers.map((header, index) => ({ header, key: `input_${index}`, width: 20 })),

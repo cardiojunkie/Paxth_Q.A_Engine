@@ -7,9 +7,9 @@ import { cn } from "../lib/utils";
 
 interface AttributeSetEditorProps {
   initialData: AttributeSet | null;
-  onSave: (data: Omit<AttributeSet, "id" | "createdAt" | "updatedAt">) => void;
+  onSave: (data: Omit<AttributeSet, "id" | "createdAt" | "updatedAt">) => void | Promise<void>;
   onCancel: () => void;
-  onDelete?: () => void;
+  onDelete?: () => void | Promise<void>;
 }
 
 export function AttributeSetEditor({ initialData, onSave, onCancel, onDelete, error }: AttributeSetEditorProps & { error?: string | null }) {
@@ -18,6 +18,7 @@ export function AttributeSetEditor({ initialData, onSave, onCancel, onDelete, er
   const [activeTab, setActiveTab] = useState<"edit" | "preview">("edit");
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
     setName(initialData?.name || "");
@@ -30,16 +31,18 @@ export function AttributeSetEditor({ initialData, onSave, onCancel, onDelete, er
     if (error) setLocalError(error);
   }, [error]);
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!name.trim()) {
       setLocalError("Please provide a name for the attribute set.");
       return;
     }
     setLocalError(null);
-    onSave({
-      name: name.trim(),
-      rulesMarkdown,
-    });
+    setIsSaving(true);
+    try {
+      await onSave({ name: name.trim(), rulesMarkdown });
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -49,6 +52,7 @@ export function AttributeSetEditor({ initialData, onSave, onCancel, onDelete, er
         <div className="flex-1 mr-8">
           <input 
             type="text"
+            aria-label="Attribute set name"
             value={name}
             onChange={(e) => {
               setName(e.target.value);
@@ -78,7 +82,7 @@ export function AttributeSetEditor({ initialData, onSave, onCancel, onDelete, er
                   <div className="flex items-center gap-2">
                     <span className="text-[10px] uppercase font-bold text-red-600">Sure?</span>
                     <button 
-                      onClick={onDelete}
+                      onClick={() => void onDelete()}
                       className="text-[10px] uppercase font-bold text-white bg-red-600 px-2 py-0.5 rounded-sm hover:bg-red-700 transition-colors"
                     >
                       Yes
@@ -137,6 +141,7 @@ export function AttributeSetEditor({ initialData, onSave, onCancel, onDelete, er
             <div className="flex-1 overflow-y-auto min-h-0 relative">
                {activeTab === "edit" ? (
                  <textarea
+                   aria-label="Attribute mapping rules"
                    value={rulesMarkdown}
                    onChange={(e) => setRulesMarkdown(e.target.value)}
                    className="w-full h-full resize-none border-0 bg-transparent text-sm leading-relaxed text-[#4A4A4A] focus:ring-0 p-0 font-mono"
@@ -155,13 +160,14 @@ export function AttributeSetEditor({ initialData, onSave, onCancel, onDelete, er
 
             <div className="mt-6 pt-6 border-t border-[#E5E2DE] flex justify-between items-center shrink-0">
               <div className="text-[10px] text-[#8C8882]">
-                AUTO-SAVED TO PERSISTENT STORAGE
+                SAVED TO SERVER WHEN SUBMITTED
               </div>
               <button 
-                onClick={handleSave}
+                onClick={() => void handleSave()}
+                disabled={isSaving}
                 className="bg-[#7C8370] text-white text-[11px] px-6 py-2 uppercase tracking-widest font-bold hover:bg-[#686E5E] transition-colors"
               >
-                {initialData ? "Update Logic" : "Create Logic"}
+                {isSaving ? "Saving…" : initialData ? "Update Logic" : "Create Logic"}
               </button>
             </div>
           </div>

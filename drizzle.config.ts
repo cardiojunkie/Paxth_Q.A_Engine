@@ -8,7 +8,9 @@ export default defineConfig({
   out: "./drizzle",
   dialect: "postgresql",
   dbCredentials: {
-    url: process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5432/paxth_qa_engine",
+    url: process.env.DATABASE_MIGRATION_URL || process.env.DATABASE_URL || (() => {
+      throw new Error("DATABASE_MIGRATION_URL or DATABASE_URL is required");
+    })(),
   },
   verbose: true,
 });
