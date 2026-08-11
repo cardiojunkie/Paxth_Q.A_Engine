@@ -10,6 +10,7 @@ export type AuthConfig = {
   publicOrigin: string;
   secureCookies: boolean;
   cookieName: string;
+  allowRequestOrigin: boolean;
 };
 
 export function loadAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig {
@@ -28,7 +29,15 @@ export function loadAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig
   const secureCookies = parsedOrigin.protocol === "https:";
   const localHttp = parsedOrigin.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(parsedOrigin.hostname.replace(/^\[|\]$/g, ""));
   if (!secureCookies && (!localHttp || env.NODE_ENV === "production")) throw new Error("PUBLIC_ORIGIN must use HTTPS outside local development");
-  return { username, passwordHash: passwordHash!, sessionSecret, publicOrigin, secureCookies, cookieName: secureCookies ? "__Host-paxth_session" : "paxth_session" };
+  return {
+    username,
+    passwordHash: passwordHash!,
+    sessionSecret,
+    publicOrigin,
+    secureCookies,
+    cookieName: secureCookies ? "__Host-paxth_session" : "paxth_session",
+    allowRequestOrigin: env.NODE_ENV !== "production",
+  };
 }
 
 function parsePasswordHash(serialized: string) {
@@ -99,7 +108,12 @@ export function requireSameOrigin(config: AuthConfig) {
   return (request: Request, response: Response, next: NextFunction) => {
     if (!["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) return next();
     const origin = request.headers.origin;
-    if (origin !== config.publicOrigin) return response.status(403).json({ error: { code: "invalid_origin", message: "Invalid request origin" } });
+    let validOrigin = origin === config.publicOrigin;
+    if (!validOrigin && config.allowRequestOrigin && typeof origin === "string") {
+      try { validOrigin = new URL(origin).origin === `${request.protocol}://${request.get("host")}`; }
+      catch { validOrigin = false; }
+    }
+    if (!validOrigin) return response.status(403).json({ error: { code: "invalid_origin", message: "Invalid request origin" } });
     if (request.headers["content-type"] !== "application/json") return response.status(415).json({ error: { code: "unsupported_media_type", message: "Content-Type must be application/json" } });
     next();
   };

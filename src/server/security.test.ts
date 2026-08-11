@@ -49,15 +49,15 @@ setSessionCookie({ setHeader: (name: string, value: string | number | readonly s
 assert.match(cookie, /^__Host-paxth_session=/);
 for (const attribute of ["Path=/", "HttpOnly", "Secure", "SameSite=Strict", "Max-Age=43200"]) assert.match(cookie, new RegExp(attribute));
 
-function checkOrigin(headers: Record<string, string>) {
+function checkOrigin(headers: Record<string, string>, config = auth, protocol = "https", host = "enzqm.aiccloud.online") {
   let status = 0;
   let next = false;
   const response = {
     status(value: number) { status = value; return this; },
     json() { return this; },
   };
-  requireSameOrigin(auth)(
-    { method: "POST", headers, is: (type: string) => type === "application/json" && headers["content-type"] === "application/json" } as Parameters<ReturnType<typeof requireSameOrigin>>[0],
+  requireSameOrigin(config)(
+    { method: "POST", headers, protocol, get: () => host, is: (type: string) => type === "application/json" && headers["content-type"] === "application/json" } as unknown as Parameters<ReturnType<typeof requireSameOrigin>>[0],
     response as Parameters<ReturnType<typeof requireSameOrigin>>[1],
     (() => { next = true; }) as Parameters<ReturnType<typeof requireSameOrigin>>[2],
   );
@@ -67,6 +67,15 @@ assert.deepEqual(checkOrigin({ origin: auth.publicOrigin, "content-type": "appli
 assert.deepEqual(checkOrigin({ origin: "https://evil.example", "content-type": "application/json" }), { status: 403, next: false });
 assert.deepEqual(checkOrigin({ origin: auth.publicOrigin }), { status: 415, next: false });
 assert.deepEqual(checkOrigin({ origin: auth.publicOrigin, "content-type": "application/json; charset=utf-8" }), { status: 415, next: false });
+const devAuth = loadAuthConfig({
+  ADMIN_USERNAME: "admin",
+  ADMIN_PASSWORD_SCRYPT: passwordHash,
+  SESSION_SECRET: sessionSecret,
+  PUBLIC_ORIGIN: "http://127.0.0.1:3000",
+  NODE_ENV: "development",
+});
+assert.deepEqual(checkOrigin({ origin: "http://localhost:3000", "content-type": "application/json" }, devAuth, "http", "localhost:3000"), { status: 0, next: true });
+assert.deepEqual(checkOrigin({ origin: "https://evil.example", "content-type": "application/json" }, devAuth, "http", "localhost:3000"), { status: 403, next: false });
 
 const settings: AppSettings = {
   baseUrl: "https://api.example.com/v1/chat/completions",

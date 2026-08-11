@@ -10,5 +10,7 @@
 !src/**
 !drizzle/
 !drizzle/**
+!certs/
+!certs/**
 !public/
 !public/**

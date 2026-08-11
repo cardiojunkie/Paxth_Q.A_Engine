@@ -29,6 +29,7 @@ RUN npm ci --omit=dev \
 
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node drizzle ./drizzle
+COPY --chown=node:node certs ./certs
 
 USER node
 EXPOSE 3000
