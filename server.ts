@@ -618,12 +618,6 @@ async function startServer() {
             delete currentPayload.response_format;
           }
 
-          // If status >= 400 and max_tokens > 4096, cap to 4096
-          if (response.status >= 400 && currentPayload.max_tokens && currentPayload.max_tokens > 4096) {
-            console.warn(`[Proxy Chat] Endpoint returned ${response.status} with max_tokens ${currentPayload.max_tokens}. Capping to 4096...`);
-            currentPayload.max_tokens = 4096;
-          }
-
           // If status >= 400 and user content is very long, truncate user content
           if (response.status >= 400 && Array.isArray(currentPayload.messages) && currentPayload.messages.length > 0) {
             const lastMsg = currentPayload.messages[currentPayload.messages.length - 1];

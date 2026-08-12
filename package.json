@@ -15,6 +15,7 @@
     "test:tab-capture": "tsx src/lib/captureDynamicTabs.test.ts",
     "test:blocked-page": "tsx src/lib/blockedScrapePage.test.ts",
     "test:lazy-content": "tsx src/lib/loadLazyPageContent.test.ts",
+    "test:llm-response": "tsx src/lib/llmResponse.test.ts",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio"

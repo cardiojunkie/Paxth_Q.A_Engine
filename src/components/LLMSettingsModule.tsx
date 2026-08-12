@@ -265,13 +265,16 @@ export function LLMSettingsModule() {
               </div>
 
               <div>
-                <label className="block text-[10px] uppercase tracking-widest text-[#8C8882] mb-2">Max Tokens</label>
+                <label className="block text-[10px] uppercase tracking-widest text-[#8C8882] mb-2">Max Output Tokens</label>
                 <input 
                   type="number"
+                  min="1"
+                  step="1"
                   value={Number.isNaN(localSettings.maxTokens) ? '' : localSettings.maxTokens}
-                  onChange={(e) => handleChange("maxTokens", e.target.value === '' ? 0 : parseInt(e.target.value, 10))}
+                  onChange={(e) => handleChange("maxTokens", e.target.value === '' ? 1 : Math.max(parseInt(e.target.value, 10), 1))}
                   className="w-full bg-[#F5F2EF] border border-transparent hover:border-[#E5E2DE] focus:border-[#1A1A1A] outline-none rounded-sm px-4 py-2.5 text-sm transition-colors"
                 />
+                <p className="text-[10px] text-[#8C8882] mt-2">Maximum generated response length. Your provider and model enforce the supported limit.</p>
               </div>
             </div>
           </section>

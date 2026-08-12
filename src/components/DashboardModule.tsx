@@ -692,11 +692,11 @@ export function DashboardModule() {
                       )}
                     </th>
                     <th className="p-3 font-normal">SKU Code</th>
+                    <th className="p-3 font-normal">Name</th>
                     <th className="p-3 font-normal">Attribute Set</th>
                     <th className="p-3 font-normal">SAP Available</th>
                     <th className="p-3 font-normal">URL Available</th>
                     <th className="p-3 font-normal">Scraped Data</th>
-                    <th className="p-3 font-normal">Status</th>
                     <th className="p-3 font-normal text-right">Actions</th>
                   </tr>
                 </thead>
@@ -714,6 +714,7 @@ export function DashboardModule() {
                         )}
                       </td>
                       <td className="p-3 font-mono text-[#1A1A1A] font-medium">{sku.sku}</td>
+                      <td className="p-3 text-[#1A1A1A]">{sku.raw_row?.name ?? sku.raw_row?.Name ?? <span className="text-[#B8B4AE]">—</span>}</td>
                       <td className="p-3 text-[#1A1A1A]">{sku.attribute_set || <span className="text-[#8C8882] italic">Unassigned</span>}</td>
                       <td className="p-3">
                         {sku.source.sap ? (
@@ -745,18 +746,6 @@ export function DashboardModule() {
                         ) : sku.source.url ? (
                           <span className="text-[#8C8882] text-xs">Pending</span>
                         ) : <span className="text-[#B8B4AE]">—</span>}
-                      </td>
-                      <td className="p-3">
-                        <span className={cn(
-                          "px-2 py-0.5 text-[10px] uppercase font-bold tracking-wider rounded-xs",
-                          sku.status === 'ready' ? "bg-emerald-100 text-emerald-800" :
-                          sku.status === 'cannot_qa' ? "bg-amber-100 text-amber-800" :
-                          sku.status === 'completed' ? "bg-blue-100 text-blue-800" :
-                          sku.status === 'failed' ? "bg-rose-100 text-rose-800" :
-                          "bg-[#F5F2EF] text-[#8C8882]"
-                        )}>
-                          {sku.status.replace("_", " ")}
-                        </span>
                       </td>
                       <td className="p-3 text-right">
                          <button 

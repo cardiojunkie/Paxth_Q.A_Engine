@@ -17,6 +17,7 @@ const skus = [
 ];
 
 assert.deepEqual(selectJobSkus(skus).map((sku) => sku.sku), ["retry"]);
+assert.deepEqual(selectJobSkus(skus, undefined, true).map((sku) => sku.sku), ["done", "qa-fail", "retry"]);
 assert.deepEqual(selectJobSkus(skus, "done").map((sku) => sku.sku), ["done"]);
 assert.deepEqual(selectJobSkus([{ ...skus[0], error: "API error", qa_result: {} }]).map((sku) => sku.sku), ["done"]);
 assert.equal(getJobRunStatus(skus, new Set(["done"]), false), "failed");

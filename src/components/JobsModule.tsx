@@ -1,7 +1,7 @@
 import React, { useState, useRef } from "react";
 import { Play, StopCircle, CheckCircle, AlertCircle, Clock, Download, Eye, Trash2, X, AlertTriangle, FileSpreadsheet, ChevronDown, ChevronUp } from "lucide-react";
 import { useAppContext, Job } from "../context/AppContext";
-import { useSettings } from "../hooks/useSettings";
+import { normalizeMaxTokens, useSettings } from "../hooks/useSettings";
 import { useAttributeSets } from "../hooks/useAttributeSets";
 import {
   getCommonAttributeSet,
@@ -12,6 +12,7 @@ import {
   hasCompletedQa,
   selectJobSkus,
 } from "../lib/jobRunState";
+import { extractLLMResponseContent, parseLLMJsonResponse } from "../lib/llmResponse";
 import { cn } from "../lib/utils";
 import ExcelJS from "exceljs";
 import { saveAs } from "file-saver";
@@ -73,40 +74,6 @@ Required JSON Schema:
   }
 }`;
 
-function extractLLMResponseContent(data: any): string {
-  if (!data) return "";
-  if (typeof data === "string") return data;
-
-  const choice = data.choices?.[0];
-  if (choice) {
-    if (typeof choice.message?.content === "string" && choice.message.content.trim()) {
-      return choice.message.content;
-    }
-    if (Array.isArray(choice.message?.content)) {
-      const textPart = choice.message.content.find((p: any) => p.text || p.type === 'text');
-      if (textPart?.text) return textPart.text;
-    }
-    if (typeof choice.message?.reasoning_content === "string" && choice.message.reasoning_content.trim()) {
-      return choice.message.reasoning_content;
-    }
-    if (typeof choice.text === "string" && choice.text.trim()) {
-      return choice.text;
-    }
-  }
-
-  if (Array.isArray(data.content)) {
-    const textBlock = data.content.find((item: any) => item.type === "text" || item.text);
-    if (textBlock?.text) return textBlock.text;
-  }
-
-  if (typeof data.content === "string" && data.content.trim()) return data.content;
-  if (typeof data.response === "string" && data.response.trim()) return data.response;
-  if (typeof data.output === "string" && data.output.trim()) return data.output;
-  if (typeof data.result === "string" && data.result.trim()) return data.result;
-
-  return "";
-}
-
 function parseApiErrorMessage(status: number, rawText: string): string {
   if (!rawText) return status ? `LLM API returned HTTP ${status}` : "Unknown error";
   try {
@@ -126,59 +93,6 @@ function parseApiErrorMessage(status: number, rawText: string): string {
     // Not JSON
   }
   return rawText;
-}
-
-function parseLLMJsonResponse(content: string): any {
-  if (!content || typeof content !== "string") {
-    throw new Error("Empty or non-string response content from LLM");
-  }
-
-  let clean = content.trim();
-
-  // Remove reasoning/think tags if present (e.g., DeepSeek R1 models)
-  clean = clean.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-
-  // Remove markdown code blocks if present
-  if (clean.includes("\`\`\`")) {
-    clean = clean.replace(/\`\`\`(?:json)?\n?/gi, "").replace(/\n?\`\`\`/gi, "").trim();
-  }
-
-  // 1. Direct JSON parse
-  try {
-    return JSON.parse(clean);
-  } catch (e1) {
-    // 2. Extract substring between first { and last }
-    const firstBrace = clean.indexOf("{");
-    const lastBrace = clean.lastIndexOf("}");
-    if (firstBrace !== -1 && lastBrace > firstBrace) {
-      const jsonSub = clean.substring(firstBrace, lastBrace + 1);
-      try {
-        return JSON.parse(jsonSub);
-      } catch (e2) {
-        // 3. Clean trailing commas in object or array
-        const fixedCommas = jsonSub.replace(/,\s*([\}\]])/g, '$1');
-        try {
-          return JSON.parse(fixedCommas);
-        } catch (e3) {
-          // 4. Try fixing newline breaks in raw text strings
-          const fixedNewlines = fixedCommas.replace(/(?<=:\s*"[^"]*)\n([^"]*")/g, '\\n$1');
-          try {
-            return JSON.parse(fixedNewlines);
-          } catch (e4) {
-            // Throw the error from the most relevant JSON subset
-            throw e2;
-          }
-        }
-      }
-    }
-    
-    // Also try trailing comma fix on original clean text
-    try {
-      return JSON.parse(clean.replace(/,\s*([\}\]])/g, '$1'));
-    } catch (e5) {
-      throw e1;
-    }
-  }
 }
 
 export function JobsModule() {
@@ -208,7 +122,7 @@ export function JobsModule() {
     }
   };
 
-  const runJob = async (jobId: string, isSequential = false, skuId?: string): Promise<boolean> => {
+  const runJob = async (jobId: string, isSequential = false, skuId?: string, rerunAll = false): Promise<boolean> => {
     if (runningJobId && !isSequential) return false;
     
     if (!settings.apiKey || !settings.baseUrl || !settings.modelName) {
@@ -229,7 +143,7 @@ export function JobsModule() {
     await updateJob(jobId, { status: "running", error: null });
     
     const allSkusInJob = job.skus.map((id) => skuDataList.find((sku) => sku.sku === id)).filter(Boolean) as typeof skuDataList;
-    const skusToProcess = selectJobSkus(allSkusInJob, skuId);
+    const skusToProcess = selectJobSkus(allSkusInJob, skuId, rerunAll);
     const processedSkuIds = new Set<string>();
     
     if (skusToProcess.length === 0) {
@@ -341,7 +255,7 @@ ${finalMarkdown || "N/A"}`.trim();
 
             let isRateLimit = false;
 
-            const maxTokensVal = Math.min(Math.max(Number(settings.maxTokens) || 4096, 1), 4096);
+            const maxTokensVal = normalizeMaxTokens(settings.maxTokens);
 
             try {
               const res1 = await fetch(`/api/chat`, {
@@ -408,6 +322,7 @@ ${finalMarkdown || "N/A"}`.trim();
                     model: settings.modelName,
                     temperature: Number(settings.temperature) || 0.1,
                     max_tokens: maxTokensVal,
+                    response_format: { type: "json_object" },
                     messages: [
                       { role: "system", content: dynamicSystemPrompt + "\nIMPORTANT: Return ONLY a valid JSON object." },
                       { role: "user", content: userPromptContent }
@@ -451,6 +366,7 @@ ${skuItem.source.sap || "N/A"}`.trim();
                     model: settings.modelName,
                     temperature: Number(settings.temperature) || 0.1,
                     max_tokens: maxTokensVal,
+                    response_format: { type: "json_object" },
                     messages: [
                       { role: "system", content: dynamicSystemPrompt + "\nIMPORTANT: Return ONLY a valid JSON object." },
                       { role: "user", content: minUserPrompt }
@@ -479,29 +395,11 @@ ${skuItem.source.sap || "N/A"}`.trim();
 
             if (!content || !content.trim()) throw new Error(`LLM endpoint returned no content. ${lastApiErr}`);
             
-            let qaResult: any = {};
+            let qaResult: any;
             try {
               qaResult = parseLLMJsonResponse(content);
             } catch (parseError: any) {
-              console.warn(`JSON parse warning for SKU ${skuItem.sku}:`, parseError);
-              qaResult = {
-                sku: skuItem.sku,
-                qa_status: "warning",
-                confidence: "low",
-                summary: "LLM output formatting issue. Raw output saved in analysis.",
-                issue_count: 1,
-                issues: [{
-                  field: "general",
-                  issue_type: "formatting",
-                  severity: "minor",
-                  uploaded_value: "",
-                  source_truth: "",
-                  explanation: `LLM JSON syntax error (${parseError.message}). Excerpt: ${content ? content.slice(0, 300) : "empty response"}`,
-                  suggested_fix: "Re-run QA for this SKU or check LLM settings.",
-                  cell_color: "yellow"
-                }],
-                raw_llm_response: content
-              };
+              throw new Error(`LLM returned invalid JSON: ${parseError.message}`);
             }
             
             const skuTimeTaken = Date.now() - skuStartTime;
@@ -912,6 +810,7 @@ ${skuItem.source.sap || "N/A"}`.trim();
             {jobs.map((job) => {
               const jobSkus = getJobSkusList(job);
               const completedCount = jobSkus.filter(hasCompletedQa).length;
+              const unresolvedCount = jobSkus.length - completedCount;
 
               return (
                 <div key={job.id} className="bg-white border border-[#E5E2DE] rounded-sm p-5 flex items-center shadow-sm hover:border-[#1A1A1A]/30 transition-all gap-4">
@@ -972,7 +871,7 @@ ${skuItem.source.sap || "N/A"}`.trim();
                       title="View job details"
                     >
                       <Eye className="w-3.5 h-3.5" />
-                      View Job
+                      View Results
                     </button>
 
                     {completedCount > 0 && (
@@ -997,14 +896,27 @@ ${skuItem.source.sap || "N/A"}`.trim();
                       </>
                     )}
 
-                    <button
-                      onClick={() => runJob(job.id)}
-                      disabled={!!runningJobId || job.status === 'completed'}
-                      className="flex items-center gap-2 px-4 py-2 text-[11px] uppercase tracking-widest border border-[#1A1A1A] bg-[#1A1A1A] text-white hover:bg-black transition-colors rounded-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      <Play className="w-3.5 h-3.5" />
-                      {job.status === 'completed' ? 'Done' : (job.status === 'failed' || completedCount > 0 ? 'Resume Q.A' : 'Run Q.A')}
-                    </button>
+                    {unresolvedCount > 0 && (
+                      <button
+                        onClick={() => runJob(job.id)}
+                        disabled={!!runningJobId}
+                        className="flex items-center gap-2 px-4 py-2 text-[11px] uppercase tracking-widest border border-[#1A1A1A] bg-[#1A1A1A] text-white hover:bg-black transition-colors rounded-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <Play className="w-3.5 h-3.5" />
+                        {job.status === 'pending' && completedCount === 0 ? 'Run Q.A' : 'Resume Q.A'}
+                      </button>
+                    )}
+
+                    {completedCount > 0 && (
+                      <button
+                        onClick={() => runJob(job.id, false, undefined, true)}
+                        disabled={!!runningJobId}
+                        className="flex items-center gap-2 px-4 py-2 text-[11px] uppercase tracking-widest border border-[#1A1A1A] text-[#1A1A1A] bg-white hover:bg-[#F5F2EF] transition-colors rounded-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <Play className="w-3.5 h-3.5" />
+                        Rerun All
+                      </button>
+                    )}
 
                     <button
                       onClick={() => {
@@ -1084,13 +996,14 @@ ${skuItem.source.sap || "N/A"}`.trim();
             {/* Content Body */}
             <div className="flex-1 overflow-y-auto p-6 space-y-4">
               <div className="text-xs text-[#8C8882] uppercase tracking-widest font-semibold mb-2">
-                Outlined Issues per SKU
+                QA Results per SKU
               </div>
 
               {getJobSkusList(selectedJobToView).map((sku) => {
-                const qa = sku.raw_row.qa_result;
+                const qa = sku.qa_result || sku.raw_row?.qa_result;
                 const issues = qa?.issues || [];
                 const isExpanded = expandedSku === sku.sku;
+                const displayStatus = sku.error ? "failed" : qa?.qa_status || sku.status;
 
                 return (
                   <div key={sku.sku} className="border border-[#E5E2DE] rounded-sm overflow-hidden bg-[#FDFCFB]">
@@ -1102,12 +1015,12 @@ ${skuItem.source.sap || "N/A"}`.trim();
                         <span className="font-mono font-bold text-sm text-[#1A1A1A]">SKU: {sku.sku}</span>
                         <span className={cn(
                           "px-2 py-0.5 text-[10px] uppercase tracking-widest font-bold rounded-sm",
-                          qa?.qa_status === 'pass' && "bg-emerald-100 text-emerald-800",
-                          qa?.qa_status === 'warning' && "bg-amber-100 text-amber-800",
-                          qa?.qa_status === 'fail' && "bg-red-100 text-red-800",
-                          !qa && "bg-gray-100 text-gray-800"
+                          displayStatus === 'pass' && "bg-emerald-100 text-emerald-800",
+                          displayStatus === 'warning' && "bg-amber-100 text-amber-800",
+                          (displayStatus === 'fail' || displayStatus === 'failed') && "bg-red-100 text-red-800",
+                          !qa && !sku.error && "bg-gray-100 text-gray-800"
                         )}>
-                          {qa?.qa_status || sku.status}
+                          {displayStatus}
                         </span>
 
                         <span className="text-xs text-[#8C8882]">
@@ -1137,8 +1050,11 @@ ${skuItem.source.sap || "N/A"}`.trim();
                           <Play className="w-3 h-3" />
                           Rerun Q.A
                         </button>
-                        <span className="text-xs text-[#8C8882] italic max-w-xs truncate">
-                          {qa?.summary || 'No QA run yet'}
+                        <span
+                          className={cn("text-xs italic max-w-xs truncate", sku.error ? "text-red-700" : "text-[#8C8882]")}
+                          title={sku.error || qa?.summary || 'No QA run yet'}
+                        >
+                          {sku.error ? `Error: ${sku.error}` : qa?.summary || 'No QA run yet'}
                         </span>
                         {isExpanded ? <ChevronUp className="w-4 h-4 text-[#8C8882]" /> : <ChevronDown className="w-4 h-4 text-[#8C8882]" />}
                       </div>

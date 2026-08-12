@@ -21,8 +21,8 @@ type JobItem = {
 
 export const hasCompletedQa = (sku: JobSkuState) => !sku.error && (sku.status === "completed" || Boolean(sku.qa_result));
 
-export const selectJobSkus = <T extends JobSkuState>(skus: T[], skuId?: string) =>
-  skuId ? skus.filter((sku) => sku.sku === skuId) : skus.filter((sku) => !hasCompletedQa(sku));
+export const selectJobSkus = <T extends JobSkuState>(skus: T[], skuId?: string, rerunAll = false) =>
+  skuId ? skus.filter((sku) => sku.sku === skuId) : rerunAll ? skus : skus.filter((sku) => !hasCompletedQa(sku));
 
 export const getJobRunStatus = (
   skus: JobSkuState[],
