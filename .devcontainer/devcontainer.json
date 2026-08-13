@@ -16,6 +16,9 @@
       ]
     }
   },
+  "remoteEnv": {
+    "NODE_OPTIONS": "--no-experimental-global-navigator"
+  },
   "forwardPorts": [3000],
   "portsAttributes": {
     "3000": {

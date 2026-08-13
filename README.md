@@ -2,6 +2,27 @@
 
 A production-quality internal QA automation web application for ecommerce catalog teams. This tool allows catalog operations managers to upload Excel product templates (`.xlsx` / `.xls`), parse SKU rows into structured JSON, scrape live source product URLs into clean Markdown, and execute automated LLM-based Quality Assurance checks against official SAP source data and live product pages.
 
+## Quick Start
+
+Requirements: Node.js 18+ and PostgreSQL.
+
+```bash
+cp .env.example .env
+npm install
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). Set `DATABASE_URL` in `.env` before uploading data; the database stores SKUs, scraped content, QA results, and job logs. Configure the LLM provider in the app under **LLM Settings**.
+
+For a production build:
+
+```bash
+npm run build
+npm start
+```
+
+The optional `./start.sh` helper stops this project's existing listeners on ports 3000 and 24678 before starting development.
+
 ---
 
 ## 📌 Executive Summary & Business Logic.
@@ -185,7 +206,7 @@ When transitioning development to **GitHub Codespaces**, keep the following key 
 
 ### 1. Devcontainer & Automatic Setup
 - A `.devcontainer/devcontainer.json` file is included in the project repository.
-- When launching in GitHub Codespaces, Node.js 20 and recommended VS Code extensions (ESLint, Tailwind CSS) will be automatically provisioned.
+- When launching in GitHub Codespaces, Node.js 22 and recommended VS Code extensions (ESLint, Tailwind CSS) will be automatically provisioned.
 - Dependencies will automatically install via `postCreateCommand: "npm install"`.
 
 ### 2. Port Configuration & Web Preview
@@ -206,7 +227,7 @@ When transitioning development to **GitHub Codespaces**, keep the following key 
   - `server.ts` automatically runs safe, non-destructive table initializations on startup.
 - **LLM API Key Configuration**:
   - You can configure your API keys (OpenRouter, OpenAI, Gemini, or custom base URLs) **directly in the application UI** under the **LLM Settings** module.
-  - Settings configured via the UI are persisted in browser `localStorage` and shared across sessions. Optionally, you can also set `GEMINI_API_KEY` in `.env`.
+  - Settings configured via the UI are persisted in the browser's `localStorage`. Optionally, you can also set `GEMINI_API_KEY` in `.env`.
 - **API Secrets**:
   - Store sensitive keys in GitHub Codespaces Secrets or in `.env`.
   - Do NOT commit `.env` to version control.
@@ -245,6 +266,20 @@ npm run lint
 # Test production build & start
 npm run build
 npm start
+```
+
+### 6. Tests
+
+Run the TypeScript check and focused scraper/QA tests with:
+
+```bash
+npm run lint
+npm run test:job-state
+npm run test:site-selector
+npm run test:tab-capture
+npm run test:blocked-page
+npm run test:lazy-content
+npm run test:llm-response
 ```
 
 ---

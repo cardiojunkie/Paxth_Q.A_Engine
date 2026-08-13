@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/devcontainers/javascript-node:1-20-bullseye AS system
+FROM mcr.microsoft.com/devcontainers/javascript-node:1-22-bullseye AS system
 
 USER root
 RUN apt-get update \
@@ -9,6 +9,8 @@ RUN apt-get update \
     libatspi2.0-0 \
     libcups2 \
     libgbm1 \
+    libnspr4 \
+    libnss3 \
     libxcomposite1 \
     libxdamage1 \
     libxfixes3 \
