@@ -7,6 +7,7 @@ import TurndownService from "turndown";
 import { launch } from "cloakbrowser";
 import { getBlockedScrapeReason } from "./src/lib/blockedScrapePage.js";
 import { captureDynamicTabs } from "./src/lib/captureDynamicTabs.js";
+import { getDatabaseErrorDetails } from "./src/lib/databaseError.js";
 import { isCompleteWebsiteDomain, normalizeWebsite } from "./src/lib/siteSelectorWebsite.js";
 import { loadLazyPageContent } from "./src/lib/loadLazyPageContent.js";
 import { db } from "./src/db/index.js";
@@ -27,11 +28,15 @@ async function startServer() {
       return res.status(503).json({ status: "disconnected", message: "DATABASE_URL is not configured." });
     }
     try {
-      // Test query
-      await db.select().from(skuData).limit(1);
+      await db.execute(sql`SELECT 1`);
       return res.json({ status: "connected", message: "Database connection successful." });
-    } catch (e: any) {
-      return res.status(500).json({ status: "error", message: e.message });
+    } catch (error: unknown) {
+      const details = getDatabaseErrorDetails(error);
+      const message = details.code
+        ? `Database unavailable (${details.code}): ${details.message}`
+        : `Database unavailable: ${details.message}`;
+      console.error("Database health check failed:", message);
+      return res.status(503).json({ status: "error", message });
     }
   });
 
@@ -43,19 +48,34 @@ async function startServer() {
     next(err);
   });
 
-  
-
   // Auto-migrate tables on start
   if (db) {
-    const runMigrate = async (query: any) => {
-      try {
-        await db.execute(query);
-      } catch (e: any) {
-        // ignore migration step if constraint or column already modified
-      }
-    };
+    let migrationsCanRun = false;
+    try {
+      await db.execute(sql`SELECT 1`);
+      migrationsCanRun = true;
+    } catch (error: unknown) {
+      const details = getDatabaseErrorDetails(error);
+      console.warn(
+        `Database unavailable at startup${details.code ? ` (${details.code})` : ""}; schema initialization skipped: ${details.message}`,
+      );
+    }
 
-    await runMigrate(sql`
+    if (migrationsCanRun) {
+      let migrationFailures = 0;
+      const runMigrate = async (query: any) => {
+        try {
+          await db.execute(query);
+        } catch (error: unknown) {
+          migrationFailures += 1;
+          const details = getDatabaseErrorDetails(error);
+          console.warn(
+            `Database schema migration failed${details.code ? ` (${details.code})` : ""}: ${details.message}`,
+          );
+        }
+      };
+
+      await runMigrate(sql`
         CREATE TABLE IF NOT EXISTS jobs (
           id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
@@ -67,20 +87,20 @@ async function startServer() {
           time_taken INTEGER,
           error TEXT
         );
-    `);
-    await runMigrate(sql`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_attribute_set_id_attribute_sets_id_fk;`);
-    await runMigrate(sql`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_attribute_set_id_fkey;`);
-    await runMigrate(sql`ALTER TABLE jobs ALTER COLUMN created_at TYPE TEXT USING created_at::text;`);
-    await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attribute_set TEXT;`);
-    await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS skus JSONB;`);
-    await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';`);
-    await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tokens_used JSONB;`);
-    await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS time_taken INTEGER;`);
-    await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS error TEXT;`);
-    await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS qa_result JSONB;`);
-    await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS export_data JSONB;`);
-    await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS last_job_id TEXT;`);
-    await runMigrate(sql`
+      `);
+      await runMigrate(sql`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_attribute_set_id_attribute_sets_id_fk;`);
+      await runMigrate(sql`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_attribute_set_id_fkey;`);
+      await runMigrate(sql`ALTER TABLE jobs ALTER COLUMN created_at TYPE TEXT USING created_at::text;`);
+      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attribute_set TEXT;`);
+      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS skus JSONB;`);
+      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';`);
+      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tokens_used JSONB;`);
+      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS time_taken INTEGER;`);
+      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS error TEXT;`);
+      await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS qa_result JSONB;`);
+      await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS export_data JSONB;`);
+      await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS last_job_id TEXT;`);
+      await runMigrate(sql`
         CREATE TABLE IF NOT EXISTS site_selectors (
           id TEXT PRIMARY KEY,
           website TEXT NOT NULL,
@@ -92,11 +112,16 @@ async function startServer() {
           created_at TIMESTAMP NOT NULL DEFAULT NOW(),
           updated_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
-    `);
-    await runMigrate(sql`ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_selector TEXT;`);
-    await runMigrate(sql`ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_content_selector TEXT;`);
-    await runMigrate(sql`ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_wait_ms INTEGER;`);
-    console.log("Database schema initialized.");
+      `);
+      await runMigrate(sql`ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_selector TEXT;`);
+      await runMigrate(sql`ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_content_selector TEXT;`);
+      await runMigrate(sql`ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_wait_ms INTEGER;`);
+      if (migrationFailures) {
+        console.warn(`Database schema initialization completed with ${migrationFailures} failed migration step(s).`);
+      } else {
+        console.log("Database schema initialized.");
+      }
+    }
   }
 
   // --- SKU Data Endpoints ---

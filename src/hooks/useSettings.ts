@@ -2,6 +2,9 @@ import { useState } from 'react';
 
 const STORAGE_KEY = "qa-analyzer-settings";
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+const LEGACY_AICREDITS_BASE_URL = "https://api.aicredits.in/v1";
+// ponytail: use AICredits' reachable main-domain route until the API subdomain accepts HTTPS again.
+const AICREDITS_BASE_URL = "https://aicredits.in/v1";
 
 export interface AppSettings {
   llmProvider: string;
@@ -18,7 +21,7 @@ export interface AppSettings {
 
 const DEFAULT_SETTINGS: AppSettings = {
   llmProvider: "openai-compatible",
-  baseUrl: "https://api.aicredits.in/v1",
+  baseUrl: AICREDITS_BASE_URL,
   apiKey: "",
   modelName: "deepseek/deepseek-v4-flash",
   temperature: 0.1,
@@ -34,10 +37,15 @@ export function normalizeMaxTokens(value: unknown): number {
   return Number.isSafeInteger(maxTokens) && maxTokens > 0 ? maxTokens : DEFAULT_MAX_OUTPUT_TOKENS;
 }
 
-function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
+export function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
+  const baseUrl = settings.baseUrl?.trim().replace(/\/+$/, "") === LEGACY_AICREDITS_BASE_URL
+    ? AICREDITS_BASE_URL
+    : settings.baseUrl;
+
   return {
     ...DEFAULT_SETTINGS,
     ...settings,
+    baseUrl: baseUrl ?? DEFAULT_SETTINGS.baseUrl,
     maxTokens: normalizeMaxTokens(settings.maxTokens),
   };
 }

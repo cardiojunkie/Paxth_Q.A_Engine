@@ -192,7 +192,7 @@ Format the output strictly as a Markdown list or set of headings that I can dire
 ## ⚙️ Configuration & LLM Providers
 
 Access the **Settings** module in the sidebar to configure:
-- **Base URL**: Supports any OpenAI-compatible API gateway (e.g. `https://api.openai.com/v1`, `https://api.aicredits.in/v1`, or local Ollama / vLLM endpoints).
+- **Base URL**: Supports any OpenAI-compatible API gateway (e.g. `https://api.openai.com/v1`, `https://aicredits.in/v1`, or local Ollama / vLLM endpoints).
 - **API Key**: Safely saved in local browser state.
 - **Model Name**: Custom model string (e.g., `gpt-4o`, `deepseek/deepseek-v4-flash`, `gemini-1.5-pro`).
 - **Temperature & Max Tokens**: Fine-tune output determinism and response limits.
@@ -223,6 +223,7 @@ When transitioning development to **GitHub Codespaces**, keep the following key 
 - **Database Connection (`DATABASE_URL`) & Supabase Data Sync**:
   - The application connects directly to your PostgreSQL database (e.g. Supabase Connection String) using Drizzle ORM in `server.ts`.
   - **All scraped data, SKUs, raw rows, QA results, and job logs are stored directly in your Supabase database** (`sku_data` and `jobs` tables).
+  - For Supabase in Codespaces or another IPv4-only runtime, copy the exact **Session pooler** URI from **Supabase Dashboard → Connect**. Keep its project-specific region, port, and `postgres.<project-ref>` username unchanged, and include `sslmode=require`. The application deliberately does not guess or rewrite a pooler endpoint.
   - Once you set your `DATABASE_URL` in `.env` or Codespaces Secrets, the Codespaces environment will instantly query your Supabase instance, making all existing SKUs and JSON details immediately accessible.
   - `server.ts` automatically runs safe, non-destructive table initializations on startup.
 - **LLM API Key Configuration**:
@@ -232,7 +233,7 @@ When transitioning development to **GitHub Codespaces**, keep the following key 
   - Store sensitive keys in GitHub Codespaces Secrets or in `.env`.
   - Do NOT commit `.env` to version control.
 
-### 4. Quick Start Command for Codespaces
+### 4. Quick Start Command for Codespacess
 
 Run this single command in your Codespaces terminal to install all dependencies and start the app preview:
 

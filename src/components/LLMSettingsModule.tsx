@@ -190,7 +190,7 @@ export function LLMSettingsModule() {
                   value={localSettings.baseUrl}
                   onChange={(e) => handleChange("baseUrl", e.target.value)}
                   className="w-full bg-[#F5F2EF] border border-transparent hover:border-[#E5E2DE] focus:border-[#1A1A1A] outline-none rounded-sm px-4 py-2.5 text-sm transition-colors"
-                  placeholder="https://api.aicredits.in/v1"
+                  placeholder="https://aicredits.in/v1"
                 />
               </div>
 

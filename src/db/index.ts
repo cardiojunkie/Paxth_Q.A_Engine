@@ -7,29 +7,28 @@ dotenv.config();
 
 // Create or retrieve the connection pool.
 export const createPool = () => {
-  let connectionString = process.env.DATABASE_URL;
-  if (connectionString && connectionString.includes('.supabase.co')) {
-    try {
-      const url = new URL(connectionString);
-      if (url.port === '5432' && url.hostname.startsWith('db.')) {
-        const projectRef = url.hostname.split('.')[1];
-        url.hostname = 'aws-0-ap-northeast-2.pooler.supabase.com';
-        url.port = '6543';
-        url.username = url.username + '.' + projectRef;
-        connectionString = url.toString();
-        console.log('Automatically rewrote Supabase URL to use connection pooler for IPv4 compatibility.');
-      }
-    } catch (e) {
-      console.warn('Failed to rewrite Supabase URL.', e);
-    }
-  }
-  if (!process.env.DATABASE_URL) {
+  const connectionString = process.env.DATABASE_URL?.trim();
+  if (!connectionString) {
     console.warn("DATABASE_URL is not set. Database operations will fail if executed.");
+    return null;
+  }
+
+  try {
+    const url = new URL(connectionString);
+    if (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') {
+      throw new Error('unsupported protocol');
+    }
+    const isSupabaseHost = url.hostname.endsWith('.supabase.co') || url.hostname.endsWith('.pooler.supabase.com');
+    if (isSupabaseHost && !url.searchParams.has('sslmode')) {
+      console.warn('Supabase DATABASE_URL has no sslmode. Use the exact TLS-enabled connection string from Supabase Dashboard → Connect.');
+    }
+  } catch {
+    console.error('DATABASE_URL must be a valid postgres:// or postgresql:// connection string.');
     return null;
   }
   
   return new Pool({
-    connectionString: connectionString,
+    connectionString,
     max: 10,
     connectionTimeoutMillis: 15000,
   });
