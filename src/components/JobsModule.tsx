@@ -2,7 +2,7 @@ import React, { useState, useRef } from "react";
 import { Play, StopCircle, CheckCircle, AlertCircle, Clock, Download, Eye, Trash2, X, AlertTriangle, FileSpreadsheet, ChevronDown, ChevronUp } from "lucide-react";
 import { useAppContext, Job } from "../context/AppContext";
 import { normalizeMaxTokens, useSettings } from "../hooks/useSettings";
-import { useAttributeSets } from "../hooks/useAttributeSets";
+import { fetchQaConfiguration, type QaConfiguration } from "../lib/qaConfiguration";
 import {
   getCommonAttributeSet,
   getCommonHeaderOrder,
@@ -13,69 +13,10 @@ import {
 } from "../lib/jobRunState";
 import { extractLLMResponseContent, parseLLMJsonResponse } from "../lib/llmResponse";
 import { populateQaWorksheet } from "../lib/qaExcelExport";
+import { prepareQaInput, finalizeQaResult } from "../lib/qaAgent";
 import { cn } from "../lib/utils";
 import ExcelJS from "exceljs";
 import { saveAs } from "file-saver";
-
-const QA_SYSTEM_PROMPT = `You are an ecommerce catalogue quality analyst.
-
-Your job is to compare the uploaded ecommerce catalogue attributes against the provided source truth.
-
-Priority of source truth:
-1. SAP source data is the highest authority.
-2. Scraped product page markdown is secondary.
-3. If SAP and scraped markdown conflict, trust SAP.
-
-Do not hallucinate. Do not invent missing product facts. Do not assume facts from generic product knowledge. Only use the provided source data.
-
-Check for:
-- factual mismatches
-- incorrect title
-- incorrect brand
-- incorrect model
-- incorrect color
-- incorrect size/capacity
-- incorrect material
-- incorrect dimensions/weight
-- wrong or unsupported bullet points
-- wrong or unsupported description
-- spelling errors
-- grammar errors
-- over-promising claims
-- unsupported marketing claims
-- missing important information
-- contradictions in the uploaded data
-- poor customer-facing catalogue wording`;
-
-const QA_JSON_SCHEMA = `CRITICAL INSTRUCTION: You MUST return your response as a single, valid JSON object. Do NOT wrap the JSON in Markdown code blocks (e.g., \`\`\`json). Do NOT add any conversational text, preamble, reasoning, or explanation before or after the JSON.
-
-Write each issue's explanation in plain English so a catalogue editor understands what is wrong and why.
-Each suggested_fix must contain the complete replacement cell value, not instructions for editing it. Use an empty string when a correction cannot be determined from the provided sources. Do not invent product facts.
-
-Required JSON Schema:
-{
-  "qa_status": "pass" | "warning" | "fail",
-  "confidence": "high" | "medium" | "low",
-  "summary": "Short summary of findings",
-  "issue_count": number,
-  "issues": [
-    {
-      "field": "attribute_name (e.g., attributes__brand)",
-      "issue_type": "data_mismatch" | "missing_data" | "formatting" | "spelling_grammar" | "unsupported_claim",
-      "severity": "minor" | "moderate" | "critical",
-      "uploaded_value": "value from upload",
-      "source_truth": "value from source",
-      "explanation": "Clear explanation of the issue",
-      "suggested_fix": "Suggested corrected value",
-      "cell_color": "yellow" | "orange" | "red"
-    }
-  ],
-  "source_notes": {
-    "sap_used": boolean,
-    "url_used": boolean,
-    "source_conflicts": ["conflict 1", "conflict 2"]
-  }
-}`;
 
 function parseApiErrorMessage(status: number, rawText: string): string {
   if (!rawText) return status ? `LLM API returned HTTP ${status}` : "Unknown error";
@@ -101,7 +42,6 @@ function parseApiErrorMessage(status: number, rawText: string): string {
 export function JobsModule() {
   const { skuDataList, updateSku, jobs, updateJob, removeJob, addNotification } = useAppContext();
   const { settings } = useSettings();
-  const { attributeSets } = useAttributeSets();
   
   const [runningJobId, setRunningJobId] = useState<string | null>(null);
   const [stopRequested, setStopRequested] = useState(false);
@@ -143,6 +83,18 @@ export function JobsModule() {
     setRunningJobId(jobId);
     setStopRequested(false);
     stopRequestedRef.current = false;
+    let configuration: QaConfiguration;
+    try {
+      configuration = await fetchQaConfiguration();
+    } catch (error: any) {
+      setRunningJobId(null);
+      addNotification({ type: "error", title: "Cannot Start QA", message: error.message });
+      return true;
+    }
+    if (stopRequestedRef.current) {
+      setRunningJobId(null);
+      return true;
+    }
     await updateJob(jobId, { status: "running", error: null });
     
     const allSkusInJob = job.skus.map((id) => skuDataList.find((sku) => sku.sku === id)).filter(Boolean) as typeof skuDataList;
@@ -168,7 +120,7 @@ export function JobsModule() {
     const jobStartTime = Date.now();
     
     const maxConcurrency = settings.maxConcurrency || 1;
-    const maxRetries = Math.max(settings.maxRetries || 0, 3);
+    const maxRetries = Math.max(settings.maxRetries || 0, 0);
 
     const processNext = async (): Promise<void> => {
       while (true) {
@@ -191,220 +143,81 @@ export function JobsModule() {
         
         await updateSku(skuItem.sku, { status: "running", error: null });
         
+        let qaInput: ReturnType<typeof prepareQaInput>;
+        try {
+          let scrapedMarkdown = skuItem.scraped_markdown;
+          if (skuItem.source.url && skuItem.scrape_status !== "success" && skuItem.scrape_status !== "failed") {
+            try {
+              const res = await fetch("/api/scrape", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ url: skuItem.source.url })
+              });
+              const data = await res.json();
+              if (res.ok && typeof data.markdown === "string" && data.markdown.trim()) {
+                scrapedMarkdown = data.markdown;
+                await updateSku(skuItem.sku, { scraped_markdown: scrapedMarkdown, scrape_status: "success" });
+              } else {
+                await updateSku(skuItem.sku, { scrape_status: "failed" });
+              }
+            } catch {
+              await updateSku(skuItem.sku, { scrape_status: "failed" });
+            }
+          }
+          if (stopRequestedRef.current) {
+            await updateSku(skuItem.sku, { status: "ready" });
+            break;
+          }
+          qaInput = prepareQaInput(
+            { ...skuItem, scraped_markdown: scrapedMarkdown }, configuration.attributeSets,
+            configuration.qaAgentMemory, settings.maxPageContentLength,
+          );
+        } catch (err: any) {
+          hasError = true;
+          processedSkuIds.add(skuItem.sku);
+          await updateSku(skuItem.sku, {
+            status: "failed", error: String(err.message || err),
+            timeTaken: (skuItem.timeTaken || 0) + Date.now() - skuStartTime,
+          });
+          continue;
+        }
+
+        // Keep the same memory, rules, and evidence for every attempt for this SKU.
+        const requestBody = JSON.stringify({
+          baseUrl: settings.baseUrl,
+          apiKey: settings.apiKey,
+          payload: {
+            model: settings.modelName,
+            temperature: Number(settings.temperature),
+            max_tokens: normalizeMaxTokens(settings.maxTokens),
+            response_format: { type: "json_object" },
+            messages: qaInput.messages,
+          },
+        });
         let attempts = 0;
         let success = false;
-        
+
         while (attempts <= maxRetries && !success && !stopRequestedRef.current) {
           attempts++;
           try {
-            let scrapedMarkdown = skuItem.scraped_markdown;
-            
-            if (skuItem.source.url && skuItem.scrape_status !== "success" && skuItem.scrape_status !== "failed") {
-              try {
-                const res = await fetch("/api/scrape", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ url: skuItem.source.url })
-                });
-                const data = await res.json();
-                if (res.ok) {
-                  scrapedMarkdown = data.markdown;
-                  await updateSku(skuItem.sku, { scraped_markdown: scrapedMarkdown, scrape_status: "success" });
-                } else {
-                  await updateSku(skuItem.sku, { scrape_status: "failed" });
-                }
-              } catch (err) {
-                await updateSku(skuItem.sku, { scrape_status: "failed" });
-              }
+            const res = await fetch("/api/chat", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: requestBody,
+            });
+            if (!res.ok) {
+              throw new Error(`LLM API returned error (${res.status}): ${parseApiErrorMessage(res.status, await res.text())}`);
             }
-            
-            if (stopRequestedRef.current) {
-               await updateSku(skuItem.sku, { status: "ready" });
-               break;
-            }
-
-            const { attribute_set, source__sap, source__url, ...cleanAttributes } = skuItem.upload_attributes;
-            const matchedSet = attributeSets.find(s => s.name === skuItem.attribute_set);
-            const mappingRules = matchedSet?.rulesMarkdown || "No specific mapping rules defined for this SKU's attribute set.";
-            const dynamicSystemPrompt = `${QA_SYSTEM_PROMPT}\n\n=== ATTRIBUTE MAPPING RULES ===\nApply the following mapping rules when validating the uploaded attributes against the source truth:\n${mappingRules}\n\n${QA_JSON_SCHEMA}`;
-
-            let maxContentLen = 30000;
-            if (attempts === 2) maxContentLen = 10000;
-            if (attempts === 3) maxContentLen = 3000;
-            if (attempts >= 4) maxContentLen = 0;
-
-            let finalMarkdown = scrapedMarkdown || "";
-            if (maxContentLen === 0) {
-              finalMarkdown = "[Scraped web content omitted for this attempt to reduce context size]";
-            } else if (finalMarkdown.length > maxContentLen) {
-              finalMarkdown = finalMarkdown.substring(0, maxContentLen) + "\n...[TRUNCATED DUE TO LENGTH LIMIT]...";
-            }
-
-            const userPromptContent = `Product SKU: ${skuItem.sku}
-Attribute Set: ${skuItem.attribute_set}
-
-=== UPLOADED ATTRIBUTES ===
-${JSON.stringify(cleanAttributes, null, 2)}
-
-=== SOURCE SAP TEXT ===
-${skuItem.source.sap || "N/A"}
-
-=== SCRAPED WEB CONTENT ===
-${finalMarkdown || "N/A"}`.trim();
-
-            let content = "";
-            let lastApiErr = "";
-            let tokensUsed = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-
-            let isRateLimit = false;
-
-            const maxTokensVal = normalizeMaxTokens(settings.maxTokens);
-
+            const data = await res.json();
+            const tokensUsed = data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+            const content = extractLLMResponseContent(data);
+            let qaResult: ReturnType<typeof finalizeQaResult>;
             try {
-              const res1 = await fetch(`/api/chat`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  baseUrl: settings.baseUrl,
-                  apiKey: settings.apiKey,
-                  payload: {
-                    model: settings.modelName,
-                    temperature: Number(settings.temperature) || 0.1,
-                    max_tokens: maxTokensVal,
-                    response_format: { type: "json_object" },
-                    messages: [
-                      { role: "system", content: dynamicSystemPrompt },
-                      { role: "user", content: userPromptContent }
-                    ]
-                  }
-                })
-              });
-
-              if (res1.ok) {
-                const data1 = await res1.json();
-                if (data1.usage) {
-                  tokensUsed = { ...data1.usage };
-                }
-                content = extractLLMResponseContent(data1);
-                if (!content) lastApiErr = `Empty output`;
-              } else {
-                const raw1 = await res1.text();
-                lastApiErr = parseApiErrorMessage(res1.status, raw1);
-                if (res1.status === 429) {
-                  isRateLimit = true;
-                  throw new Error(`Rate limit exceeded (${res1.status}): ${lastApiErr}`);
-                }
-                if (res1.status === 402 || lastApiErr.toLowerCase().includes("insufficient balance") || lastApiErr.toLowerCase().includes("payment required")) {
-                  throw new Error(`LLM API returned error (${res1.status || 402}): Insufficient Balance`);
-                }
-                if (res1.status === 401 || res1.status === 403) {
-                  throw new Error(`Authentication error (${res1.status}): ${lastApiErr}`);
-                }
-                if (res1.status >= 400) {
-                  throw new Error(`LLM API returned error (${res1.status}): ${lastApiErr}`);
-                }
-              }
-            } catch (err1: any) {
-              const msg = err1.message || String(err1);
-              lastApiErr = parseApiErrorMessage(0, msg);
-              if (lastApiErr.includes("429") || lastApiErr.includes("Rate limit")) {
-                isRateLimit = true;
-                throw err1;
-              }
-              if (lastApiErr.includes("Authentication error") || msg.includes("LLM API returned error") || msg.includes("Insufficient Balance")) throw err1;
+              qaResult = finalizeQaResult(parseLLMJsonResponse(content), qaInput);
+            } catch (error: any) {
+              throw new Error(`LLM returned invalid QA output: ${error.message}`);
             }
 
-            if ((!content || !content.trim()) && !isRateLimit) {
-              const res2 = await fetch(`/api/chat`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  baseUrl: settings.baseUrl,
-                  apiKey: settings.apiKey,
-                  payload: {
-                    model: settings.modelName,
-                    temperature: Number(settings.temperature) || 0.1,
-                    max_tokens: maxTokensVal,
-                    response_format: { type: "json_object" },
-                    messages: [
-                      { role: "system", content: dynamicSystemPrompt + "\nIMPORTANT: Return ONLY a valid JSON object." },
-                      { role: "user", content: userPromptContent }
-                    ]
-                  }
-                })
-              });
-
-              if (res2.ok) {
-                const data2 = await res2.json();
-                if (data2.usage) {
-                  tokensUsed = { ...data2.usage };
-                }
-                content = extractLLMResponseContent(data2);
-              } else {
-                const raw2 = await res2.text();
-                const err2Parsed = parseApiErrorMessage(res2.status, raw2);
-                if (res2.status === 429) isRateLimit = true;
-                lastApiErr = err2Parsed || lastApiErr;
-              }
-            }
-
-            // Third fallback: If res1 and res2 both failed, try res3 with minimal user prompt (without web content)
-            if ((!content || !content.trim()) && !isRateLimit) {
-              const minUserPrompt = `Product SKU: ${skuItem.sku}
-Attribute Set: ${skuItem.attribute_set}
-
-=== UPLOADED ATTRIBUTES ===
-${JSON.stringify(cleanAttributes, null, 2)}
-
-=== SOURCE SAP TEXT ===
-${skuItem.source.sap || "N/A"}`.trim();
-
-              const res3 = await fetch(`/api/chat`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  baseUrl: settings.baseUrl,
-                  apiKey: settings.apiKey,
-                  payload: {
-                    model: settings.modelName,
-                    temperature: Number(settings.temperature) || 0.1,
-                    max_tokens: maxTokensVal,
-                    response_format: { type: "json_object" },
-                    messages: [
-                      { role: "system", content: dynamicSystemPrompt + "\nIMPORTANT: Return ONLY a valid JSON object." },
-                      { role: "user", content: minUserPrompt }
-                    ]
-                  }
-                })
-              });
-
-              if (res3.ok) {
-                const data3 = await res3.json();
-                if (data3.usage) {
-                  tokensUsed = { ...data3.usage };
-                }
-                content = extractLLMResponseContent(data3);
-              } else {
-                const raw3 = await res3.text();
-                const err3Parsed = parseApiErrorMessage(res3.status, raw3);
-                if (res3.status === 429) isRateLimit = true;
-                throw new Error(`LLM API returned error (${res3.status}): ${err3Parsed || lastApiErr}`);
-              }
-            }
-
-            if (isRateLimit) {
-              throw new Error(`Rate limit exceeded: ${lastApiErr}`);
-            }
-
-            if (!content || !content.trim()) throw new Error(`LLM endpoint returned no content. ${lastApiErr}`);
-            
-            let qaResult: any;
-            try {
-              qaResult = parseLLMJsonResponse(content);
-            } catch (parseError: any) {
-              throw new Error(`LLM returned invalid JSON: ${parseError.message}`);
-            }
-            
             const skuTimeTaken = Date.now() - skuStartTime;
             
             const exportData = {
@@ -1056,11 +869,15 @@ ${skuItem.source.sap || "N/A"}`.trim();
                                   </div>
                                 )}
 
-                                {iss.suggested_fix && (
+                                {String(iss.suggested_fix ?? "").trim() ? (
                                   <div className="bg-emerald-50/80 border border-emerald-200 p-2 rounded text-emerald-900 font-mono text-[11px]">
                                     <span className="font-bold block text-[9px] uppercase tracking-widest text-emerald-800">Suggested Fix:</span>
-                                    {iss.suggested_fix}
+                                    {String(iss.suggested_fix)}
                                   </div>
+                                ) : iss.field && (
+                                  <p className="font-semibold">
+                                    Needs verification: no verified replacement was supplied. The correction stays blank; see the explanation above.
+                                  </p>
                                 )}
                               </div>
                             ))}

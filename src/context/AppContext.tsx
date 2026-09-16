@@ -39,7 +39,7 @@ interface AppContextType {
 
   skuDataList: SkuData[];
   addParsedData: (data: SkuData[]) => void;
-  updateSku: (sku: string, updates: Partial<SkuData>) => void;
+  updateSku: (sku: string, updates: Partial<SkuData>) => Promise<boolean>;
   deleteSku: (sku: string) => void;
   clearData: () => void;
   removeSkus: (skus: string[]) => void;

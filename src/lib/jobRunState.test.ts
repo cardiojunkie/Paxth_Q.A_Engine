@@ -247,7 +247,7 @@ assert.match(note("D2"), /Another source says Red\./);
 assert.match(note("D2"), /Review required: suggested corrections disagree/);
 assert.equal(color("D2"), "FFFFE5B4");
 assert.equal(feedback.getCell("G2").value, null);
-assert.match(note("F2"), /Review required: no correction was supplied/);
+assert.match(note("F2"), /Needs verification: no verified replacement was supplied/);
 assert.equal(color("F2"), "FFFFFFE0");
 assert.match(note("H2"), /exact bare header/);
 assert.doesNotMatch(note("B2"), /exact bare header/);
@@ -351,7 +351,7 @@ assert.deepEqual(exportedHeaders(partial), exportedHeaders(feedback).filter((hea
 assert.equal(partial.getCell("E2").value, null);
 assert.match(note("D2", partial), /suggested corrections disagree/);
 assert.equal(partial.getCell("G2").value, null);
-assert.match(note("F2", partial), /no correction was supplied/);
+assert.match(note("F2", partial), /Needs verification: no verified replacement was supplied/);
 assert.equal(partial.getCell("J2").value, "M1");
 assert.equal(partial.getCell("K2").value, "Brand: Samsung");
 assert.equal(partial.getCell("M2").value, "Original status");

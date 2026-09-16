@@ -10,9 +10,10 @@ interface AttributeSetEditorProps {
   onSave: (data: Omit<AttributeSet, "id" | "createdAt" | "updatedAt">) => void;
   onCancel: () => void;
   onDelete?: () => void;
+  disabled?: boolean;
 }
 
-export function AttributeSetEditor({ initialData, onSave, onCancel, onDelete, error }: AttributeSetEditorProps & { error?: string | null }) {
+export function AttributeSetEditor({ initialData, onSave, onCancel, onDelete, error, disabled }: AttributeSetEditorProps & { error?: string | null }) {
   const [name, setName] = useState(initialData?.name || "");
   const [rulesMarkdown, setRulesMarkdown] = useState(initialData?.rulesMarkdown || "");
   const [activeTab, setActiveTab] = useState<"edit" | "preview">("edit");
@@ -43,7 +44,7 @@ export function AttributeSetEditor({ initialData, onSave, onCancel, onDelete, er
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-[#FDFCFB]">
+    <fieldset disabled={disabled} className="flex-1 flex flex-col h-full min-w-0 bg-[#FDFCFB]">
       {/* Header Section */}
       <header className="p-10 pb-6 flex items-end justify-between shrink-0">
         <div className="flex-1 mr-8">
@@ -155,7 +156,7 @@ export function AttributeSetEditor({ initialData, onSave, onCancel, onDelete, er
 
             <div className="mt-6 pt-6 border-t border-[#E5E2DE] flex justify-between items-center shrink-0">
               <div className="text-[10px] text-[#8C8882]">
-                AUTO-SAVED TO PERSISTENT STORAGE
+                SAVE TO SHARE RULES THROUGH SUPABASE
               </div>
               <button 
                 onClick={handleSave}
@@ -168,6 +169,6 @@ export function AttributeSetEditor({ initialData, onSave, onCancel, onDelete, er
         </div>
         
       </div>
-    </div>
+    </fieldset>
   );
 }

@@ -23,7 +23,9 @@ export function DashboardModule() {
   
   // Modal State
   const [viewedMarkdown, setViewedMarkdown] = useState<{sku: string, markdown: string} | null>(null);
-  const [viewedSAP, setViewedSAP] = useState<{sku: string, sap: string} | null>(null);
+  const [viewedSAP, setViewedSAP] = useState<{sku: string, sap: string, editing?: boolean} | null>(null);
+  const [isSavingSAP, setIsSavingSAP] = useState(false);
+  const [sapSaveError, setSapSaveError] = useState("");
   const [manualScrapeQueue, setManualScrapeQueue] = useState<string[]>([]);
   const [manualScrapeText, setManualScrapeText] = useState("");
   const [skuToDelete, setSkuToDelete] = useState<string | null>(null);
@@ -52,6 +54,29 @@ export function DashboardModule() {
       (sku.attribute_set && sku.attribute_set.toLowerCase().includes(searchTerm.toLowerCase()));
     return matchesFilter && matchesSearch;
   });
+
+  const handleSaveSAP = async () => {
+    if (!viewedSAP?.editing || !viewedSAP.sap.trim() || isSavingSAP) return;
+    const sku = skuDataList.find(item => item.sku === viewedSAP.sku);
+    if (!sku) {
+      setSapSaveError("This SKU is no longer available. Close the editor and refresh the catalog.");
+      return;
+    }
+
+    setIsSavingSAP(true);
+    setSapSaveError("");
+    const saved = await updateSku(sku.sku, {
+      source: { ...sku.source, sap: viewedSAP.sap },
+      ...(sku.status === "cannot_qa" ? { status: "ready" } : {}),
+    });
+    setIsSavingSAP(false);
+    if (!saved) {
+      setSapSaveError("SAP data could not be saved. Your draft is still here; please try again.");
+      return;
+    }
+    addNotification({ type: "success", title: "SAP Saved", message: `SAP data for ${sku.sku} saved to database.` });
+    setViewedSAP(null);
+  };
 
   const handleSelectAll = () => {
     if (isScraping) return;
@@ -734,18 +759,31 @@ export function DashboardModule() {
                         ) : <span className="text-[#B8B4AE]">—</span>}
                       </td>
                       <td className="p-3">
-                        {sku.scrape_status === 'success' ? (
-                          <button 
-                            onClick={() => setViewedMarkdown({ sku: sku.sku, markdown: sku.scraped_markdown || '' })}
-                            className="text-emerald-600 hover:underline flex items-center gap-1 text-xs"
-                          >
-                            <FileText className="w-3 h-3" /> View Data
-                          </button>
-                        ) : sku.scrape_status === 'failed' ? (
-                          <span className="text-rose-500 text-xs">Failed</span>
-                        ) : sku.source.url ? (
-                          <span className="text-[#8C8882] text-xs">Pending</span>
-                        ) : <span className="text-[#B8B4AE]">—</span>}
+                        <div className="flex flex-wrap items-center gap-2">
+                          {sku.scrape_status === 'success' ? (
+                            <button
+                              onClick={() => setViewedMarkdown({ sku: sku.sku, markdown: sku.scraped_markdown || '' })}
+                              className="text-emerald-600 hover:underline flex items-center gap-1 text-xs"
+                            >
+                              <FileText className="w-3 h-3" /> View Data
+                            </button>
+                          ) : sku.scrape_status === 'failed' ? (
+                            <span className="text-rose-500 text-xs">Failed</span>
+                          ) : sku.source.url ? (
+                            <span className="text-[#8C8882] text-xs">Pending</span>
+                          ) : <span className="text-[#B8B4AE]">—</span>}
+                          {!sku.scraped_markdown?.trim() && (
+                            <button
+                              onClick={() => {
+                                setSapSaveError("");
+                                setViewedSAP({ sku: sku.sku, sap: sku.source.sap || "", editing: true });
+                              }}
+                              className="text-blue-600 hover:underline text-xs"
+                            >
+                              Edit SAP
+                            </button>
+                          )}
+                        </div>
                       </td>
                       <td className="p-3 text-right">
                          <button 
@@ -1007,21 +1045,63 @@ export function DashboardModule() {
       )}
 
       {viewedSAP && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+        <dialog
+          ref={dialog => { if (dialog && !dialog.open) dialog.showModal(); }}
+          aria-labelledby="sap-modal-title"
+          onCancel={event => {
+            event.preventDefault();
+            if (!isSavingSAP) setViewedSAP(null);
+          }}
+          className="m-auto w-[calc(100%-2rem)] max-w-4xl p-0 border-0 bg-transparent backdrop:bg-black/50"
+        >
           <div className="bg-white w-full max-w-4xl h-[80vh] flex flex-col rounded-sm shadow-xl relative overflow-hidden">
             <div className="flex items-center justify-between p-4 border-b border-[#E5E2DE] bg-[#FDFCFB]">
-              <h3 className="font-bold text-[#1A1A1A] text-sm">SAP Source Content: <span className="font-mono">{viewedSAP.sku}</span></h3>
-              <button onClick={() => setViewedSAP(null)} className="text-[#8C8882] hover:text-[#1A1A1A]">
+              <h3 id="sap-modal-title" className="font-bold text-[#1A1A1A] text-sm">SAP Source Content: <span className="font-mono">{viewedSAP.sku}</span></h3>
+              <button disabled={isSavingSAP} aria-label="Close SAP" onClick={() => setViewedSAP(null)} className="text-[#8C8882] hover:text-[#1A1A1A] disabled:opacity-50">
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <div className="flex-1 p-6 overflow-y-auto bg-gray-50">
-              <pre className="whitespace-pre-wrap font-mono text-xs text-gray-800 bg-white p-4 border border-gray-200 rounded">
-                {viewedSAP.sap}
-              </pre>
+            <div className="flex-1 p-6 overflow-y-auto bg-gray-50 flex flex-col gap-3">
+              {viewedSAP.editing ? (
+                <>
+                  <label htmlFor="sap-content" className="text-xs text-[#8C8882] font-medium">SAP source text</label>
+                  <textarea
+                    id="sap-content"
+                    autoFocus
+                    value={viewedSAP.sap}
+                    onChange={event => setViewedSAP({ ...viewedSAP, sap: event.target.value })}
+                    disabled={isSavingSAP}
+                    placeholder="Paste or edit SAP data here..."
+                    className="flex-1 min-h-40 w-full font-mono text-xs text-gray-800 bg-white p-4 border border-gray-200 rounded resize-none focus:outline-none focus:border-[#1A1A1A]"
+                  />
+                  {sapSaveError && <p role="alert" className="text-xs text-rose-600">{sapSaveError}</p>}
+                </>
+              ) : (
+                <pre className="whitespace-pre-wrap font-mono text-xs text-gray-800 bg-white p-4 border border-gray-200 rounded">
+                  {viewedSAP.sap}
+                </pre>
+              )}
             </div>
+            {viewedSAP.editing && (
+              <div className="p-4 border-t border-[#E5E2DE] bg-[#FDFCFB] flex justify-end gap-2">
+                <button
+                  disabled={isSavingSAP}
+                  onClick={() => setViewedSAP(null)}
+                  className="px-4 py-2 border border-[#E5E2DE] text-xs font-bold uppercase tracking-wider text-[#8C8882] hover:text-[#1A1A1A] rounded-sm disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  disabled={isSavingSAP || !viewedSAP.sap.trim()}
+                  onClick={handleSaveSAP}
+                  className="px-4 py-2 bg-[#1A1A1A] text-white text-xs font-bold uppercase tracking-wider rounded-sm hover:bg-[#333333] disabled:opacity-50"
+                >
+                  {isSavingSAP ? "Saving..." : "Save SAP"}
+                </button>
+              </div>
+            )}
           </div>
-        </div>
+        </dialog>
       )}
     </div>
   );

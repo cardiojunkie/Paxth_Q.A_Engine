@@ -7,43 +7,47 @@ import { AttributeSetEditor } from "./AttributeSetEditor";
 import { cn } from "../lib/utils";
 
 export function AttributeSetsModule() {
-  const { attributeSets, addSet, updateSet, deleteSet } = useAttributeSets();
+  const { attributeSets, addSet, updateSet, deleteSet, isLoading, loadError, reloadSets, browserRules, importBrowserRules } = useAttributeSets();
   const [editingSet, setEditingSet] = useState<AttributeSet | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [editorError, setEditorError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
+  const [importMessage, setImportMessage] = useState("");
 
   const filteredSets = attributeSets.filter(set => 
     set.name.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  const handleCreate = (data: Omit<AttributeSet, "id" | "createdAt" | "updatedAt">) => {
-    if (attributeSets.some(s => s.name.toLowerCase() === data.name.trim().toLowerCase())) {
+  const handleSave = async (data: Omit<AttributeSet, "id" | "createdAt" | "updatedAt">) => {
+    if (attributeSets.some(s => s.id !== editingSet?.id && s.name.trim().toLowerCase() === data.name.trim().toLowerCase())) {
       setEditorError("An attribute set with this name already exists.");
       return;
     }
     setEditorError(null);
-    addSet(data);
-    setIsCreating(false);
-  };
-
-  const handleUpdate = (data: Omit<AttributeSet, "id" | "createdAt" | "updatedAt">) => {
-    if (editingSet) {
-      if (attributeSets.some(s => s.id !== editingSet.id && s.name.toLowerCase() === data.name.trim().toLowerCase())) {
-        setEditorError("An attribute set with this name already exists.");
-        return;
-      }
-      setEditorError(null);
-      updateSet(editingSet.id, data);
+    setIsSaving(true);
+    try {
+      if (editingSet) await updateSet(editingSet.id, data);
+      else await addSet(data);
+      setIsCreating(false);
       setEditingSet(null);
+    } catch (error: any) {
+      setEditorError(error.message);
+    } finally {
+      setIsSaving(false);
     }
   };
 
-  const handleDelete = (id: string) => {
+  const handleDelete = async (id: string) => {
     setEditorError(null);
-    deleteSet(id);
-    if (editingSet?.id === id) {
+    setIsSaving(true);
+    try {
+      await deleteSet(id);
       setEditingSet(null);
+    } catch (error: any) {
+      setEditorError(error.message);
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -53,6 +57,9 @@ export function AttributeSetsModule() {
       <aside className="w-64 border-r border-[#E5E2DE] flex flex-col shrink-0">
         <div className="p-8 pb-4 shrink-0 flex flex-col gap-4">
           <h2 className="font-serif text-sm italic text-[#8C8882]">Index / Collections</h2>
+          {isLoading && <p role="status" className="text-xs">Loading shared mapping rules…</p>}
+          {loadError && <p role="alert" className="text-xs text-red-700">{loadError}</p>}
+          <button type="button" disabled={isLoading || isSaving} onClick={() => { setEditingSet(null); setIsCreating(false); void reloadSets(); }} className="text-xs underline text-left">Reload shared rules</button>
           <div className="relative">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-[#8C8882]" />
             <input 
@@ -78,7 +85,7 @@ export function AttributeSetsModule() {
                       "flex flex-col cursor-pointer transition-colors",
                       editingSet?.id === set.id ? "border-l-2 border-[#1A1A1A] pl-4 -ml-[18px]" : "opacity-40 hover:opacity-100"
                     )}
-                    onClick={() => { setIsCreating(false); setEditingSet(set); setEditorError(null); }}
+                    onClick={() => { if (!isSaving && !isLoading) { setIsCreating(false); setEditingSet(set); setEditorError(null); } }}
                   >
                     <span className={cn("text-[10px] mb-1 font-mono", editingSet?.id === set.id ? "text-[#1A1A1A]" : "text-[#8C8882]")}>
                       {(originalIndex + 1).toString().padStart(2, '0')}
@@ -101,12 +108,23 @@ export function AttributeSetsModule() {
         <div className="p-8 pt-6 border-t border-[#E5E2DE] shrink-0 bg-[#FDFCFB]">
           <button
             onClick={() => { setEditingSet(null); setIsCreating(true); setEditorError(null); }}
+            disabled={isLoading || isSaving || Boolean(loadError)}
             className="text-[11px] uppercase tracking-widest border border-[#1A1A1A] px-5 py-2 hover:bg-[#1A1A1A] hover:text-white transition-colors w-full mb-4"
           >
             New Attribute Set
           </button>
           <div className="p-4 bg-[#F5F2EF] rounded-sm">
-            <p className="text-[10px] leading-relaxed italic text-[#8C8882]">"Attribute sets define the validation boundary for the DeepSeek-V4-Flash scraper engine."</p>
+            <p className="text-[10px] leading-relaxed text-[#8C8882]">Mapping rules are shared through Supabase and loaded when each QA job starts.</p>
+            {browserRules.length > 0 && <>
+              <button type="button" disabled={isSaving || isLoading || Boolean(loadError)} onClick={async () => {
+                setIsSaving(true);
+                try { setImportMessage(`Imported ${await importBrowserRules()} rule sets. Existing shared rules were preserved.`); }
+                catch (error: any) { setImportMessage(error.message); }
+                finally { setIsSaving(false); }
+              }} className="text-xs underline mt-3">Import browser rules ({browserRules.length})</button>
+              <p className="text-[10px] mt-2">Adds missing rules and fills blank sets. Existing shared rules and your browser backup are preserved.</p>
+            </>}
+            {importMessage && <p role="status" className="text-xs mt-2">{importMessage}</p>}
           </div>
         </div>
       </aside>
@@ -116,7 +134,8 @@ export function AttributeSetsModule() {
         {(isCreating || editingSet) ? (
           <AttributeSetEditor
             initialData={editingSet}
-            onSave={isCreating ? handleCreate : handleUpdate}
+            onSave={handleSave}
+            disabled={isSaving || isLoading || Boolean(loadError)}
             onCancel={() => {
               setIsCreating(false);
               setEditingSet(null);

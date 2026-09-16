@@ -95,18 +95,22 @@ export function useCatalogData() {
     }
   }, []);
 
-  const updateSku = useCallback(async (sku: string, updates: Partial<SkuData>) => {
-    setSkuDataList((prev) =>
-      prev.map((item) => (item.sku === sku ? { ...item, ...updates } : item))
-    );
-    
+  const updateSku = useCallback(async (sku: string, updates: Partial<SkuData>): Promise<boolean> => {
     try {
-      await fetch(`/api/catalog/${sku}`, {
+      const response = await fetch(`/api/catalog/${encodeURIComponent(sku)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates)
       });
-    } catch(e) { console.error(e); }
+      if (!response.ok) return false;
+      setSkuDataList((prev) =>
+        prev.map((item) => (item.sku === sku ? { ...item, ...updates } : item))
+      );
+      return true;
+    } catch(e) {
+      console.error(e);
+      return false;
+    }
   }, []);
 
   const removeSkus = useCallback(async (skusToRemove: string[]) => {

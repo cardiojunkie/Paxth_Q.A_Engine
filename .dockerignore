@@ -1,5 +1,8 @@
 .env
+.env.*
+!.env.example
 .git
+backups
 dist
 node_modules
 npm-debug.log*

@@ -11,12 +11,13 @@ import { getDatabaseErrorDetails } from "./src/lib/databaseError.js";
 import { isCompleteWebsiteDomain, normalizeWebsite } from "./src/lib/siteSelectorWebsite.js";
 import { loadLazyPageContent } from "./src/lib/loadLazyPageContent.js";
 import { db } from "./src/db/index.js";
+import { initializeQaConfiguration, registerQaConfigurationRoutes } from "./src/db/qaConfiguration.js";
 import { skuData, attributeSets, jobs, siteSelectors } from "./src/db/schema.js";
 import { eq, inArray, sql } from "drizzle-orm";
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(cors());
   app.use(express.json({ limit: '50mb' }));
@@ -62,6 +63,11 @@ async function startServer() {
     }
 
     if (migrationsCanRun) {
+      try {
+        await initializeQaConfiguration(db);
+      } catch (error) {
+        console.error("Shared QA configuration initialization failed:", getDatabaseErrorDetails(error).message);
+      }
       let migrationFailures = 0;
       const runMigrate = async (query: any) => {
         try {
@@ -123,6 +129,8 @@ async function startServer() {
       }
     }
   }
+
+  registerQaConfigurationRoutes(app, db);
 
   // --- SKU Data Endpoints ---
   app.get("/api/catalog", async (req, res) => {
@@ -643,15 +651,6 @@ async function startServer() {
             delete currentPayload.response_format;
           }
 
-          // If status >= 400 and user content is very long, truncate user content
-          if (response.status >= 400 && Array.isArray(currentPayload.messages) && currentPayload.messages.length > 0) {
-            const lastMsg = currentPayload.messages[currentPayload.messages.length - 1];
-            if (lastMsg && typeof lastMsg.content === 'string' && lastMsg.content.length > 12000) {
-              console.warn(`[Proxy Chat] Endpoint returned ${response.status} with content length ${lastMsg.content.length}. Truncating to 12000 chars...`);
-              lastMsg.content = lastMsg.content.substring(0, 12000) + "\n...[TRUNCATED BY PROXY FOR COMPATIBILITY]...";
-            }
-          }
-
           // If status is retryable (429, 500, 502, 503, 504) and we have retries left
           if (response.status >= 400 && response.status !== 401 && response.status !== 402 && response.status !== 403 && attempts < maxServerAttempts) {
             const delay = attempts * 1000;
@@ -706,7 +705,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.join(process.cwd(), 'dist', 'public');
     app.use(express.static(distPath));
     app.get('*all', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));

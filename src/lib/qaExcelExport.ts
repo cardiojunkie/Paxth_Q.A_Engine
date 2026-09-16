@@ -72,7 +72,7 @@ export function populateQaWorksheet(
         } else {
           notes.push(fixes.length > 1
             ? "Review required: suggested corrections disagree. The correction cell is blank."
-            : "Review required: no correction was supplied. The correction cell is blank.");
+            : "Needs verification: no verified replacement was supplied. The correction cell is blank; see the issue explanation for the evidence needed.");
         }
       }
 

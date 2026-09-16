@@ -23,6 +23,45 @@ npm start
 
 The optional `./start.sh` helper stops this project's existing listeners on ports 3000 and 24678 before starting development.
 
+## Password-protected VPS deployment
+
+The deployment in `/opt/paxth-qa` uses `compose.yaml` as a separate Docker project. The container runs as `node`, restarts automatically, and has a 1 CPU / 1536 MiB memory limit with 256 MiB shared memory. Its backend is published only at `127.0.0.1:3200`.
+
+Keep `DATABASE_URL` in `/opt/paxth-qa/.env` with mode `600`; Compose supplies it at runtime. Environment files and database backups are excluded from the image build. Back up the shared database before starting a new deployment because the app initializes its schema at startup.
+
+```bash
+cd /opt/paxth-qa
+docker compose up -d --build
+docker compose ps
+```
+
+The image preinstalls CloakBrowser. Production uses the ESM entrypoint `dist/server.mjs` and serves only `dist/public`; the server bundle and its source map are outside the public asset directory.
+
+Caddy listens only on `127.0.0.1:8082`, requires HTTP Basic authentication for every page, asset, and API request, strips `Authorization`, and proxies to `127.0.0.1:3200`. Keep only the password's bcrypt hash in its configuration. The Caddy site must accept the Tailscale hostname rather than matching only `127.0.0.1`.
+
+```bash
+tailscale funnel --bg --https=8443 http://127.0.0.1:8082
+```
+
+Open `https://rakazo.tail608e42.ts.net:8443` in any browser and enter the separately supplied gateway credentials; a Tailscale client is not required. Port 8443 uses public Funnel behind Caddy authentication; leave the existing Rakazo Funnel configuration on port 443 intact. The app's existing login remains behind the gateway. LLM API keys and provider settings are browser-local, so configure them for this URL; catalog data, QA memory, and mapping rules use the shared database.
+
+After deployment, check `tailscale serve status` and `docker compose logs --tail=50`. From outside the tailnet, confirm missing and incorrect credentials return `401` for `/`, an asset, and `/api/catalog`; valid credentials must load the UI and `/api/db-status`. Verify catalog loading, SAP editing, a sample scrape, recovery after `docker compose restart app`, and that Rakazo still works. Backend ports 3200 and 8082 must remain bound to loopback.
+
+To restore private, tailnet-only access, run `tailscale serve --bg --https=8443 http://127.0.0.1:8082`.
+
+To roll back this deployment, remove only its Funnel listener and Compose project, then validate and restore the saved Caddy configuration:
+
+```bash
+tailscale funnel --https=8443 off
+cd /opt/paxth-qa
+docker compose down
+caddy validate --config /opt/paxth-qa/backups/Caddyfile.before --adapter caddyfile
+cp /opt/paxth-qa/backups/Caddyfile.before /etc/caddy/Caddyfile
+systemctl reload caddy
+```
+
+The rollback leaves the shared database and existing Rakazo services running. Avoid `tailscale serve reset`, which would remove unrelated Serve settings.
+
 ---
 
 ## 📌 Executive Summary & Business Logic.
@@ -78,9 +117,12 @@ When uploading new catalog SKUs to ecommerce marketplaces or platforms, data inc
 - If scraping fails or is blocked, QA proceeds relying on `source__sap`.
 
 ### Step 4: LLM-Powered QA Analysis
-- Sends the structured payload (`SKU`, `upload_attributes`, `source_sap`, and `scraped_markdown`) to the configured OpenAI-compatible LLM endpoint.
+- Sends the SKU, original template fields (including `name`, `base_code`, and `note`), SAP, and scraped evidence to the configured OpenAI-compatible LLM endpoint. Original column names, supplied values, and blank cells are retained; previous QA output and source metadata are excluded from template fields.
+- Loads shared **QA Agent Memory** and attribute-set mapping rules from Supabase when each job starts, and uses that snapshot throughout the run. Matching ignores case and surrounding spaces; missing, blank, or ambiguous rules allow a general review with a visible warning that category validation was skipped. Jobs cannot start if shared configuration cannot be loaded.
+- Prepares evidence once per SKU and retains it through retries. The **Max Source Page Characters** setting limits web evidence; truncation produces an incomplete-evidence warning. A SKU with neither usable SAP nor web evidence fails with an actionable error.
 - Evaluates 18+ audit vectors (factual mismatches, incorrect brand/model, unsupported marketing claims, contradictions, spelling/grammar, model code leaks).
-- Returns a strict, machine-readable JSON evaluation output.
+- Validates new JSON results before saving. Issue counts, colors, and statuses are reconciled so critical issues fail and incomplete reviews cannot pass. Existing saved results remain readable.
+- A `data_mismatch` requires source truth for the same attribute and a complete suggested replacement; incomplete responses use the configured retries and fail visibly if still invalid. Unverifiable values remain blank with a verification explanation. Product weight cannot substitute for shipping weight, and material cannot establish colour. Rerun QA to replace older results with the new checks.
 
 ### Step 5: Exporting Formatted Excel Output
 - Jobs downloads (single job, combined jobs, and issues-only) preserve original values and column order. A `Corrected: <original header>` column is inserted beside an `attributes__` column only when at least one exported SKU has a matched QA issue there, of any severity. The layout is fixed for the whole sheet using only the included rows; clean attributes have no correction column. SKU, SAP text, URLs, and other metadata remain single columns; `qa_status`, `qa_scrape_status`, and `job_error` are appended at the end.
@@ -198,7 +240,11 @@ Access the **Settings** module in the sidebar to configure:
 - **API Key**: Safely saved in local browser state.
 - **Model Name**: Custom model string (e.g., `gpt-4o`, `deepseek/deepseek-v4-flash`, `gemini-1.5-pro`).
 - **Temperature & Max Tokens**: Fine-tune output determinism and response limits.
-- **Scraper Settings**: Configurable network timeout and max page character limits.
+- **Max Source Page Characters**: Limit the web evidence sent to QA; truncated reviews receive a warning.
+
+**QA Agent Memory** stores shared standing instructions in Supabase (`qa_agent_settings`); category mapping rules are stored in `attribute_sets`. Both survive browser and application restarts. The default covers GCC catalogue QA, SAP precedence, exact product variants, category rules, source-supported corrections, Arabic/English content, and regional claims without assumed product facts. Edit the memory and click **Save Changes**; success is shown only after the database confirms the save. **Restore Default Memory** replaces only the editor contents until saved; blank memory uses the default. Changes apply to future runs and explicit reruns, not running jobs or existing results. API keys, provider settings, and execution parameters remain browser-local. The agent does not learn facts between SKUs, and the application retains control of the output format and evidence requirements.
+
+On first startup, shared QA configuration is initialized without overwriting existing database rules. Default category names are seeded once; deletions persist across restarts. In **Attribute Sets**, use **Import browser rules** to migrate browser-only rules into missing or blank shared sets; existing nonblank shared rules and the browser backup are preserved. If browser memory differs from shared memory, **Load previous browser memory into editor** lets you review it before saving it to Supabase. Saves and imports report database failures instead of silently falling back to local storage.
 
 ---
 
@@ -230,7 +276,7 @@ When transitioning development to **GitHub Codespaces**, keep the following key 
   - `server.ts` automatically runs safe, non-destructive table initializations on startup.
 - **LLM API Key Configuration**:
   - You can configure your API keys (OpenRouter, OpenAI, Gemini, or custom base URLs) **directly in the application UI** under the **LLM Settings** module.
-  - Settings configured via the UI are persisted in the browser's `localStorage`. Optionally, you can also set `GEMINI_API_KEY` in `.env`.
+  - API/provider settings configured via the UI remain in browser `localStorage`. QA agent memory and category mapping rules are shared through the database. Optionally, you can also set `GEMINI_API_KEY` in `.env`.
 - **API Secrets**:
   - Store sensitive keys in GitHub Codespaces Secrets or in `.env`.
   - Do NOT commit `.env` to version control.
@@ -283,7 +329,10 @@ npm run test:tab-capture
 npm run test:blocked-page
 npm run test:lazy-content
 npm run test:llm-response
+npm run test:qa-agent
 ```
+
+With `TEST_DATABASE_URL` set to a PostgreSQL test connection, `npm run test:qa-config-db` checks shared-memory persistence, mapping-rule CRUD/imports, restart behavior, and database failures. It creates and removes its own isolated schema and does not modify existing application tables.
 
 ---
 

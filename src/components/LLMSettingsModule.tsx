@@ -5,11 +5,13 @@ import { cn } from "../lib/utils";
 import { useAppContext } from "../context/AppContext";
 
 export function LLMSettingsModule() {
-  const { settings, saveSettings, defaultSettings } = useSettings();
+  const { settings, saveSettings, defaultSettings, legacyMemory, isMemoryLoading, memoryError } = useSettings();
   const { addNotification } = useAppContext();
   const [localSettings, setLocalSettings] = useState<AppSettings>(settings);
   const [isSaved, setIsSaved] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
 
   useEffect(() => {
     setLocalSettings(settings);
@@ -20,24 +22,29 @@ export function LLMSettingsModule() {
     setIsSaved(false);
   };
 
-  const handleSave = () => {
-    saveSettings(localSettings);
-    setIsSaved(true);
-    addNotification({
-      type: "success",
-      title: "Settings Saved",
-      message: "LLM API settings have been updated successfully."
-    });
-    setTimeout(() => setIsSaved(false), 2000);
+  const handleSave = async () => {
+    setIsSaving(true);
+    setSaveError("");
+    try {
+      await saveSettings(localSettings);
+      setIsSaved(true);
+      addNotification({ type: "success", title: "Settings Saved", message: "QA agent memory is saved in Supabase for everyone. API settings remain in this browser." });
+      setTimeout(() => setIsSaved(false), 2000);
+    } catch (error: any) {
+      setSaveError(error.message);
+      addNotification({ type: "error", title: "Save Failed", message: error.message });
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const handleReset = () => {
-    saveSettings(defaultSettings);
     setLocalSettings(defaultSettings);
+    setIsSaved(false);
     addNotification({
       type: "info",
       title: "Settings Reset",
-      message: "LLM API settings reset to default values."
+      message: "Defaults loaded into the editor. Save Changes to apply them, including shared QA memory."
     });
   };
 
@@ -115,7 +122,7 @@ export function LLMSettingsModule() {
         <div>
           <h2 className="font-serif text-4xl tracking-tighter mb-2 text-[#1A1A1A]">LLM Settings</h2>
           <p className="text-[#8C8882] text-sm leading-relaxed max-w-lg">
-            Configure language model endpoints, system prompts, API keys, and parameter overrides for the QA engine.
+            Configure language model endpoints, QA agent memory, API keys, and parameters for the QA engine.
           </p>
         </div>
         <div className="flex gap-4">
@@ -133,6 +140,7 @@ export function LLMSettingsModule() {
           </button>
           <button
             onClick={handleReset}
+            disabled={isSaving || isMemoryLoading || Boolean(memoryError)}
             className="flex items-center gap-2 px-4 py-2 text-[10px] uppercase font-bold text-[#8C8882] hover:text-[#1A1A1A] transition-colors"
           >
             <RotateCcw className="w-3.5 h-3.5" />
@@ -140,16 +148,20 @@ export function LLMSettingsModule() {
           </button>
           <button
             onClick={handleSave}
+            disabled={isSaving || isMemoryLoading || Boolean(memoryError)}
             className="flex items-center gap-2 px-6 py-2 text-[11px] uppercase tracking-widest border border-[#1A1A1A] bg-[#1A1A1A] text-white hover:bg-black transition-colors rounded-sm"
           >
             <Save className="w-3.5 h-3.5" />
-            {isSaved ? "Saved" : "Save Changes"}
+            {isSaving ? "Saving…" : isSaved ? "Saved" : "Save Changes"}
           </button>
         </div>
       </header>
 
       <div className="flex-1 overflow-y-auto p-10">
-        <div className="max-w-4xl space-y-12 pb-10">
+        <fieldset disabled={isMemoryLoading || isSaving || Boolean(memoryError)} className="max-w-4xl min-w-0 w-full space-y-12 pb-10">
+          {isMemoryLoading && <p role="status" className="text-sm text-[#8C8882]">Loading shared QA memory from Supabase…</p>}
+          {memoryError && <p role="alert" className="text-sm text-red-700">{memoryError} Reload this page to try again.</p>}
+          {saveError && <p role="alert" className="text-sm text-red-700">{saveError} Your edits remain in the editor; retry Save Changes.</p>}
           
           {/* Warning Banner */}
           <div className="bg-[#FFF8E6] border border-[#F2DCA5] rounded-sm p-4 flex gap-3 text-[#B37B00]">
@@ -247,7 +259,7 @@ export function LLMSettingsModule() {
                   onChange={(e) => handleChange("maxRetries", e.target.value === '' ? 0 : parseInt(e.target.value, 10))}
                   className="w-full bg-[#F5F2EF] border border-transparent hover:border-[#E5E2DE] focus:border-[#1A1A1A] outline-none rounded-sm px-4 py-2.5 text-sm transition-colors"
                 />
-                <p className="text-[10px] text-[#8C8882] mt-2">Times to retry processing a SKU if the LLM or scraper fails.</p>
+                <p className="text-[10px] text-[#8C8882] mt-2">Times to retry a failed QA response using the same source evidence.</p>
               </div>
 
               <div>
@@ -276,9 +288,64 @@ export function LLMSettingsModule() {
                 />
                 <p className="text-[10px] text-[#8C8882] mt-2">Maximum generated response length. Your provider and model enforce the supported limit.</p>
               </div>
+
+              <div className="col-span-2">
+                <label htmlFor="qa-page-limit" className="block text-[10px] uppercase tracking-widest text-[#8C8882] mb-2">Max Source Page Characters</label>
+                <input
+                  id="qa-page-limit"
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={localSettings.maxPageContentLength}
+                  onChange={(e) => handleChange("maxPageContentLength", Math.max(parseInt(e.target.value, 10) || 1, 1))}
+                  className="w-full bg-[#F5F2EF] border border-transparent hover:border-[#E5E2DE] focus:border-[#1A1A1A] outline-none rounded-sm px-4 py-2.5 text-sm transition-colors"
+                />
+                <p className="text-[10px] text-[#8C8882] mt-2">Longer product pages are truncated once before QA and marked as incomplete evidence. Retries retain the same excerpt.</p>
+              </div>
             </div>
           </section>
-        </div>
+
+          <section aria-labelledby="qa-memory-heading">
+            <div className="flex items-center justify-between gap-4 mb-4">
+              <h3 id="qa-memory-heading" className="font-serif text-xl">QA Agent Memory</h3>
+              <button
+                type="button"
+                onClick={() => handleChange("qaAgentMemory", defaultSettings.qaAgentMemory)}
+                disabled={isSaving || isMemoryLoading || Boolean(memoryError)}
+                className="flex items-center gap-2 px-3 py-2 text-xs text-[#1A1A1A] border border-[#E5E2DE] hover:bg-[#F5F2EF] rounded-sm"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Restore Default Memory
+              </button>
+            </div>
+            <p id="qa-memory-help" className="text-sm text-[#8C8882] mb-4">
+              Shared instructions saved in Supabase for all browsers and preserved across restarts.
+              Each job loads the latest saved memory and category mapping rules when it starts and keeps them for that run.
+              Save Changes applies edits to future runs and explicit reruns; existing results stay as they are.
+            </p>
+            {!isMemoryLoading && !memoryError && legacyMemory !== settings.qaAgentMemory && legacyMemory !== defaultSettings.qaAgentMemory && (
+              <button type="button" disabled={isSaving} onClick={() => handleChange("qaAgentMemory", legacyMemory)} className="text-sm underline mb-4">
+                Load previous browser memory into editor
+              </button>
+            )}
+            <label htmlFor="qa-agent-memory" className="block text-[10px] uppercase tracking-widest text-[#8C8882] mb-2">
+              Agent instructions
+            </label>
+            <textarea
+              id="qa-agent-memory"
+              aria-describedby="qa-memory-help qa-memory-default-help"
+              rows={20}
+              disabled={isSaving || isMemoryLoading || Boolean(memoryError)}
+              value={localSettings.qaAgentMemory}
+              onChange={(e) => handleChange("qaAgentMemory", e.target.value)}
+              className="w-full bg-[#F5F2EF] border border-[#E5E2DE] focus:border-[#1A1A1A] outline-none rounded-sm px-4 py-3 text-sm font-mono leading-relaxed resize-y"
+            />
+            <p id="qa-memory-default-help" className="text-xs text-[#8C8882] mt-2">
+              Blank memory uses the default GCC catalogue QA instructions. Restore Default Memory changes this editor only until you save.
+              Evidence requirements and the result format are enforced by the application.
+            </p>
+          </section>
+        </fieldset>
       </div>
     </div>
   );

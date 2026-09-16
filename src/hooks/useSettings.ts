@@ -1,4 +1,6 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { DEFAULT_QA_AGENT_MEMORY } from '../lib/qaAgent';
+import { fetchQaConfiguration, saveQaAgentMemory } from '../lib/qaConfiguration';
 
 const STORAGE_KEY = "qa-analyzer-settings";
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
@@ -17,6 +19,7 @@ export interface AppSettings {
   maxRetries: number;
   scraperTimeout: number;
   maxPageContentLength: number;
+  qaAgentMemory: string;
 }
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -30,6 +33,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   maxRetries: 3,
   scraperTimeout: 30000,
   maxPageContentLength: 40000,
+  qaAgentMemory: DEFAULT_QA_AGENT_MEMORY,
 };
 
 export function normalizeMaxTokens(value: unknown): number {
@@ -47,6 +51,10 @@ export function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
     ...settings,
     baseUrl: baseUrl ?? DEFAULT_SETTINGS.baseUrl,
     maxTokens: normalizeMaxTokens(settings.maxTokens),
+    maxPageContentLength: Number.isSafeInteger(settings.maxPageContentLength) && settings.maxPageContentLength > 0
+      ? settings.maxPageContentLength : DEFAULT_SETTINGS.maxPageContentLength,
+    qaAgentMemory: typeof settings.qaAgentMemory === 'string' && settings.qaAgentMemory.trim()
+      ? settings.qaAgentMemory : DEFAULT_QA_AGENT_MEMORY,
   };
 }
 
@@ -59,12 +67,31 @@ export function useSettings() {
       return DEFAULT_SETTINGS;
     }
   });
+  const [legacyMemory, setLegacyMemory] = useState(settings.qaAgentMemory);
+  const [isMemoryLoading, setIsMemoryLoading] = useState(true);
+  const [memoryError, setMemoryError] = useState("");
 
-  const saveSettings = (newSettings: AppSettings) => {
+  useEffect(() => {
+    let active = true;
+    fetchQaConfiguration().then(config => {
+      if (active) setSettings(current => ({ ...current, qaAgentMemory: config.qaAgentMemory }));
+    }).catch(error => {
+      if (active) setMemoryError(error.message);
+    }).finally(() => {
+      if (active) setIsMemoryLoading(false);
+    });
+    return () => { active = false; };
+  }, []);
+
+  const saveSettings = async (newSettings: AppSettings) => {
     const normalized = normalizeSettings(newSettings);
-    setSettings(normalized);
+    normalized.qaAgentMemory = await saveQaAgentMemory(normalized.qaAgentMemory);
+    // This is only a local cache; QA jobs always fetch the database configuration.
     localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+    setSettings(normalized);
+    setLegacyMemory(normalized.qaAgentMemory);
+    setMemoryError("");
   };
 
-  return { settings, saveSettings, defaultSettings: DEFAULT_SETTINGS };
+  return { settings, saveSettings, defaultSettings: DEFAULT_SETTINGS, legacyMemory, isMemoryLoading, memoryError };
 }

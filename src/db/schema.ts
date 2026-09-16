@@ -1,5 +1,5 @@
-import { pgTable, text, serial, timestamp, jsonb, boolean, integer, pgEnum } from 'drizzle-orm/pg-core';
-import { relations } from 'drizzle-orm';
+import { pgTable, text, serial, timestamp, jsonb, boolean, integer, pgEnum, uniqueIndex } from 'drizzle-orm/pg-core';
+import { relations, sql } from 'drizzle-orm';
 
 export const userRoleEnum = pgEnum('user_role', ['admin', 'user']);
 
@@ -17,6 +17,12 @@ export const attributeSets = pgTable('attribute_sets', {
   name: text('name').notNull(),
   rulesMarkdown: text('rules_markdown').notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => [uniqueIndex('attribute_sets_normalized_name_idx').on(sql`lower(btrim(${table.name}))`)]);
+
+export const qaAgentSettings = pgTable('qa_agent_settings', {
+  id: text('id').primaryKey(),
+  memory: text('memory').notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
 

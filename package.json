@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
-    "start": "node dist/server.cjs",
-    "preview": "vite preview",
+    "build": "vite build --outDir dist/public && esbuild server.ts --bundle --platform=node --format=esm --packages=external --sourcemap --outfile=dist/server.mjs",
+    "start": "node dist/server.mjs",
+    "preview": "vite preview --outDir dist/public",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "test:job-state": "tsx src/lib/jobRunState.test.ts",
@@ -17,6 +17,9 @@
     "test:db-error": "tsx src/lib/databaseError.test.ts",
     "test:lazy-content": "tsx src/lib/loadLazyPageContent.test.ts",
     "test:llm-response": "tsx src/lib/llmResponse.test.ts",
+    "test:qa-agent": "tsx src/hooks/useSettings.test.ts && tsx src/lib/qaAgent.test.ts",
+    "test:sap-editor": "tsx src/components/DashboardModule.test.ts",
+    "test:qa-config-db": "tsx src/db/qaConfiguration.test.ts",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio"
