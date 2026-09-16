@@ -7,12 +7,12 @@ import {
   getCommonAttributeSet,
   getCommonHeaderOrder,
   getCompletedJobSkuIds,
-  getExportColumns,
   getJobRunStatus,
   hasCompletedQa,
   selectJobSkus,
 } from "../lib/jobRunState";
 import { extractLLMResponseContent, parseLLMJsonResponse } from "../lib/llmResponse";
+import { populateQaWorksheet } from "../lib/qaExcelExport";
 import { cn } from "../lib/utils";
 import ExcelJS from "exceljs";
 import { saveAs } from "file-saver";
@@ -48,6 +48,9 @@ Check for:
 - poor customer-facing catalogue wording`;
 
 const QA_JSON_SCHEMA = `CRITICAL INSTRUCTION: You MUST return your response as a single, valid JSON object. Do NOT wrap the JSON in Markdown code blocks (e.g., \`\`\`json). Do NOT add any conversational text, preamble, reasoning, or explanation before or after the JSON.
+
+Write each issue's explanation in plain English so a catalogue editor understands what is wrong and why.
+Each suggested_fix must contain the complete replacement cell value, not instructions for editing it. Use an empty string when a correction cannot be determined from the provided sources. Do not invent product facts.
 
 Required JSON Schema:
 {
@@ -599,77 +602,7 @@ ${skuItem.source.sap || "N/A"}`.trim();
 
       const workbook = new ExcelJS.Workbook();
       const sheet = workbook.addWorksheet(`QA Results`);
-
-      let maxIssues = 0;
-      jobSkus.forEach(sku => {
-        const qa = sku.qa_result || (sku.raw_row && sku.raw_row.qa_result);
-        if (qa && qa.issues && Array.isArray(qa.issues)) {
-          maxIssues = Math.max(maxIssues, qa.issues.length);
-        }
-      });
-
-      sheet.columns = getExportColumns(headerOrder.headers, maxIssues);
-
-      jobSkus.forEach((sku) => {
-        const rowData: Record<string, any> = {};
-        headerOrder.headers.forEach((header, index) => {
-          const value = sku.raw_row?.[header];
-          rowData[`input_${index}`] = typeof value === "object" && value !== null ? JSON.stringify(value) : value;
-        });
-        const qa = sku.qa_result || (sku.raw_row && sku.raw_row.qa_result);
-        
-        if (qa) {
-          rowData.qa_status = qa.qa_status || sku.status;
-          
-          if (qa.issues && Array.isArray(qa.issues)) {
-            qa.issues.forEach((issue: any, index: number) => {
-              rowData[`error_${index + 1}`] = `${issue.field || 'general'} : ${issue.uploaded_value || ''} : ${issue.explanation}`;
-            });
-          }
-        } else {
-          rowData.qa_status = sku.status;
-        }
-        
-        rowData.qa_scrape_status = sku.scrape_status;
-        rowData.job_error = sku.error || '';
-
-        const row = sheet.addRow(rowData);
-        
-        if (qa && qa.issues && Array.isArray(qa.issues)) {
-          qa.issues.forEach((issue: any, index: number) => {
-            const field = issue.field;
-            let color = 'FFFFFFE0'; // yellow
-            if (issue.cell_color === 'red') color = 'FFFFCCCC';
-            else if (issue.cell_color === 'orange') color = 'FFFFE5B4';
-            else if (issue.cell_color === 'yellow') color = 'FFFFFFE0';
-            
-            const errorColIndex = sheet.columns.findIndex((c: any) => c.key === `error_${index + 1}`);
-            if (errorColIndex >= 0) {
-               const errorCell = row.getCell(errorColIndex + 1);
-               errorCell.fill = {
-                 type: 'pattern',
-                 pattern: 'solid',
-                 fgColor: { argb: color }
-               };
-               if (issue.suggested_fix) {
-                 errorCell.note = `Suggestion: ${issue.suggested_fix}`;
-               }
-            }
-
-            const originalColIndex = headerOrder.headers.indexOf(field);
-            if (originalColIndex >= 0) {
-               const originalCell = row.getCell(originalColIndex + 1);
-               originalCell.fill = {
-                 type: 'pattern',
-                 pattern: 'solid',
-                 fgColor: { argb: color }
-               };
-            }
-          });
-        }
-      });
-
-      sheet.getRow(1).font = { bold: true };
+      populateQaWorksheet(sheet, headerOrder.headers, jobSkus);
       
       const buffer = await workbook.xlsx.writeBuffer();
       const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });

@@ -71,14 +71,14 @@ export const getCompletedJobSkuIds = (items: JobItem[]) => [
   ...new Set(items.filter((item) => item.status === "completed").flatMap((item) => item.skus)),
 ];
 
-export const getExportColumns = (headers: string[], maxIssues: number) => [
-  ...headers.map((header, index) => ({ header, key: `input_${index}`, width: 20 })),
+export const getExportColumns = (headers: string[], affectedAttributeIndexes: ReadonlySet<number>) => [
+  ...headers.flatMap((header, index) => [
+    { header, key: `input_${index}`, width: 20 },
+    ...(header.startsWith("attributes__") && affectedAttributeIndexes.has(index)
+      ? [{ header: `Corrected: ${header}`, key: `corrected_${index}`, width: 30 }]
+      : []),
+  ]),
   { header: "qa_status", key: "qa_status", width: 15 },
   { header: "qa_scrape_status", key: "qa_scrape_status", width: 20 },
   { header: "job_error", key: "job_error", width: 40 },
-  ...Array.from({ length: maxIssues }, (_, index) => ({
-    header: `Error ${index + 1}`,
-    key: `error_${index + 1}`,
-    width: 60,
-  })),
 ];

@@ -83,8 +83,10 @@ When uploading new catalog SKUs to ecommerce marketplaces or platforms, data inc
 - Returns a strict, machine-readable JSON evaluation output.
 
 ### Step 5: Exporting Formatted Excel Output
-- Re-generates the original Excel file with appended QA metadata columns (`qa_status`, `qa_confidence`, `qa_issue_count`, `qa_summary`, `qa_issues_plain_english`, `qa_suggestions`, `qa_source_used`).
-- Highlights individual cells containing errors using industry-standard color coding and cell comments.
+- Jobs downloads (single job, combined jobs, and issues-only) preserve original values and column order. A `Corrected: <original header>` column is inserted beside an `attributes__` column only when at least one exported SKU has a matched QA issue there, of any severity. The layout is fixed for the whole sheet using only the included rows; clean attributes have no correction column. SKU, SAP text, URLs, and other metadata remain single columns; `qa_status`, `qa_scrape_status`, and `job_error` are appended at the end.
+- Affected original cells are highlighted and contain Excel notes (classic comments) with the plain-English explanation, available source truth, and suggested correction. Multiple issues share one comment and the highest severity determines the highlight. There are no separate `Error 1`, `Error 2`, etc. columns.
+- Correction cells contain the stored suggested replacement value for review. Unaffected rows leave that correction cell blank. Missing or conflicting suggestions still create the correction column, but its cells stay blank where no unambiguous fix is available; comments explain when review is required. General issues and fields that cannot be matched to an original column appear in a comment on `qa_status` without creating correction columns.
+- Existing results can be exported without rerunning QA. New QA runs request complete replacement values instead of editing instructions. The Dashboard summary export and uploaded data are unchanged.
 
 ---
 
