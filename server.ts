@@ -1,15 +1,11 @@
 import express from "express";
+import { scrapeWithAgent, ScrapeError, validateScrapeInput } from "./src/lib/scrapeAgent.js";
+import { fetchChatCompletion } from "./src/lib/chatCompletion.js";
 import path from "path";
 import cors from "cors";
 import axios from "axios";
-import * as cheerio from "cheerio";
-import TurndownService from "turndown";
-import { launch } from "cloakbrowser";
-import { getBlockedScrapeReason } from "./src/lib/blockedScrapePage.js";
-import { captureDynamicTabs } from "./src/lib/captureDynamicTabs.js";
 import { getDatabaseErrorDetails } from "./src/lib/databaseError.js";
 import { isCompleteWebsiteDomain, normalizeWebsite } from "./src/lib/siteSelectorWebsite.js";
-import { loadLazyPageContent } from "./src/lib/loadLazyPageContent.js";
 import { db } from "./src/db/index.js";
 import { initializeQaConfiguration, registerQaConfigurationRoutes } from "./src/db/qaConfiguration.js";
 import { skuData, attributeSets, jobs, siteSelectors } from "./src/db/schema.js";
@@ -475,24 +471,13 @@ async function startServer() {
     }
   });
 
-  // Scraping endpoint
+  // Every scrape entry point shares the same agent and evidence contract.
   app.post("/api/scrape", async (req, res) => {
+    const controller = new AbortController();
+    const disconnect = () => { if (!res.writableEnded) controller.abort(); };
+    res.on("close", disconnect);
     try {
-      let { url } = req.body;
-      if (!url) {
-        return res.status(400).json({ error: "URL is required" });
-      }
-
-      if (!url.startsWith('http://') && !url.startsWith('https://')) {
-        url = 'https://' + url;
-      }
-
-      try {
-        new URL(url);
-      } catch (e) {
-        return res.status(400).json({ error: "Invalid URL provided", details: url });
-      }
-
+      const { url, llm } = validateScrapeInput(req.body);
       const hostname = new URL(url).hostname.toLowerCase();
       let selectorRule: typeof siteSelectors.$inferSelect | undefined;
       if (db) {
@@ -500,99 +485,19 @@ async function startServer() {
           selectorRule = (await db.select().from(siteSelectors))
             .filter(rule => rule.enabled && matchesWebsite(hostname, rule.website))
             .sort((a, b) => normalizeWebsite(b.website).length - normalizeWebsite(a.website).length)[0];
-        } catch (e: any) {
-          console.error("Failed to load site selectors:", e.message);
-          return res.status(500).json({ error: "Failed to load site selector rules", details: e.message });
+        } catch {
+          throw new ScrapeError("Failed to load site selector rules", 503);
         }
       }
-
-      let browser;
-      try {
-        // Fetch HTML with CloakBrowser
-        browser = await launch({ headless: true });
-        const page = await browser.newPage();
-        
-        // Navigate and wait for network to be idle to ensure dynamic content loads
-        const navigationResponse = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        
-        // Try to wait for network idle to get SPAs, but don't fail if it times out
-        try {
-          await page.waitForLoadState('networkidle', { timeout: 10000 });
-        } catch (e) {
-          // Ignore timeout on networkidle
-        }
-
-        let html = await page.content();
-        const blockedReason = getBlockedScrapeReason({
-          status: navigationResponse?.status(),
-          hostname,
-          html,
-        });
-        if (blockedReason) {
-          return res.status(502).json({
-            error: blockedReason,
-            details: "Use SAP or manually supplied source content for this QA run.",
-          });
-        }
-
-        if (/(^|\.)amazon\./i.test(hostname)) {
-          await loadLazyPageContent(page);
-          html = await page.content();
-        }
-
-        if (selectorRule && Boolean(selectorRule.tabSelector) !== Boolean(selectorRule.tabContentSelector)) {
-          return res.status(422).json({ error: `Incomplete tab selector configuration for ${selectorRule.website}` });
-        }
-        if (selectorRule?.tabSelector && selectorRule.tabContentSelector) {
-          try {
-            await captureDynamicTabs(page, {
-              tabSelector: selectorRule.tabSelector,
-              panelSelector: selectorRule.tabContentSelector,
-              waitMs: selectorRule.tabWaitMs ?? 300,
-            });
-          } catch (error: any) {
-            return res.status(422).json({
-              error: `Could not capture specification tabs for ${selectorRule.website}`,
-              details: error.message || String(error),
-            });
-          }
-          html = await page.content();
-        }
-        
-        const $ = cheerio.load(html);
-
-        // Remove irrelevant elements
-        $('header, footer, nav, aside, script, style, noscript, svg, [role="banner"], [role="contentinfo"], .related-products, .recommendations, .cookie-banner, .ads').remove();
-
-        let cleanHtml = $.html();
-        if (selectorRule) {
-          let selected;
-          try {
-            selected = $(selectorRule.selectors);
-          } catch {
-            return res.status(422).json({ error: `Invalid selector for ${selectorRule.website}` });
-          }
-          if (!selected.length) return res.status(422).json({ error: `Selector matched no content for ${selectorRule.website}` });
-          cleanHtml = selected.toString();
-        }
-
-        // Convert to Markdown
-        const turndownService = new TurndownService({
-          headingStyle: 'atx',
-          codeBlockStyle: 'fenced'
-        });
-        
-        const markdown = turndownService.turndown(cleanHtml);
-
-        return res.json({ markdown });
-      } finally {
-        if (browser) {
-          await browser.close().catch(console.error);
-        }
-      }
-    } catch (error: any) {
-      console.error("Scraping error:", error.message);
-      return res.status(500).json({ error: "Failed to scrape URL", details: error.message });
+      const markdown = await scrapeWithAgent(url, llm, selectorRule, controller.signal);
+      if (!res.destroyed) res.json({ markdown });
+    } catch (error) {
+      if (!res.destroyed) res.status(error instanceof ScrapeError ? error.status : 500).json({
+        error: error instanceof ScrapeError ? error.message : "Failed to scrape URL",
+        details: "Use SAP or manually supplied source content if this page cannot be retrieved.",
+      });
+    } finally {
+      res.removeListener("close", disconnect);
     }
   });
 
@@ -603,11 +508,6 @@ async function startServer() {
       if (!baseUrl || !payload) {
         return res.status(400).json({ error: "baseUrl and payload are required" });
       }
-
-      let cleanBaseUrl = String(baseUrl).trim().replace(/\/+$/, '');
-      let endpoint = cleanBaseUrl.endsWith('/chat/completions')
-        ? cleanBaseUrl
-        : `${cleanBaseUrl}/chat/completions`;
 
       let currentPayload = { ...payload };
       let attempts = 0;
@@ -621,15 +521,7 @@ async function startServer() {
         const timeout = setTimeout(() => controller.abort(), 90000); // 90s per request attempt
 
         try {
-          const response = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              ...(apiKey && { "Authorization": `Bearer ${apiKey}` })
-            },
-            body: JSON.stringify(currentPayload),
-            signal: controller.signal
-          });
+          const response = await fetchChatCompletion(String(baseUrl), apiKey, currentPayload, controller.signal);
           clearTimeout(timeout);
           lastResponse = response;
 

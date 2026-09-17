@@ -1,363 +1,324 @@
-# Ecommerce Catalogue QA Automation Platform
+# Paxth Q.A. Engine
 
-A production-quality internal QA automation web application for ecommerce catalog teams. This tool allows catalog operations managers to upload Excel product templates (`.xlsx` / `.xls`), parse SKU rows into structured JSON, scrape live source product URLs into clean Markdown, and execute automated LLM-based Quality Assurance checks against official SAP source data and live product pages.
+An internal ecommerce catalog review application, displayed in the UI as **Project 22**. Import product spreadsheets, collect SAP and product-page evidence, run an OpenAI-compatible language model against category rules, and download Excel files for human review.
 
-## Quick Start
+The application uses React, TypeScript, Express, PostgreSQL/Drizzle, and a Python Crawl4AI agent. It has working QA and export checks, but several reliability and access-control limitations remain. Read the [codebase analysis](docs/codebase-analysis.md) for evidence and priorities, and the [two Codex task briefs](docs/codex-tasks.md) for follow-up work.
 
-Requirements: Node.js 18+ and PostgreSQL.
+## Does pushing to GitHub update the live app?
+
+**No, not by itself.** Tailscale Funnel routes public HTTPS traffic to a service on your server; it does not pull Git commits or rebuild the application. No automatic deployment workflow is checked into this repository. Any separate automation on the VPS has not been inspected. See the [Tailscale Funnel documentation](https://tailscale.com/docs/features/tailscale-funnel).
+
+The existing VPS deployment at `/opt/paxth-qa` contains copied source, **not a Git checkout**. Push the tested branch, transfer source from its exact commit (excluding secrets, backups, dependencies, and build artifacts), and build a release image before replacing the running app. Preserve the host's `.env`, `compose.yaml`, and gateway files. After retaining the previous image and tagging the tested release as `paxth-qa:local`, run **on the VPS**:
 
 ```bash
-cp .env.example .env
-npm install
+cd /opt/paxth-qa
+docker compose up -d --no-build --no-deps app
+docker compose logs --tail=50 app
+```
+
+Back up the database and retain the previous source and image before deployment as described in [deployment and updates](#deployment-and-updates). Record the deployed commit on the VPS. A container restart alone does not rebuild changed source. Leave the existing Funnel listener in place. Automatic deployment is proposed in [Task 2](docs/codex-tasks.md#task-2--prioritized-improvements-roadmap); it is not implemented.
+
+## What the application does
+
+1. **Dashboard:** import the first sheet of an `.xlsx`, `.xls`, or `.csv` file, inspect/filter SKUs, scrape selected URLs, supply source content, and create jobs.
+2. **Scraper:** test a URL and maintain shared domain-specific CSS selectors, including optional dynamic-tab capture.
+3. **Attribute Sets:** save category names and Markdown mapping rules in PostgreSQL.
+4. **LLM Settings:** configure a provider, model, API key, execution settings, and shared QA agent memory.
+5. **Jobs:** run selected jobs, inspect results, rerun SKUs, and export detailed Excel feedback.
+6. **Users:** manage browser-local accounts. These accounts are not server-enforced authorization.
+
+SAP text is supplied through uploads or the editor; there is no direct SAP/ERP integration. SAP is the primary factual source. Web evidence supports details absent from SAP, and conflicts must be reported. The model is instructed to avoid invented facts and supply complete replacement cell values when supported. Human review remains necessary: structural validation cannot prove every model conclusion correct.
+
+## Architecture and storage
+
+```mermaid
+flowchart LR
+    B[Browser: React UI and job runner] -->|JSON API| E[Express]
+    B -->|Import and export| X[Spreadsheet files]
+    B --> L[Browser localStorage]
+    E --> D[(PostgreSQL via Drizzle)]
+    E --> C[Python Crawl4AI agent → product page]
+    E --> M[Configured LLM endpoint]
+```
+
+Express mounts Vite middleware in development. With `NODE_ENV=production`, it serves `dist/public` and the same API routes. The server entrypoint is `dist/server.mjs`; it is outside the public asset directory.
+
+| Data | Where it lives | Consequence |
+| --- | --- | --- |
+| Catalog rows, source text, scraped Markdown, latest QA results | PostgreSQL `sku_data` | Shared by clients using the same database |
+| Job membership, status, token/time totals | PostgreSQL `jobs` | Saved records persist, but execution is browser-driven |
+| Category rules and QA agent memory | `attribute_sets`, `qa_agent_settings` | Shared; a configuration snapshot is loaded at each run |
+| Domain selectors | PostgreSQL `site_selectors`, with a browser cache | Scraping uses server-loaded rules; a failed UI load can show stale cached rules |
+| Provider URL, API key, model, execution settings | Browser `localStorage` | Specific to the browser and origin, including port; the key is sent to the Express proxy for requests |
+| Login session and user accounts/passwords | Browser `localStorage` | Not synchronized accounts or an API security boundary; passwords are stored as plaintext |
+| Notifications and active run controls | React memory | Lost on reload; run controls also reset when the Jobs component unmounts |
+
+The schema defines a `users` table, but the current login does not use it. The API has no application authentication middleware. For the documented public deployment, the Caddy authentication gateway is the access barrier; keep the backend bound to loopback through Compose.
+
+## Local setup
+
+Use **Node.js 22**, **Python 3.11+**, npm, and an accessible PostgreSQL database. The Dockerfile and devcontainer use Node 22 with Debian's Python 3.11. Linux scraping also needs Chromium system libraries; the Dockerfile lists the installed packages.
+
+```bash
+npm ci
+# Create the file only if it does not already exist.
+test -e .env || cp .env.example .env
+```
+
+Edit `.env` and set `DATABASE_URL` to the intended database. Create that database with your PostgreSQL service first; Compose does not provision PostgreSQL. For Supabase, use the exact TLS-enabled connection URI from the project's Connect dialog. In an IPv4-only environment, use its Session pooler connection details rather than guessing the hostname or region.
+
+For a **new, empty application database**, review and apply the declared schema:
+
+```bash
+npm run db:push
+```
+
+Do not blindly run `db:push` on an existing/shared production database: inspect the proposed changes and take a backup. Startup initializes shared QA configuration, jobs, and selectors and attempts some schema alterations, but **does not create the base `sku_data` table**. There is no checked-in versioned migration history.
+
+Install the pinned Crawl4AI dependencies and its browser before scraping:
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -r scraper/requirements.txt
+.venv/bin/python -m playwright install chromium
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). Set `DATABASE_URL` in `.env` before uploading data; the database stores SKUs, scraped content, QA results, and job logs. Configure the LLM provider in the app under **LLM Settings**.
+The app detects `.venv/bin/python` automatically. Set `CRAWL4AI_PYTHON` in `.env` only to use a different interpreter. In the devcontainer, you can instead install into its existing `/opt/crawl4ai` virtualenv using `$CRAWL4AI_PYTHON -m pip install -r scraper/requirements.txt` and `$CRAWL4AI_PYTHON -m playwright install chromium`. On a Linux host missing browser libraries, run `.venv/bin/python -m playwright install-deps chromium` with the required system privileges.
 
-For a production build:
+Open [localhost:3000](http://localhost:3000). The production image installs Crawl4AI and Chromium and verifies the browser launches as `node`. The devcontainer uses the Dockerfile's `system` stage and requires the Python dependency/browser installation above. Keep a Codespaces port private because the application's login does not protect its API. The existing UI browser tests still use CloakBrowser; install it separately with `npx --no-install cloakbrowser install` before running them.
+
+| Configuration | Current use |
+| --- | --- |
+| `DATABASE_URL` | PostgreSQL connection; loaded from `.env` or the process environment |
+| `PORT` | Express port, default `3000` |
+| `NODE_ENV=production` | Serve built frontend assets instead of Vite middleware |
+| `DISABLE_HMR=true` | Disable development HMR/file watching through Vite configuration |
+| `CRAWL4AI_PYTHON` | Python 3.11+ interpreter; defaults to `.venv/bin/python` when present, then `python3`. Docker sets `/opt/crawl4ai/bin/python`. |
+| `CLOAKBROWSER_AUTO_UPDATE=false` | Used by the existing UI browser tests to disable automatic browser updates |
+| `GEMINI_API_KEY` | Present in the example file but unused by the current application; configure the LLM through the UI |
+
+For a production build outside Docker:
 
 ```bash
 npm run build
-npm start
+NODE_ENV=production npm start
 ```
 
-The optional `./start.sh` helper stops this project's existing listeners on ports 3000 and 24678 before starting development.
+`npm start` alone does not set production mode. `npm run preview` serves the Vite frontend preview, not the Express API. The optional Linux helper `./start.sh` stops this checkout's existing listeners on ports 3000 and 24678, then starts development.
 
-## Password-protected VPS deployment
+## Importing and reviewing a catalog
 
-The deployment in `/opt/paxth-qa` uses `compose.yaml` as a separate Docker project. The container runs as `node`, restarts automatically, and has a 1 CPU / 1536 MiB memory limit with 256 MiB shared memory. Its backend is published only at `127.0.0.1:3200`.
+### Input columns
 
-Keep `DATABASE_URL` in `/opt/paxth-qa/.env` with mode `600`; Compose supplies it at runtime. Environment files and database backups are excluded from the image build. Back up the shared database before starting a new deployment because the app initializes its schema at startup.
+The first worksheet and its first header row are used. There is no interactive column-mapping step.
 
-```bash
-cd /opt/paxth-qa
-docker compose up -d --build
-docker compose ps
-```
+| Column | Meaning |
+| --- | --- |
+| `sku` or `SKU` | Product identifier; required for the row to be imported |
+| `attributes__<field>` | Upload attributes being checked; the prefix is stripped in `upload_attributes`, while the original row is retained |
+| `source__sap` or a case-insensitive `sap` header | Supplied SAP source text |
+| `source__url` or a case-insensitive `url` header | Product-page URL |
+| Case-insensitive `attribute_set` or `attribute set` | Category name used to group a job and find its mapping rules |
+| Other columns, such as `name`, `base_code`, `note` | Retained in the original row and included in QA unless they are source/QA metadata |
 
-The image preinstalls CloakBrowser. Production uses the ESM entrypoint `dist/server.mjs` and serves only `dist/public`; the server bundle and its source map are outside the public asset directory.
+Keep identifiers such as SKUs and barcodes as text in spreadsheets to avoid numeric conversion. Rows without a usable SKU are skipped. Within a file, the first occurrence of a trimmed SKU is kept. The UI skips SKUs already in the loaded catalog; uploading a duplicate is not an edit operation. Category grouping currently requires identical, nonblank names, including case and spacing, even though rule lookup trims names and ignores case.
 
-Caddy listens only on `127.0.0.1:8082`, requires HTTP Basic authentication for every page, asset, and API request, strips `Authorization`, and proxies to `127.0.0.1:3200`. Keep only the password's bcrypt hash in its configuration. The Caddy site must accept the Tailscale hostname rather than matching only `127.0.0.1`.
+### Prepare evidence and create a job
 
-```bash
-tailscale funnel --bg --https=8443 http://127.0.0.1:8082
-```
+1. Configure and save **LLM Settings**. Scraping and QA both require a nonempty API key, base URL, and model, including when using a compatible local endpoint. The endpoint must be reachable from the application server.
+2. Add mapping rules in **Attribute Sets**, matching the spreadsheet category. Seeded category names initially have blank rules.
+3. Upload the spreadsheet and select SKUs. A URL makes a row initially `ready`, but job creation still requires SAP text or actual scraped/pasted content.
+4. Use **Scrape Selected** for URL evidence. Failed scrapes can enter the manual-content queue. **Edit SAP** is available when a SKU has no nonblank scraped content; saving it preserves the uploaded row and previous QA result.
+5. Create one job from SKUs sharing one nonblank attribute set. Open **Jobs** and run it.
 
-Open `https://rakazo.tail608e42.ts.net:8443` in any browser and enter the separately supplied gateway credentials; a Tailscale client is not required. Port 8443 uses public Funnel behind Caddy authentication; leave the existing Rakazo Funnel configuration on port 443 intact. The app's existing login remains behind the gateway. LLM API keys and provider settings are browser-local, so configure them for this URL; catalog data, QA memory, and mapping rules use the shared database.
+Every **Scrape URL**, **Scrape Selected**, and automatic job scrape uses a Crawl4AI browser agent with the saved QA endpoint, API key, and model. The agent inspects the supplied product page, loads lazy content, and opens product tabs/accordions for the current variant. It does not crawl the whole site, change variants, log in, submit forms, or solve CAPTCHAs. Blocked pages, unusable content, and failed runs keep the existing SAP/manual-content fallback; no scraper can guarantee success on every URL.
 
-After deployment, check `tailscale serve status` and `docker compose logs --tail=50`. From outside the tailnet, confirm missing and incorrect credentials return `401` for `/`, an asset, and `/api/catalog`; valid credentials must load the UI and `/api/db-status`. Verify catalog loading, SAP editing, a sample scrape, recovery after `docker compose restart app`, and that Rakazo still works. Backend ports 3200 and 8082 must remain bound to loopback.
+The most specific enabled matching domain rule still controls CSS extraction. Dynamic tabs need both control and panel selectors; their wait defaults to 300 ms and supports 0–10,000 ms. Configured tabs are captured separately from the agent's eight-decision limit. Selectors that match nothing fail visibly. Product evidence is converted from captured HTML into Markdown, preserving specification labels and tables; the LLM chooses browser actions instead of rewriting source facts. Saved content and subsequent QA/export behavior remain the same, including the existing 40,000-character default QA evidence limit and truncation warning.
 
-To restore private, tailnet-only access, run `tailscale serve --bg --https=8443 http://127.0.0.1:8082`.
+Express starts the Python SDK worker as a subprocess; its JSON stdin/stdout protocol is internal and exposes no additional service or port. Scrapes run one at a time, with a FIFO queue of up to eight waiting requests. A queued request waits at most 120 seconds; execution has a separate 120-second limit and at most eight agent decisions. Requests fail visibly when limits are reached, and worker/browser cleanup runs on completion, failure, or client disconnect. Each scrape makes LLM calls and incurs provider cost; those calls are separate from existing QA token totals.
 
-To roll back this deployment, remove only its Funnel listener and Compose project, then validate and restore the saved Caddy configuration:
+Keep the browser open and stay in the Jobs view until the run finishes. Selected jobs run sequentially, but **SKUs within a job use configurable concurrency**, defaulting to 2. “Stop After Current SKU” is cooperative; it does not abort an outstanding server request. Reloading/closing the page interrupts browser orchestration, and navigating between modules can lose run controls while work continues. There is no durable backend worker or cross-client job lock.
 
-```bash
-tailscale funnel --https=8443 off
-cd /opt/paxth-qa
-docker compose down
-caddy validate --config /opt/paxth-qa/backups/Caddyfile.before --adapter caddyfile
-cp /opt/paxth-qa/backups/Caddyfile.before /etc/caddy/Caddyfile
-systemctl reload caddy
-```
+### QA settings and results
 
-The rollback leaves the shared database and existing Rakazo services running. Avoid `tailscale serve reset`, which would remove unrelated Serve settings.
+The current defaults are 3 client retries, 4,096 output tokens, temperature 0.1, and 40,000 characters of web evidence. The chat proxy has its own retry logic, so provider attempts can exceed the client retry setting. Set a model/base URL your provider supports; the shipped default is not an availability guarantee.
 
----
+All requests use the OpenAI-compatible chat-completions format. The Provider Format dropdown currently also lists Anthropic and Gemini, but selecting them does not implement their native API protocols. Use a compatible endpoint; the dropdown does not change the request format.
 
-## 📌 Executive Summary & Business Logic.
+Each run fetches shared memory and category rules before processing. Unavailable shared configuration prevents the run from starting. Missing, blank, or ambiguous rules produce a general review with a warning; truncated web content also produces a warning. A SKU with no usable SAP or web evidence fails. The same prepared evidence is retained through that SKU's retries.
 
-When uploading new catalog SKUs to ecommerce marketplaces or platforms, data inconsistencies, missing specs, typos, and unverified marketing claims lead to customer returns and delays. This platform automates the verification process:
+The application validates the returned JSON structure and reconciles issue counts, severity colors, and status. `data_mismatch` requires both source truth and a complete suggested replacement. These checks validate the response contract, not the truth of the source claim.
 
-1. **Upload Data vs. Source Truth**:
-   - Headers starting with `attributes__` represent **Upload Data** (the catalog data being validated).
-   - Headers starting with `source__` represent **Source Data** (ground truth references).
-2. **Required Source Data**:
-   - `source__sap`: Official SAP/ERP master data (Highest Authority / Holy Truth).
-   - `source__url`: Live website product page URL (Secondary Supporting Source).
-3. **Hierarchy of Truth**:
-   - **`source__sap` is the ultimate authority**.
-   - Scraped `source__url` Markdown serves as secondary evidence.
-   - If SAP data and web scraped data conflict, the system trusts SAP and flags the discrepancy.
-   - If both `source__sap` and `source__url` are missing, the SKU is marked **"Cannot QA – No source data"**.
-4. **Job Processing**:
-   - Each selected SKU row is queued as an independent QA case.
-   - Jobs run **sequentially, one at a time**, to respect API rate limits and ensure deterministic progress tracking.
+| QA finding | Color | Result behavior |
+| --- | --- | --- |
+| Critical | Red | QA fails |
+| Moderate | Orange | At least a warning |
+| Minor | Yellow | At least a warning |
+| Missing category rules or truncated evidence | Orange | Cannot pass without a warning |
 
----
+Catalog processing status (`ready`, `running`, `completed`, `failed`, etc.) differs from the review verdict (`pass`, `warning`, `fail`). A job can finish processing successfully while individual SKUs have a failing QA verdict. Jobs reference the catalog's current results; they are not immutable historical result snapshots.
 
-## 🛠️ System Workflow (Step-by-Step)
+### Exporting
 
-```
-┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────────┐
-│ 1. Excel Upload │ ──► │ 2. Parsing & Mapping │ ──► │ 3. Queue Selection  │
-└─────────────────┘     └──────────────────────┘     └─────────────────────┘
-                                                                │
-                                                                ▼
-┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────────┐
-│ 6. Download     │ ◄── │ 5. LLM QA Engine     │ ◄── │ 4. Web Scraper      │
-│    Excel & JSON │     │    (JSON Rules)      │     │    (Markdown)       │
-└─────────────────┘     └──────────────────────┘     └─────────────────────┘
-```
+Use **Jobs** exports for detailed review. Single-job, selected completed-job, and issues-only exports preserve original columns and add `Corrected: <original header>` beside affected `attributes__` columns. Cells have severity highlighting and notes with explanations, source truth, and suggestions. Conflicting or absent suggestions leave correction cells blank for review. General/unmatched findings are attached to `qa_status`; `qa_scrape_status` and `job_error` are appended.
 
-### Step 1: Excel Upload and Attribute Parsing
-- Users drag and drop or select an `.xlsx` / `.xls` catalog template.
-- The app automatically parses row headers from Row 1:
-  - Columns with `attributes__` prefix are stored in `upload_attributes` (prefix stripped).
-  - Columns with `source__` prefix are stored in `source` (`sap` and `url`).
-  - Identifies the `sku` column (or allows user column mapping).
+Combined jobs must use one attribute set and compatible original header order. Issues-only export includes warning/fail verdicts. Legacy uploads without stored header order can be exported with a warning. The Dashboard's Excel download is a separate summary; its missing/mapping counts currently use outdated issue types. A JSON-download function remains in source but has no UI control. Existing results can be exported without a new LLM call.
 
-### Step 2: Queueing & Selection
-- All uploaded SKUs are listed in the interactive dashboard with readiness status indicators (`Ready`, `Missing Source`, `Cannot QA`).
-- Users filter rows, select specific SKUs or click **Select All Ready**, and initiate the QA run.
+### Writing mapping rules
 
-### Step 3: Web Scraping (per SKU)
-- For SKUs with a `source__url`, the built-in server scraper fetches the webpage content.
-- Strips irrelevant clutter (navbars, footers, cookie popups, ads, recommendations, cart buttons).
-- Converts core product content (Title, Specs, Bullet Points, Model, Description, Warranty) into clean Markdown.
-- If scraping fails or is blocked, QA proceeds relying on `source__sap`.
+Paste category-specific Markdown into **Attribute Sets** and save. The root-level [TV](tv_mapping_rules.md), [USB hub](usb_hubs_mapping_rules.md), and [charger/cable](power_adapters_chargers_utility_cables_mapping_rules.md) documents are reference material; they are not automatically imported.
 
-### Step 4: LLM-Powered QA Analysis
-- Sends the SKU, original template fields (including `name`, `base_code`, and `note`), SAP, and scraped evidence to the configured OpenAI-compatible LLM endpoint. Original column names, supplied values, and blank cells are retained; previous QA output and source metadata are excluded from template fields.
-- Loads shared **QA Agent Memory** and attribute-set mapping rules from Supabase when each job starts, and uses that snapshot throughout the run. Matching ignores case and surrounding spaces; missing, blank, or ambiguous rules allow a general review with a visible warning that category validation was skipped. Jobs cannot start if shared configuration cannot be loaded.
-- Prepares evidence once per SKU and retains it through retries. The **Max Source Page Characters** setting limits web evidence; truncation produces an incomplete-evidence warning. A SKU with neither usable SAP nor web evidence fails with an actionable error.
-- Evaluates 18+ audit vectors (factual mismatches, incorrect brand/model, unsupported marketing claims, contradictions, spelling/grammar, model code leaks).
-- Validates new JSON results before saving. Issue counts, colors, and statuses are reconciled so critical issues fail and incomplete reviews cannot pass. Existing saved results remain readable.
-- A `data_mismatch` requires source truth for the same attribute and a complete suggested replacement; incomplete responses use the configured retries and fail visibly if still invalid. Unverifiable values remain blank with a verification explanation. Product weight cannot substitute for shipping weight, and material cannot establish colour. Rerun QA to replace older results with the new checks.
-
-### Step 5: Exporting Formatted Excel Output
-- Jobs downloads (single job, combined jobs, and issues-only) preserve original values and column order. A `Corrected: <original header>` column is inserted beside an `attributes__` column only when at least one exported SKU has a matched QA issue there, of any severity. The layout is fixed for the whole sheet using only the included rows; clean attributes have no correction column. SKU, SAP text, URLs, and other metadata remain single columns; `qa_status`, `qa_scrape_status`, and `job_error` are appended at the end.
-- Affected original cells are highlighted and contain Excel notes (classic comments) with the plain-English explanation, available source truth, and suggested correction. Multiple issues share one comment and the highest severity determines the highlight. There are no separate `Error 1`, `Error 2`, etc. columns.
-- Correction cells contain the stored suggested replacement value for review. Unaffected rows leave that correction cell blank. Missing or conflicting suggestions still create the correction column, but its cells stay blank where no unambiguous fix is available; comments explain when review is required. General issues and fields that cannot be matched to an original column appear in a comment on `qa_status` without creating correction columns.
-- Existing results can be exported without rerunning QA. New QA runs request complete replacement values instead of editing instructions. The Dashboard summary export and uploaded data are unchanged.
-
----
-
-## 🎨 Color Coding & Issue Severity Rules
-
-| Cell Color | Severity Level | Issue Types Covered |
-| :--- | :--- | :--- |
-| 🔴 **Red Fill** | **Critical / Major** | Wrong product identity, incorrect brand, wrong model code, capacity mismatch, dangerous or unverified specs. |
-| 🟠 **Orange Fill** | **Moderate / Warning** | Unsupported marketing claims, over-promising, SAP vs. Web source conflicts, missing vital product attributes. |
-| 🟡 **Yellow Fill** | **Minor / Formatting** | Spelling errors, grammar mistakes, bad capitalisation, formatting inconsistencies, minor wording tweaks. |
-
----
-
-## 🤖 Prompting ChatGPT for Mapping Rules
-
-**Mapping Rules** (Attribute Sets) are markdown-formatted instructions injected directly into the LLM's system prompt during QA. They tell the AI *exactly how* to validate specific attributes for a specific product category (e.g., Laptops, Memory Cards, Apparel).
-
-If you want ChatGPT (or another LLM) to write perfect Mapping Rules for this application, **copy and paste the following prompt into ChatGPT**, replacing the bracketed `[...]` information with your specific category needs.
-
-### ChatGPT Prompt Template
-
-> **Copy the text below and paste it into ChatGPT:**
+Use this prompt when drafting rules, then review the result before saving:
 
 ```text
-Act as an Ecommerce Catalog Quality Assurance expert. I am building a set of "Mapping Rules" for an automated LLM-based QA tool. 
-
-This tool validates uploaded catalog attributes (from an Excel file) against "Source Truth" (SAP data and Web Scraped Markdown). The mapping rules are injected into the system prompt to tell the QA LLM exactly how to validate specific attributes for a product category.
-
-Please write the mapping rules for the category: [INSERT CATEGORY NAME, e.g., Memory Cards / Laptops / Televisions].
-
-The rules must be written in clear Markdown format.
-
-For each key attribute in this category, provide:
-1. The expected format or constraints (e.g., "Must be in GB or TB", "Must exactly match the brand name").
-2. How to handle discrepancies or missing data.
-3. Strict instructions on severity (e.g., "Flag as critical if capacity differs from SAP").
-
-Here are the specific attributes I need rules for:
-- attributes__brand
-- attributes__title
-- attributes__color
-- [ADD OR REMOVE ATTRIBUTES AS NEEDED]
-
-Format the output strictly as a Markdown list or set of headings that I can directly paste into my application's rule engine. Keep the instructions imperative and strict (e.g., "Flag as critical if...", "Value MUST be...").
+Write Markdown QA mapping rules for [CATEGORY] and these exact uploaded
+column names: [ATTRIBUTES]. For each attribute, state required/optional
+status, accepted formats and units, missing-data handling, and severity.
+Use supplied SAP as primary evidence and product-page content as secondary
+evidence. Report source conflicts. Do not invent product facts or infer
+shipping weight from product weight, or colour from material. Preserve
+identifiers and the cell's language. Request complete replacement cell
+values only where evidence or a formatting rule supports the correction;
+otherwise explain what must be verified and leave the correction blank.
 ```
 
----
+**QA Agent Memory** supplies shared standing instructions. Category rules take precedence for category-specific checks; the application's output/evidence requirements take precedence over both. “Restore Default Memory” changes the editor until saved. Blank saved memory uses the default. Changes affect new runs/reruns, not an already running configuration snapshot or existing results. “Import browser rules” imports only missing/blank shared rules without overwriting nonblank ones. Previous browser memory can be loaded into the editor for review before saving.
 
-## 📊 Data Schema Definitions
+## API and developer checks
 
-### Input SKU JSON Structure
-```json
-{
-  "sku": "SKU-90210-BLK",
-  "upload_attributes": {
-    "title": "Wireless Noise Cancelling Headphones",
-    "brand": "Acoustix",
-    "color": "Matte Black",
-    "battery_life": "30 Hours"
-  },
-  "source": {
-    "sap": "Brand: Acoustix, Model: ANC-900, Color: Black, Battery: 30h",
-    "url": "https://example.com/products/anc-900"
-  },
-  "raw_row": {
-    "sku": "SKU-90210-BLK",
-    "attributes__title": "Wireless Noise Cancelling Headphones",
-    "source__sap": "Brand: Acoustix..."
-  },
-  "status": "ready"
-}
-```
+All routes below are registered in [server.ts](server.ts) or [shared QA configuration routes](src/db/qaConfiguration.ts). They have no application authentication; public deployment requires the gateway.
 
-### LLM Output QA Schema
-```json
-{
-  "sku": "SKU-90210-BLK",
-  "qa_status": "fail",
-  "confidence": "high",
-  "summary": "Brand and battery life mismatch against SAP source truth.",
-  "issue_count": 2,
-  "issues": [
-    {
-      "field": "attributes__brand",
-      "issue_type": "data_mismatch",
-      "severity": "critical",
-      "uploaded_value": "Acoustix",
-      "source_truth": "Acoustix Pro",
-      "explanation": "Uploaded brand name 'Acoustix' is missing the 'Pro' suffix specified in official SAP data.",
-      "suggested_fix": "Acoustix Pro",
-      "cell_color": "red"
-    }
-  ],
-  "source_notes": {
-    "sap_used": true,
-    "url_used": true,
-    "scrape_status": "success",
-    "source_conflicts": []
-  }
-}
-```
+| Routes | Methods | Purpose |
+| --- | --- | --- |
+| `/api/db-status` | GET | Database connectivity (`SELECT 1`), not complete schema readiness |
+| `/api/catalog`, `/api/catalog/:sku` | GET/POST/DELETE collection; PUT item | Load/upsert/delete catalog data; update one SKU |
+| `/api/jobs`, `/api/jobs/:id` | GET/POST/DELETE collection; PUT/DELETE item | Persist job records; does not run a server-side queue |
+| `/api/qa-configuration` | GET | Shared memory and attribute sets in one snapshot |
+| `/api/qa-agent-memory` | PUT | Save shared memory |
+| `/api/attribute-sets`, `/api/attribute-sets/:id`, `/api/attribute-sets/import` | POST collection/import; PUT/DELETE item | Maintain shared category rules |
+| `/api/site-selectors`, `/api/site-selectors/:id` | GET/POST collection; PUT/DELETE item | Maintain extraction rules |
+| `/api/scrape` | POST | `{ url, llm: { baseUrl, apiKey, modelName } }` → `{ markdown }`; failures use `{ error, details }` |
+| `/api/chat` | POST | Proxy `{ baseUrl, apiKey, payload }` to chat completions |
 
----
-
-## ⚙️ Configuration & LLM Providers
-
-Access the **Settings** module in the sidebar to configure:
-- **Base URL**: Supports any OpenAI-compatible API gateway (e.g. `https://api.openai.com/v1`, `https://aicredits.in/v1`, or local Ollama / vLLM endpoints).
-- **API Key**: Safely saved in local browser state.
-- **Model Name**: Custom model string (e.g., `gpt-4o`, `deepseek/deepseek-v4-flash`, `gemini-1.5-pro`).
-- **Temperature & Max Tokens**: Fine-tune output determinism and response limits.
-- **Max Source Page Characters**: Limit the web evidence sent to QA; truncated reviews receive a warning.
-
-**QA Agent Memory** stores shared standing instructions in Supabase (`qa_agent_settings`); category mapping rules are stored in `attribute_sets`. Both survive browser and application restarts. The default covers GCC catalogue QA, SAP precedence, exact product variants, category rules, source-supported corrections, Arabic/English content, and regional claims without assumed product facts. Edit the memory and click **Save Changes**; success is shown only after the database confirms the save. **Restore Default Memory** replaces only the editor contents until saved; blank memory uses the default. Changes apply to future runs and explicit reruns, not running jobs or existing results. API keys, provider settings, and execution parameters remain browser-local. The agent does not learn facts between SKUs, and the application retains control of the output format and evidence requirements.
-
-On first startup, shared QA configuration is initialized without overwriting existing database rules. Default category names are seeded once; deletions persist across restarts. In **Attribute Sets**, use **Import browser rules** to migrate browser-only rules into missing or blank shared sets; existing nonblank shared rules and the browser backup are preserved. If browser memory differs from shared memory, **Load previous browser memory into editor** lets you review it before saving it to Supabase. Saves and imports report database failures instead of silently falling back to local storage.
-
----
-
-## ☁️ GitHub Codespaces Development Guide
-
-When transitioning development to **GitHub Codespaces**, keep the following key points and best practices in mind:
-
-### 1. Devcontainer & Automatic Setup
-- A `.devcontainer/devcontainer.json` file is included in the project repository.
-- When launching in GitHub Codespaces, Node.js 22 and recommended VS Code extensions (ESLint, Tailwind CSS) will be automatically provisioned.
-- Dependencies will automatically install via `postCreateCommand: "npm install"`.
-
-### 2. Port Configuration & Web Preview
-- The app runs a unified full-stack server on **Port 3000** (Express server mounting Vite middleware in development).
-- Codespaces automatically forwards port `3000`.
-- In the **Ports** tab of VS Code / Codespaces, make sure port `3000` is forwarded.
-- If you need to access the app preview from external browser windows or webhooks, change the port visibility from `Private` to `Public`.
-
-### 3. Environment Variables & Database (`DATABASE_URL`)
-- Copy `.env.example` to `.env`:
-  ```bash
-  cp .env.example .env
-  ```
-- **Database Connection (`DATABASE_URL`) & Supabase Data Sync**:
-  - The application connects directly to your PostgreSQL database (e.g. Supabase Connection String) using Drizzle ORM in `server.ts`.
-  - **All scraped data, SKUs, raw rows, QA results, and job logs are stored directly in your Supabase database** (`sku_data` and `jobs` tables).
-  - For Supabase in Codespaces or another IPv4-only runtime, copy the exact **Session pooler** URI from **Supabase Dashboard → Connect**. Keep its project-specific region, port, and `postgres.<project-ref>` username unchanged, and include `sslmode=require`. The application deliberately does not guess or rewrite a pooler endpoint.
-  - Once you set your `DATABASE_URL` in `.env` or Codespaces Secrets, the Codespaces environment will instantly query your Supabase instance, making all existing SKUs and JSON details immediately accessible.
-  - `server.ts` automatically runs safe, non-destructive table initializations on startup.
-- **LLM API Key Configuration**:
-  - You can configure your API keys (OpenRouter, OpenAI, Gemini, or custom base URLs) **directly in the application UI** under the **LLM Settings** module.
-  - API/provider settings configured via the UI remain in browser `localStorage`. QA agent memory and category mapping rules are shared through the database. Optionally, you can also set `GEMINI_API_KEY` in `.env`.
-- **API Secrets**:
-  - Store sensitive keys in GitHub Codespaces Secrets or in `.env`.
-  - Do NOT commit `.env` to version control.
-
-### 4. Quick Start Command for Codespacess
-
-Run this single command in your Codespaces terminal to install all dependencies and start the app preview:
-
-```bash
-cp .env.example .env && npm install && npm run dev
-```
-
-### Docker
-
-```bash
-docker build -t paxth-qa-engine .
-docker run --rm -p 3000:3000 --env-file .env paxth-qa-engine
-```
-
-This command will:
-1. Create your `.env` file from `.env.example`.
-2. Install all npm packages and requirements.
-3. Start the Express + Vite server on **Port 3000**.
-4. Open or forward Port 3000 in the Codespaces **Ports** tab to view your frontend!
-
----
-
-### 5. Running & Debugging in Codespaces
-```bash
-# Start the full-stack development server
-npm run dev
-
-# Run TypeScript lint & type-check
-npm run lint
-
-# Test production build & start
-npm run build
-npm start
-```
-
-### 6. Tests
-
-Run the TypeScript check and focused scraper/QA tests with:
+Run the checks that do not require a browser or database:
 
 ```bash
 npm run lint
 npm run test:job-state
 npm run test:site-selector
-npm run test:tab-capture
 npm run test:blocked-page
+npm run test:db-error
 npm run test:lazy-content
 npm run test:llm-response
 npm run test:qa-agent
+npm run test:scrape-agent
 ```
 
-With `TEST_DATABASE_URL` set to a PostgreSQL test connection, `npm run test:qa-config-db` checks shared-memory persistence, mapping-rule CRUD/imports, restart behavior, and database failures. It creates and removes its own isolated schema and does not modify existing application tables.
+`lint` is TypeScript checking, not ESLint. Additional checks have prerequisites:
 
----
-
-## 🚀 Running the Project (Local Development)
-
-### Prerequisites
-- Node.js 18+ installed
-
-### Development Server
 ```bash
-# Install dependencies
-npm install
+# Requires an installed CloakBrowser binary and its OS libraries.
+npm run test:tab-capture
+npm run test:sap-editor
 
-# Start full-stack development server (Express backend + Vite React frontend on port 3000)
-npm run dev
+# Requires the Crawl4AI virtualenv and Chromium installed above.
+CRAWL4AI_PYTHON="$PWD/.venv/bin/python" npm run test:crawl-worker
 
-# Replace a stale instance of this project before starting
-./start.sh
+# Set TEST_DATABASE_URL to a disposable test database before running.
+npm run test:qa-config-db
 ```
 
-### Production Build
+The Crawl4AI checks passed locally with Python 3.11, Crawl4AI 0.9.3, and Playwright 1.58 (the workspace runs Debian 11). Checks covered real browser fixtures, all three UI entry points, process cleanup, and a production API scrape of a public page using a mocked LLM response. Deployment additionally requires the Docker browser and worker smoke checks below. A live LLM-provider run requires the user's saved provider settings.
+
+The database test creates and drops an isolated schema. Never point it at the shared production database. The SAP editor browser test mocks API traffic; it does not prove real database persistence. Check the [analysis validation record](docs/codebase-analysis.md#validation-record) for what was actually run.
+
+## Deployment and updates
+
+### Existing VPS topology
+
+The VPS, container, and Funnel routes were inspected on 2026-09-17:
+
+```text
+https://project22.tail608e42.ts.net/
+    → dedicated tailscaled-project22.service (HTTPS :443)
+    → Caddy 127.0.0.1:8082 (HTTP Basic authentication)
+    → Docker-published 127.0.0.1:3200
+    → Express container :3000
+```
+
+The deployment directory is `/opt/paxth-qa`. Its gateway requires separately supplied credentials; a Tailscale client is not required. The separate Rakazo application uses `https://rakazo.tail608e42.ts.net/`, its own containers, and the default Tailscale service. Do not change those resources. A legacy Rakazo-hostname listener on port 8443 also points to the QA gateway; leave that existing route unchanged.
+
+[compose.yaml](compose.yaml) defines the separate `paxth-qa` project, image `paxth-qa:local`, restart policy, loopback port binding, 1 CPU, 1,536 MiB memory, 256 MiB shared memory, and rotating container logs. The image runs as `node`, installs pinned Crawl4AI and Chromium, checks the browser launch, and serves the production build. Secrets, virtualenvs, Python caches, and backups are excluded from the image build. On the Docker-capable deployment host, also run `/opt/crawl4ai/bin/python scraper/worker_test.py` inside the candidate image before promotion, with no production environment file attached.
+
+Keep `/opt/paxth-qa/.env` readable only by its owner (`chmod 600 .env`). Its `DATABASE_URL` must reach PostgreSQL from inside the container: container `localhost` is not the VPS host. Caddy should authenticate every page, asset, and API request, strip inbound `Authorization` before proxying, store only the password hash, and accept the Funnel hostname. This repository does not contain its Caddyfile.
+
+Inspect Project 22's existing listener using its dedicated socket:
+
 ```bash
-# Build Vite frontend and bundle server with esbuild
-npm run build
-
-# Launch production Node server
-npm start
+tailscale --socket=/run/tailscale-project22/tailscaled.sock funnel status
 ```
+
+Do not rerun gateway setup for an ordinary code update. Before deploying, wait for active browser-driven jobs to finish, confirm the tested source commit, retain the previous source and image, and make a database backup using the database provider or PostgreSQL tools. Store it outside the source directory and verify it can be restored. Startup executes DDL, so a successful code build is not a database migration check. Build and smoke-test the release image before changing the running container.
+
+For an existing deployment, retain the current image before the update commands near the top of this document:
+
+```bash
+docker image tag paxth-qa:local paxth-qa:previous
+```
+
+After rebuilding, verify:
+
+```bash
+docker compose ps
+docker compose logs --tail=50 app
+curl -fsS http://127.0.0.1:3200/api/db-status
+tailscale --socket=/run/tailscale-project22/tailscaled.sock funnel status
+```
+
+Also load the catalog and shared configuration, since database connectivity alone does not prove schema readiness. From outside the tailnet, check that missing/wrong gateway credentials return `401` for the page, an asset, and an API route. With valid credentials, run `scripts/verify-public-access.mjs` against the Project 22 URL and verify login, SAP editing, a sample scrape, and persistence after a controlled app restart. Confirm Rakazo's container IDs and start times are unchanged and ports 3200/8082 remain loopback-only.
+
+### Rollback and private access
+
+If the newly built image fails and the old image is compatible with the current schema, restore the retained image:
+
+```bash
+cd /opt/paxth-qa
+docker image tag paxth-qa:previous paxth-qa:local
+docker compose up -d --no-build --force-recreate app
+docker compose logs --tail=50 app
+```
+
+This rolls back the image only. Do not run `--build` until the checkout is back on the intended release. Changes to Compose, environment configuration, or the database require their own reviewed rollback; never restore a shared database automatically over newer data.
+
+To switch this listener to private, tailnet-only access, configure its port with Serve. The most recent Serve/Funnel command determines that port's exposure, as described in the [Tailscale documentation](https://tailscale.com/docs/features/tailscale-funnel):
+
+```bash
+tailscale --socket=/run/tailscale-project22/tailscaled.sock serve --bg --https=443 http://127.0.0.1:8082
+```
+
+To remove this deployment, disable only its listener using the original flags, then stop only its Compose project. The target URL can be omitted when turning a listener off; see the [Funnel CLI reference](https://tailscale.com/docs/reference/tailscale-cli/funnel):
+
+```bash
+tailscale --socket=/run/tailscale-project22/tailscaled.sock funnel --bg --https=443 off
+cd /opt/paxth-qa
+docker compose down
+```
+
+The earlier deployment notes name `/opt/paxth-qa/backups/Caddyfile.before` as a gateway backup. Before restoring it, compare it with the current shared Caddy configuration and validate it with `caddy validate --config /opt/paxth-qa/backups/Caddyfile.before --adapter caddyfile`. Restore/reload only after confirming it preserves other services. Avoid `tailscale serve reset`, which would remove unrelated settings. Stopping this Compose project does not delete the external PostgreSQL database.
+
+## Troubleshooting and current limits
+
+| Symptom | Check |
+| --- | --- |
+| GitHub has new code but the public URL looks unchanged | Update/rebuild on the VPS; restarting the old container is insufficient. Refresh the browser after deployment. |
+| “Database connected” but the catalog fails | `/api/db-status` only runs `SELECT 1`; inspect schema initialization logs and verify the base schema exists. |
+| Settings/rules will not save | Shared configuration requires PostgreSQL. Settings save also persists shared memory before local provider settings. |
+| Scrape fails or shows a challenge | Test the URL/selectors in Scraper; use SAP or manually supplied product content when needed. Check browser installation and container logs. |
+| Reload loses a running job's controls | Execution lives in the browser. Inspect saved SKU results before resuming; avoid running the same job in multiple tabs. |
+| An upload appears to do nothing | Empty/malformed/no-SKU upload errors are not currently rendered; inspect the browser console and input headers. |
+| A save/delete looks successful but returns after reload | Several mutation paths ignore failed HTTP responses. Reload to verify persistence; see findings F03/F04 in the analysis. |
+| Combined export is rejected | Use one identical category name and compatible original header order across all included SKUs. |
+| LLM settings disappear at a different URL | Provider settings and keys belong to that browser origin, including its port. |
+
+The analysis also identifies vulnerable dependencies, unbounded server work, and missing URL restrictions. Treat these as concrete follow-up work before expanding access. This documentation change does not fix them or certify the live deployment.

@@ -58,15 +58,17 @@ export function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
   };
 }
 
+export function readSavedSettings(): AppSettings {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    return stored ? normalizeSettings(JSON.parse(stored)) : DEFAULT_SETTINGS;
+  } catch {
+    return DEFAULT_SETTINGS;
+  }
+}
+
 export function useSettings() {
-  const [settings, setSettings] = useState<AppSettings>(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      return stored ? normalizeSettings(JSON.parse(stored)) : DEFAULT_SETTINGS;
-    } catch (e) {
-      return DEFAULT_SETTINGS;
-    }
-  });
+  const [settings, setSettings] = useState<AppSettings>(readSavedSettings);
   const [legacyMemory, setLegacyMemory] = useState(settings.qaAgentMemory);
   const [isMemoryLoading, setIsMemoryLoading] = useState(true);
   const [memoryError, setMemoryError] = useState("");

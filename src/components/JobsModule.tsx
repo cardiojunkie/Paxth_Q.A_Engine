@@ -14,6 +14,7 @@ import {
 import { extractLLMResponseContent, parseLLMJsonResponse } from "../lib/llmResponse";
 import { populateQaWorksheet } from "../lib/qaExcelExport";
 import { prepareQaInput, finalizeQaResult } from "../lib/qaAgent";
+import { scrapeUrl } from "../lib/scrapeRequest";
 import { cn } from "../lib/utils";
 import ExcelJS from "exceljs";
 import { saveAs } from "file-saver";
@@ -148,20 +149,10 @@ export function JobsModule() {
           let scrapedMarkdown = skuItem.scraped_markdown;
           if (skuItem.source.url && skuItem.scrape_status !== "success" && skuItem.scrape_status !== "failed") {
             try {
-              const res = await fetch("/api/scrape", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url: skuItem.source.url })
-              });
-              const data = await res.json();
-              if (res.ok && typeof data.markdown === "string" && data.markdown.trim()) {
-                scrapedMarkdown = data.markdown;
-                await updateSku(skuItem.sku, { scraped_markdown: scrapedMarkdown, scrape_status: "success" });
-              } else {
-                await updateSku(skuItem.sku, { scrape_status: "failed" });
-              }
-            } catch {
-              await updateSku(skuItem.sku, { scrape_status: "failed" });
+              scrapedMarkdown = await scrapeUrl(skuItem.source.url);
+              await updateSku(skuItem.sku, { scraped_markdown: scrapedMarkdown, scrape_status: "success" });
+            } catch (error) {
+              await updateSku(skuItem.sku, { scrape_status: "failed", error: error instanceof Error ? error.message : "Scraping failed" });
             }
           }
           if (stopRequestedRef.current) {

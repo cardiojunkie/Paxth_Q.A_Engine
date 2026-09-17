@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { Search, Loader2, AlertCircle, Trash2, Globe, Plus } from "lucide-react";
 import { useSiteSelectors } from "../hooks/useSiteSelectors";
 import { isCompleteWebsiteDomain, normalizeWebsite } from "../lib/siteSelectorWebsite";
+import { scrapeUrl } from "../lib/scrapeRequest";
 
 export function ScraperModule() {
   const [url, setUrl] = useState("");
@@ -66,19 +67,7 @@ export function ScraperModule() {
     setMarkdown(null);
 
     try {
-      const response = await fetch("/api/scrape", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: url.trim() }),
-      });
-      
-      const data = await response.json();
-      
-      if (!response.ok) {
-        throw new Error([data.error, data.details].filter(Boolean).join(": ") || "Scraping failed");
-      }
-      
-      setMarkdown(data.markdown);
+      setMarkdown(await scrapeUrl(url));
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -91,7 +80,7 @@ export function ScraperModule() {
       <header className="px-10 py-8 border-b border-[#E5E2DE] shrink-0">
         <h2 className="font-serif text-4xl tracking-tighter mb-2 text-[#1A1A1A]">Scraper Tools</h2>
         <p className="text-[#8C8882] text-sm leading-relaxed max-w-lg">
-          Test URL scraping functionality before running full QA jobs. The backend will remove headers, footers, and extract clean markdown using a stealth CloakBrowser instance.
+          Test product URLs before running QA jobs. The Crawl4AI agent uses your saved LLM settings to collect page content and specifications as Markdown.
         </p>
       </header>
 

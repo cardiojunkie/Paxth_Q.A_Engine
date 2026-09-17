@@ -7,6 +7,7 @@ import { useAppContext, Job } from "../context/AppContext";
 import { SkuData, QAStatus } from "../hooks/useCatalogData";
 import { getCommonAttributeSet } from "../lib/jobRunState";
 import { cn } from "../lib/utils";
+import { scrapeUrl } from "../lib/scrapeRequest";
 
 type FilterType = "all" | "ready" | "cannot_qa" | "completed" | "failed";
 
@@ -23,7 +24,9 @@ export function DashboardModule() {
   
   // Modal State
   const [viewedMarkdown, setViewedMarkdown] = useState<{sku: string, markdown: string} | null>(null);
-  const [viewedSAP, setViewedSAP] = useState<{sku: string, sap: string, editing?: boolean} | null>(null);
+  const [isSavingMarkdown, setIsSavingMarkdown] = useState(false);
+  const [markdownSaveError, setMarkdownSaveError] = useState("");
+  const [viewedSAP, setViewedSAP] = useState<{sku: string, sap: string} | null>(null);
   const [isSavingSAP, setIsSavingSAP] = useState(false);
   const [sapSaveError, setSapSaveError] = useState("");
   const [manualScrapeQueue, setManualScrapeQueue] = useState<string[]>([]);
@@ -56,7 +59,7 @@ export function DashboardModule() {
   });
 
   const handleSaveSAP = async () => {
-    if (!viewedSAP?.editing || !viewedSAP.sap.trim() || isSavingSAP) return;
+    if (!viewedSAP || !viewedSAP.sap.trim() || isSavingSAP) return;
     const sku = skuDataList.find(item => item.sku === viewedSAP.sku);
     if (!sku) {
       setSapSaveError("This SKU is no longer available. Close the editor and refresh the catalog.");
@@ -76,6 +79,31 @@ export function DashboardModule() {
     }
     addNotification({ type: "success", title: "SAP Saved", message: `SAP data for ${sku.sku} saved to database.` });
     setViewedSAP(null);
+  };
+
+  const handleSaveMarkdown = async () => {
+    if (!viewedMarkdown || isSavingMarkdown || isScraping) return;
+    const sku = skuDataList.find(item => item.sku === viewedMarkdown.sku);
+    if (!sku) {
+      setMarkdownSaveError("This SKU is no longer available. Close the editor and refresh the catalog.");
+      return;
+    }
+
+    setIsSavingMarkdown(true);
+    setMarkdownSaveError("");
+    const hasContent = Boolean(viewedMarkdown.markdown.trim());
+    const saved = await updateSku(sku.sku, {
+      scraped_markdown: viewedMarkdown.markdown,
+      scrape_status: hasContent ? "success" : "failed",
+      ...(hasContent && sku.status === "cannot_qa" ? { status: "ready" } : {}),
+    });
+    setIsSavingMarkdown(false);
+    if (!saved) {
+      setMarkdownSaveError("Data could not be saved. Your draft is still here; please try again.");
+      return;
+    }
+    addNotification({ type: "success", title: "Data Saved", message: `Product content for ${sku.sku} saved to database.` });
+    setViewedMarkdown(null);
   };
 
   const handleSelectAll = () => {
@@ -112,30 +140,16 @@ export function DashboardModule() {
     for (const skuItem of skusToProcess) {
       if (skuItem.source.url) {
         try {
-          const res = await fetch("/api/scrape", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ url: skuItem.source.url })
-          });
-          
-          const data = await res.json();
-          
-          if (res.ok) {
-            updateSku(skuItem.sku, { scraped_markdown: data.markdown, scrape_status: "success" });
-          } else {
-            const error = data.error || "Scraping failed";
-            updateSku(skuItem.sku, { scrape_status: "failed", error });
-            failedSkus.push(skuItem.sku);
-            scrapeErrors.push(`${skuItem.sku}: ${error}`);
-          }
+          const markdown = await scrapeUrl(skuItem.source.url);
+          await updateSku(skuItem.sku, { scraped_markdown: markdown, scrape_status: "success" });
         } catch (err: any) {
           const error = err.message || "Scraping failed";
-          updateSku(skuItem.sku, { scrape_status: "failed", error });
+          await updateSku(skuItem.sku, { scrape_status: "failed", error });
           failedSkus.push(skuItem.sku);
           scrapeErrors.push(`${skuItem.sku}: ${error}`);
         }
       } else {
-        updateSku(skuItem.sku, { scrape_status: "skipped_no_url" });
+        await updateSku(skuItem.sku, { scrape_status: "skipped_no_url" });
       }
       processed++;
       setScrapeProgress({ current: processed, total: skusToProcess.length });
@@ -742,14 +756,15 @@ export function DashboardModule() {
                       <td className="p-3 text-[#1A1A1A]">{sku.raw_row?.name ?? sku.raw_row?.Name ?? <span className="text-[#B8B4AE]">—</span>}</td>
                       <td className="p-3 text-[#1A1A1A]">{sku.attribute_set || <span className="text-[#8C8882] italic">Unassigned</span>}</td>
                       <td className="p-3">
-                        {sku.source.sap ? (
-                           <button 
-                             onClick={() => setViewedSAP({sku: sku.sku, sap: sku.source.sap!})}
-                             className="text-blue-600 hover:underline flex items-center gap-1 text-xs"
-                           >
-                             <FileText className="w-3 h-3" /> View SAP
-                           </button>
-                        ) : <span className="text-[#B8B4AE]">—</span>}
+                        <button
+                          onClick={() => {
+                            setSapSaveError("");
+                            setViewedSAP({ sku: sku.sku, sap: sku.source.sap || "" });
+                          }}
+                          className="text-blue-600 hover:underline flex items-center gap-1 text-xs"
+                        >
+                          <FileText className="w-3 h-3" /> View/Edit SAP
+                        </button>
                       </td>
                       <td className="p-3">
                         {sku.source.url ? (
@@ -760,29 +775,21 @@ export function DashboardModule() {
                       </td>
                       <td className="p-3">
                         <div className="flex flex-wrap items-center gap-2">
-                          {sku.scrape_status === 'success' ? (
-                            <button
-                              onClick={() => setViewedMarkdown({ sku: sku.sku, markdown: sku.scraped_markdown || '' })}
-                              className="text-emerald-600 hover:underline flex items-center gap-1 text-xs"
-                            >
-                              <FileText className="w-3 h-3" /> View Data
-                            </button>
-                          ) : sku.scrape_status === 'failed' ? (
+                          {sku.scrape_status === 'success' ? null : sku.scrape_status === 'failed' ? (
                             <span className="text-rose-500 text-xs">Failed</span>
                           ) : sku.source.url ? (
                             <span className="text-[#8C8882] text-xs">Pending</span>
                           ) : <span className="text-[#B8B4AE]">—</span>}
-                          {!sku.scraped_markdown?.trim() && (
-                            <button
-                              onClick={() => {
-                                setSapSaveError("");
-                                setViewedSAP({ sku: sku.sku, sap: sku.source.sap || "", editing: true });
-                              }}
-                              className="text-blue-600 hover:underline text-xs"
-                            >
-                              Edit SAP
-                            </button>
-                          )}
+                          <button
+                            disabled={isScraping}
+                            onClick={() => {
+                              setMarkdownSaveError("");
+                              setViewedMarkdown({ sku: sku.sku, markdown: sku.scraped_markdown || "" });
+                            }}
+                            className="text-emerald-600 hover:underline flex items-center gap-1 text-xs disabled:opacity-50 disabled:no-underline disabled:cursor-not-allowed"
+                          >
+                            <FileText className="w-3 h-3" /> View/Edit Data
+                          </button>
                         </div>
                       </td>
                       <td className="p-3 text-right">
@@ -934,56 +941,59 @@ export function DashboardModule() {
 
       {/* Modals for Markdown and SAP */}
       {viewedMarkdown && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+        <dialog
+          ref={dialog => { if (dialog && !dialog.open) dialog.showModal(); }}
+          aria-labelledby="markdown-modal-title"
+          onCancel={event => {
+            event.preventDefault();
+            if (!isSavingMarkdown) setViewedMarkdown(null);
+          }}
+          className="m-auto w-[calc(100%-2rem)] max-w-4xl p-0 border-0 bg-transparent backdrop:bg-black/50"
+        >
           <div className="bg-white w-full max-w-4xl h-[80vh] flex flex-col rounded-sm shadow-xl relative overflow-hidden">
             <div className="flex items-center justify-between p-4 border-b border-[#E5E2DE] bg-[#FDFCFB]">
               <div className="flex items-center gap-2">
                 <FileText className="w-4 h-4 text-[#1A1A1A]" />
-                <h3 className="font-bold text-[#1A1A1A] text-sm">Scraped Markdown Data: <span className="font-mono text-blue-600">{viewedMarkdown.sku}</span></h3>
+                <h3 id="markdown-modal-title" className="font-bold text-[#1A1A1A] text-sm">Scraped Data: <span className="font-mono text-blue-600">{viewedMarkdown.sku}</span></h3>
               </div>
-              <button onClick={() => setViewedMarkdown(null)} className="text-[#8C8882] hover:text-[#1A1A1A]">
+              <button disabled={isSavingMarkdown} aria-label="Close scraped data" onClick={() => setViewedMarkdown(null)} className="text-[#8C8882] hover:text-[#1A1A1A] disabled:opacity-50">
                 <X className="w-5 h-5" />
               </button>
             </div>
             <div className="flex-1 p-6 overflow-hidden flex flex-col bg-gray-50 gap-3">
-              <label className="text-xs text-[#8C8882] font-medium">Edit or view scraped markdown content:</label>
-              <textarea 
+              <label htmlFor="markdown-content" className="text-xs text-[#8C8882] font-medium">Product content (plain text or Markdown)</label>
+              <textarea
+                id="markdown-content"
+                autoFocus
                 value={viewedMarkdown.markdown}
                 onChange={(e) => setViewedMarkdown({ ...viewedMarkdown, markdown: e.target.value })}
+                disabled={isSavingMarkdown}
                 className="flex-1 w-full font-mono text-xs text-gray-800 bg-white p-4 border border-gray-200 rounded resize-none focus:outline-none focus:border-[#1A1A1A]"
-                placeholder="Paste or edit scraped markdown here..."
+                placeholder="Paste product details or edit saved content here. No URL or scraping required."
               />
+              {markdownSaveError && <p role="alert" className="text-xs text-rose-600">{markdownSaveError}</p>}
             </div>
             <div className="p-4 border-t border-[#E5E2DE] bg-[#FDFCFB] flex justify-between items-center">
               <span className="text-xs text-[#8C8882] font-mono">{viewedMarkdown.markdown.length} characters</span>
               <div className="flex gap-2">
                 <button
+                  disabled={isSavingMarkdown}
                   onClick={() => setViewedMarkdown(null)}
-                  className="px-4 py-2 border border-[#E5E2DE] text-xs font-bold uppercase tracking-wider text-[#8C8882] hover:text-[#1A1A1A] rounded-sm transition-colors"
+                  className="px-4 py-2 border border-[#E5E2DE] text-xs font-bold uppercase tracking-wider text-[#8C8882] hover:text-[#1A1A1A] rounded-sm transition-colors disabled:opacity-50"
                 >
-                  Close
+                  Cancel
                 </button>
                 <button
-                  onClick={() => {
-                    updateSku(viewedMarkdown.sku, { 
-                      scraped_markdown: viewedMarkdown.markdown, 
-                      scrape_status: viewedMarkdown.markdown.trim() ? "success" : "failed" 
-                    });
-                    addNotification({
-                      type: "success",
-                      title: "Markdown Saved",
-                      message: `Scraped markdown for ${viewedMarkdown.sku} saved to database.`
-                    });
-                    setViewedMarkdown(null);
-                  }}
-                  className="px-4 py-2 bg-[#1A1A1A] text-white text-xs font-bold uppercase tracking-wider rounded-sm hover:bg-[#333333] transition-colors"
+                  disabled={isSavingMarkdown}
+                  onClick={handleSaveMarkdown}
+                  className="px-4 py-2 bg-[#1A1A1A] text-white text-xs font-bold uppercase tracking-wider rounded-sm hover:bg-[#333333] transition-colors disabled:opacity-50"
                 >
-                  Save Markdown
+                  {isSavingMarkdown ? "Saving..." : "Save Data"}
                 </button>
               </div>
             </div>
           </div>
-        </div>
+        </dialog>
       )}
 
       {/* Manual Scrape Queue Modal */}
@@ -1062,44 +1072,34 @@ export function DashboardModule() {
               </button>
             </div>
             <div className="flex-1 p-6 overflow-y-auto bg-gray-50 flex flex-col gap-3">
-              {viewedSAP.editing ? (
-                <>
-                  <label htmlFor="sap-content" className="text-xs text-[#8C8882] font-medium">SAP source text</label>
-                  <textarea
-                    id="sap-content"
-                    autoFocus
-                    value={viewedSAP.sap}
-                    onChange={event => setViewedSAP({ ...viewedSAP, sap: event.target.value })}
-                    disabled={isSavingSAP}
-                    placeholder="Paste or edit SAP data here..."
-                    className="flex-1 min-h-40 w-full font-mono text-xs text-gray-800 bg-white p-4 border border-gray-200 rounded resize-none focus:outline-none focus:border-[#1A1A1A]"
-                  />
-                  {sapSaveError && <p role="alert" className="text-xs text-rose-600">{sapSaveError}</p>}
-                </>
-              ) : (
-                <pre className="whitespace-pre-wrap font-mono text-xs text-gray-800 bg-white p-4 border border-gray-200 rounded">
-                  {viewedSAP.sap}
-                </pre>
-              )}
+              <label htmlFor="sap-content" className="text-xs text-[#8C8882] font-medium">SAP source text</label>
+              <textarea
+                id="sap-content"
+                autoFocus
+                value={viewedSAP.sap}
+                onChange={event => setViewedSAP({ ...viewedSAP, sap: event.target.value })}
+                disabled={isSavingSAP}
+                placeholder="Paste or edit SAP data here..."
+                className="flex-1 min-h-40 w-full font-mono text-xs text-gray-800 bg-white p-4 border border-gray-200 rounded resize-none focus:outline-none focus:border-[#1A1A1A]"
+              />
+              {sapSaveError && <p role="alert" className="text-xs text-rose-600">{sapSaveError}</p>}
             </div>
-            {viewedSAP.editing && (
-              <div className="p-4 border-t border-[#E5E2DE] bg-[#FDFCFB] flex justify-end gap-2">
-                <button
-                  disabled={isSavingSAP}
-                  onClick={() => setViewedSAP(null)}
-                  className="px-4 py-2 border border-[#E5E2DE] text-xs font-bold uppercase tracking-wider text-[#8C8882] hover:text-[#1A1A1A] rounded-sm disabled:opacity-50"
-                >
-                  Cancel
-                </button>
-                <button
-                  disabled={isSavingSAP || !viewedSAP.sap.trim()}
-                  onClick={handleSaveSAP}
-                  className="px-4 py-2 bg-[#1A1A1A] text-white text-xs font-bold uppercase tracking-wider rounded-sm hover:bg-[#333333] disabled:opacity-50"
-                >
-                  {isSavingSAP ? "Saving..." : "Save SAP"}
-                </button>
-              </div>
-            )}
+            <div className="p-4 border-t border-[#E5E2DE] bg-[#FDFCFB] flex justify-end gap-2">
+              <button
+                disabled={isSavingSAP}
+                onClick={() => setViewedSAP(null)}
+                className="px-4 py-2 border border-[#E5E2DE] text-xs font-bold uppercase tracking-wider text-[#8C8882] hover:text-[#1A1A1A] rounded-sm disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                disabled={isSavingSAP || !viewedSAP.sap.trim()}
+                onClick={handleSaveSAP}
+                className="px-4 py-2 bg-[#1A1A1A] text-white text-xs font-bold uppercase tracking-wider rounded-sm hover:bg-[#333333] disabled:opacity-50"
+              >
+                {isSavingSAP ? "Saving..." : "Save SAP"}
+              </button>
+            </div>
           </div>
         </dialog>
       )}

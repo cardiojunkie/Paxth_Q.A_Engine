@@ -22,7 +22,9 @@
     "test:qa-config-db": "tsx src/db/qaConfiguration.test.ts",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "test:scrape-agent": "tsx src/lib/scrapeAgent.test.ts && tsx src/lib/scrapeRequest.test.ts",
+    "test:crawl-worker": "\"${CRAWL4AI_PYTHON:-.venv/bin/python}\" scraper/worker_test.py"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
