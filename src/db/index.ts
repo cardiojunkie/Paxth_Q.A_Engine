@@ -30,11 +30,15 @@ export const createPool = () => {
   return new Pool({
     connectionString,
     max: 10,
+    query_timeout: 15000,
+    statement_timeout: 15000,
+    keepAlive: true,
     connectionTimeoutMillis: 15000,
   });
 };
 
-const pool = createPool();
+export const pool = createPool();
+pool?.on('error', () => console.error('An idle database connection was lost; requests will reconnect.'));
 
 // Initialize Drizzle with the pool and schema.
 export const db = pool ? drizzle(pool, { schema }) : null;

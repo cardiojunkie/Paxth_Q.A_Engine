@@ -1,10 +1,12 @@
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
+import { api } from '../lib/api';
 
 export type QAStatus = "pending" | "ready" | "cannot_qa" | "running" | "completed" | "failed";
 
 export interface SkuData {
   sku: string;
+  revision?: number;
   upload_attributes: Record<string, any>;
   source: {
     sap?: string;
@@ -29,112 +31,55 @@ export interface SkuData {
   last_job_id?: string;
 }
 
-export function useCatalogData() {
+export function useCatalogData(enabled = true) {
   const [skuDataList, setSkuDataList] = useState<SkuData[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-
-  // Fetch initial data
+  const [isLoading, setIsLoading] = useState(enabled);
+  const [catalogError, setCatalogError] = useState("");
+  const generation = useRef(0);
+  const refreshCatalog = useCallback(async () => {
+    if (!enabled) return;
+    const current = generation.current;
+    const rows = await api<SkuData[]>('/api/catalog');
+    if (current === generation.current) { setSkuDataList(rows); setCatalogError(""); }
+  }, [enabled]);
+  const resetCatalog = useCallback(() => { generation.current++; setSkuDataList([]); }, []);
   useEffect(() => {
-    fetch('/api/catalog')
-      .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) {
-          setSkuDataList(data);
-        }
-        setIsLoading(false);
-      })
-      .catch(err => {
-        console.error("Failed to fetch catalog", err);
-        setIsLoading(false);
-      });
-  }, []);
+    generation.current++;
+    if (!enabled) { setSkuDataList([]); setIsLoading(false); return; }
+    let active = true;
+    setIsLoading(true);
+    refreshCatalog().catch(error => { if (active) setCatalogError(error.message); })
+      .finally(() => { if (active) setIsLoading(false); });
+    return () => { active = false; generation.current++; };
+  }, [enabled, refreshCatalog]);
 
   const addParsedData = useCallback(async (data: SkuData[]) => {
-    setSkuDataList((prev) => {
-      const newMap = new Map(prev.map((item) => [item.sku, item]));
-      data.forEach((item) => {
-        const existing = newMap.get(item.sku);
-        if (existing) {
-          newMap.set(item.sku, {
-            ...existing,
-            ...item,
-            scraped_markdown: item.scraped_markdown || existing.scraped_markdown,
-            scrape_status: item.scrape_status || existing.scrape_status,
-          });
-        } else {
-          newMap.set(item.sku, item);
-        }
-      });
-      return Array.from(newMap.values());
-    });
-    
     try {
-      await fetch('/api/catalog', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data)
+      const result = await api<{inserted: SkuData[]; skipped: string[]}>('/api/catalog', { method:'POST', body:JSON.stringify(data) });
+      setSkuDataList(previous => {
+        const rows = new Map(previous.map(item => [item.sku,item]));
+        result.inserted.forEach(item => rows.set(item.sku,item));
+        return [...rows.values()];
       });
-    } catch(e) { console.error(e); }
+      setCatalogError("");
+      return result;
+    } catch (error) { setCatalogError((error as Error).message); return null; }
   }, []);
-
-  const updateSkuStatus = useCallback(async (skus: string[], newStatus: QAStatus) => {
-    setSkuDataList((prev) =>
-      prev.map((item) =>
-        skus.includes(item.sku) ? { ...item, status: newStatus } : item
-      )
-    );
-    
-    for (const sku of skus) {
-      try {
-        await fetch(`/api/catalog/${sku}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status: newStatus })
-        });
-      } catch(e) { console.error(e); }
-    }
-  }, []);
-
   const updateSku = useCallback(async (sku: string, updates: Partial<SkuData>): Promise<boolean> => {
     try {
-      const response = await fetch(`/api/catalog/${encodeURIComponent(sku)}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates)
-      });
-      if (!response.ok) return false;
-      setSkuDataList((prev) =>
-        prev.map((item) => (item.sku === sku ? { ...item, ...updates } : item))
-      );
+      const saved = await api<SkuData>(`/api/catalog/${encodeURIComponent(sku)}`, { method:'PUT', body:JSON.stringify(updates) });
+      setSkuDataList(previous => previous.map(item => item.sku === sku ? saved : item));
+      setCatalogError("");
       return true;
-    } catch(e) {
-      console.error(e);
-      return false;
-    }
+    } catch (error) { setCatalogError((error as Error).message); return false; }
   }, []);
-
-  const removeSkus = useCallback(async (skusToRemove: string[]) => {
-    setSkuDataList((prev) => prev.filter((item) => !skusToRemove.includes(item.sku)));
-    
+  const removeSkus = useCallback(async (skus: string[]) => {
     try {
-      await fetch('/api/catalog', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ skus: skusToRemove })
-      });
-    } catch(e) { console.error(e); }
+      await api('/api/catalog', { method:'DELETE', body:JSON.stringify({skus}) });
+      setSkuDataList(previous => previous.filter(item => !skus.includes(item.sku)));
+      setCatalogError("");
+      return true;
+    } catch (error) { setCatalogError((error as Error).message); return false; }
   }, []);
-
-  const clearAllData = useCallback(async () => {
-    setSkuDataList([]);
-    try {
-      await fetch('/api/catalog', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ all: true })
-      });
-    } catch(e) { console.error(e); }
-  }, []);
-
-  return { skuDataList, addParsedData, updateSkuStatus, updateSku, removeSkus, clearAllData, isLoading };
+  return { skuDataList, addParsedData, updateSku, removeSkus, resetCatalog, refreshCatalog, isLoading, catalogError };
 }

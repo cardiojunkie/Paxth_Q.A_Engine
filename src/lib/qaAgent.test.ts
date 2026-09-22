@@ -22,12 +22,10 @@ const sku: SkuData = {
 const originalSku = JSON.stringify(sku);
 const input = prepareQaInput(sku, [set], "Custom instructions", 40000);
 const requestSettings = normalizeSettings({
-  apiKey: "test-only", modelName: "deepseek/deepseek-v4.1-flash", temperature: 0.3,
-  maxTokens: 10000, maxConcurrency: 3, maxRetries: 2,
+  modelName: "deepseek/deepseek-v4.1-flash", temperature:0.3, maxTokens: 10000, maxConcurrency: 3, maxRetries: 2,
 });
 const request = buildQaRequest({ ...requestSettings, baseUrl: "https://aicredits.in/v1/chat/completions" }, input);
 assert.deepEqual(request, {
-  baseUrl: "https://api.aicredits.in/v1/chat/completions", apiKey: "test-only",
   payload: { model: "deepseek/deepseek-v4.1-flash", temperature: 0.3, max_tokens: 10000,
     response_format: { type: "json_object" }, messages: input.messages },
 });

@@ -1,14 +1,7 @@
-import { readSavedSettings } from "../hooks/useSettings";
-
 export async function scrapeUrl(url: string): Promise<string> {
-  const { baseUrl, apiKey, modelName } = readSavedSettings();
-  if (![baseUrl, apiKey, modelName].every(value => typeof value === "string" && value.trim())) {
-    throw new Error("Configure and save the base URL, API key, and model in LLM Settings before scraping.");
-  }
   const response = await fetch("/api/scrape", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url: url.trim(), llm: { baseUrl, apiKey, modelName } }),
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url: url.trim() }),
   });
   const data = await response.json().catch(() => null);
   if (!response.ok) {

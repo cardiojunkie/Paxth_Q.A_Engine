@@ -31,8 +31,7 @@ export function UsersModule() {
   const [showEditPassword, setShowEditPassword] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
 
-  // Visible Passwords toggle per row ID
-  const [visiblePasswordIds, setVisiblePasswordIds] = useState<Record<string, boolean>>({});
+  const [isSaving, setIsSaving] = useState(false);
 
   // Security Wall Check
   if (!user || user.role !== 'admin') {
@@ -43,7 +42,7 @@ export function UsersModule() {
         </div>
         <h2 className="text-2xl font-serif text-[#1A1A1A] font-medium">Access Restricted</h2>
         <p className="text-sm text-[#8C8882] max-w-md mt-2 leading-relaxed">
-          The Users module is restricted exclusively to system administrators. Log in with an admin account (e.g. <strong className="text-[#1A1A1A]">Aswath</strong>) to manage user accounts and permissions.
+          The Users module is restricted exclusively to system administrators. Log in with an admin account to manage user accounts and permissions.
         </p>
       </div>
     );
@@ -60,18 +59,7 @@ export function UsersModule() {
   const adminCount = usersList.filter(u => u.role === 'admin').length;
   const regularCount = usersList.filter(u => u.role === 'user').length;
 
-  const togglePasswordVisibility = (id: string) => {
-    setVisiblePasswordIds(prev => ({ ...prev, [id]: !prev[id] }));
-  };
-
-  const generateRandomPassword = () => {
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
-    let pass = '';
-    for (let i = 0; i < 12; i++) {
-      pass += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return pass;
-  };
+  const generateRandomPassword = () => crypto.randomUUID().replace(/-/g, '');
 
   const handleOpenAddModal = () => {
     setNewUsername('');
@@ -81,15 +69,17 @@ export function UsersModule() {
     setIsAddModalOpen(true);
   };
 
-  const handleCreateUser = (e: React.FormEvent) => {
+  const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     setAddError(null);
 
-    const result = addUserAccount({
+    setIsSaving(true);
+    const result = await addUserAccount({
       username: newUsername,
       password: newPassword,
       role: newRole,
     });
+    setIsSaving(false);
 
     if (result.success) {
       addNotification({
@@ -107,21 +97,23 @@ export function UsersModule() {
 
   const handleOpenEditModal = (u: UserAccount) => {
     setEditingUser(u);
-    setEditPassword(u.password || '');
+    setEditPassword('');
     setEditRole(u.role);
     setEditError(null);
   };
 
-  const handleSaveEdit = (e: React.FormEvent) => {
+  const handleSaveEdit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingUser) return;
 
     setEditError(null);
 
-    const result = updateUserAccount(editingUser.id, {
-      password: editPassword,
+    setIsSaving(true);
+    const result = await updateUserAccount(editingUser.id, {
+      ...(editPassword ? { password: editPassword } : {}),
       role: editRole,
     });
+    setIsSaving(false);
 
     if (result.success) {
       addNotification({
@@ -135,10 +127,12 @@ export function UsersModule() {
     }
   };
 
-  const handleDeleteConfirm = () => {
+  const handleDeleteConfirm = async () => {
     if (!deletingUser) return;
 
-    const result = deleteUserAccount(deletingUser.id);
+    setIsSaving(true);
+    const result = await deleteUserAccount(deletingUser.id);
+    setIsSaving(false);
     if (result.success) {
       addNotification({
         type: 'warning',
@@ -252,7 +246,6 @@ export function UsersModule() {
                 <tr className="bg-[#FDFCFB] border-b border-[#E5E2DE] text-[10px] uppercase tracking-widest text-[#8C8882]">
                   <th className="py-3.5 px-6 font-semibold">User</th>
                   <th className="py-3.5 px-4 font-semibold">Role</th>
-                  <th className="py-3.5 px-4 font-semibold">Sign In Password</th>
                   <th className="py-3.5 px-4 font-semibold">Created Date</th>
                   <th className="py-3.5 px-4 font-semibold">Last Active</th>
                   <th className="py-3.5 px-6 font-semibold text-right">Actions</th>
@@ -261,14 +254,13 @@ export function UsersModule() {
               <tbody className="divide-y divide-[#E5E2DE] text-xs">
                 {filteredUsers.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="py-12 text-center text-[#8C8882]">
+                    <td colSpan={5} className="py-12 text-center text-[#8C8882]">
                       <Users className="w-8 h-8 mx-auto mb-2 opacity-40" />
                       <p>No user accounts found matching your query.</p>
                     </td>
                   </tr>
                 ) : (
                   filteredUsers.map((u) => {
-                    const isVisible = !!visiblePasswordIds[u.id];
                     const isCurrentAdmin = user.username.toLowerCase() === u.username.toLowerCase();
 
                     return (
@@ -303,21 +295,6 @@ export function UsersModule() {
                           </span>
                         </td>
 
-                        <td className="py-4 px-4 font-mono">
-                          <div className="flex items-center gap-2">
-                            <span className="bg-[#F5F2EF] px-2 py-1 rounded text-[11px] border border-[#E5E2DE] text-[#1A1A1A]">
-                              {isVisible ? u.password : '••••••••••••'}
-                            </span>
-                            <button
-                              onClick={() => togglePasswordVisibility(u.id)}
-                              className="text-[#8C8882] hover:text-[#1A1A1A] transition-colors p-1"
-                              title={isVisible ? "Hide Password" : "Show Password"}
-                            >
-                              {isVisible ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                            </button>
-                          </div>
-                        </td>
-
                         <td className="py-4 px-4 text-[#8C8882]">
                           {new Date(u.createdAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}
                         </td>
@@ -345,9 +322,9 @@ export function UsersModule() {
 
                             <button
                               onClick={() => setDeletingUser(u)}
-                              disabled={isCurrentAdmin || u.username.toLowerCase() === 'aswath'}
+                              disabled={isSaving || (u.role === 'admin' && adminCount === 1)}
                               className="p-1.5 text-red-600 hover:bg-red-50 rounded transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
-                              title={isCurrentAdmin ? "Cannot delete active logged in account" : "Delete User"}
+                              title={u.role === 'admin' && adminCount === 1 ? "Cannot delete the last administrator" : "Delete User"}
                             >
                               <Trash2 className="w-4 h-4" />
                             </button>
@@ -424,6 +401,9 @@ export function UsersModule() {
                 <div className="relative">
                   <input
                     type={showNewPassword ? 'text' : 'password'}
+                    autoComplete="new-password"
+                    minLength={12}
+                    maxLength={256}
                     required
                     value={newPassword}
                     onChange={(e) => setNewPassword(e.target.value)}
@@ -431,6 +411,7 @@ export function UsersModule() {
                   />
                   <button
                     type="button"
+                    aria-label={showNewPassword ? 'Hide new password' : 'Show new password'}
                     onClick={() => setShowNewPassword(!showNewPassword)}
                     className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#8C8882] hover:text-[#1A1A1A]"
                   >
@@ -463,6 +444,7 @@ export function UsersModule() {
                 </button>
                 <button
                   type="submit"
+                  disabled={isSaving}
                   className="px-4 py-2 text-xs uppercase tracking-wider font-bold bg-[#1A1A1A] text-white hover:bg-[#333333] rounded-sm transition-colors shadow-sm"
                 >
                   Save & Create User
@@ -527,13 +509,17 @@ export function UsersModule() {
                 <div className="relative">
                   <input
                     type={showEditPassword ? 'text' : 'password'}
-                    required
+                    autoComplete="new-password"
+                    minLength={12}
+                    maxLength={256}
+                    placeholder="Leave blank to keep current password"
                     value={editPassword}
                     onChange={(e) => setEditPassword(e.target.value)}
                     className="w-full px-3 py-2 pr-10 border border-[#E5E2DE] rounded-sm text-xs font-mono text-[#1A1A1A] focus:outline-none focus:border-[#1A1A1A]"
                   />
                   <button
                     type="button"
+                    aria-label={showEditPassword ? 'Hide new password' : 'Show new password'}
                     onClick={() => setShowEditPassword(!showEditPassword)}
                     className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#8C8882] hover:text-[#1A1A1A]"
                   >
@@ -566,6 +552,7 @@ export function UsersModule() {
                 </button>
                 <button
                   type="submit"
+                  disabled={isSaving}
                   className="px-4 py-2 text-xs uppercase tracking-wider font-bold bg-[#1A1A1A] text-white hover:bg-[#333333] rounded-sm transition-colors shadow-sm"
                 >
                   Save Changes
@@ -597,6 +584,7 @@ export function UsersModule() {
               </button>
               <button
                 onClick={handleDeleteConfirm}
+                disabled={isSaving}
                 className="px-4 py-2 text-xs uppercase tracking-wider font-bold bg-red-600 text-white hover:bg-red-700 rounded-sm transition-colors shadow-sm"
               >
                 Delete Account

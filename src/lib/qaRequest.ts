@@ -1,4 +1,4 @@
-import { normalizeSettings, type AppSettings } from "../hooks/useSettings";
+import { normalizeSettings, type AppSettings } from "./providerSettings";
 import { finalizeQaResult, type prepareQaInput } from "./qaAgent";
 import { extractLLMResponseContent, parseLLMJsonResponse } from "./llmResponse";
 
@@ -7,8 +7,6 @@ type QaInput = ReturnType<typeof prepareQaInput>;
 export function buildQaRequest(settings: AppSettings, input: QaInput) {
   const normalized = normalizeSettings(settings);
   return {
-    baseUrl: normalized.baseUrl,
-    apiKey: normalized.apiKey,
     payload: {
       model: normalized.modelName,
       temperature: Number(normalized.temperature),

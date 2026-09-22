@@ -1,99 +1,22 @@
-import { useState, useEffect } from 'react';
-import { DEFAULT_QA_AGENT_MEMORY } from '../lib/qaAgent';
-import { fetchQaConfiguration, saveQaAgentMemory } from '../lib/qaConfiguration';
-
-const STORAGE_KEY = "qa-analyzer-settings";
-const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
-const LEGACY_AICREDITS_BASE_URL = "https://aicredits.in/v1";
-const AICREDITS_BASE_URL = "https://api.aicredits.in/v1";
-
-export interface AppSettings {
-  llmProvider: string;
-  baseUrl: string;
-  apiKey: string;
-  modelName: string;
-  temperature: number;
-  maxTokens: number;
-  maxConcurrency: number;
-  maxRetries: number;
-  scraperTimeout: number;
-  maxPageContentLength: number;
-  qaAgentMemory: string;
-}
-
-const DEFAULT_SETTINGS: AppSettings = {
-  llmProvider: "openai-compatible",
-  baseUrl: AICREDITS_BASE_URL,
-  apiKey: "",
-  modelName: "deepseek/deepseek-v4-flash",
-  temperature: 0.1,
-  maxTokens: DEFAULT_MAX_OUTPUT_TOKENS,
-  maxConcurrency: 2,
-  maxRetries: 3,
-  scraperTimeout: 30000,
-  maxPageContentLength: 40000,
-  qaAgentMemory: DEFAULT_QA_AGENT_MEMORY,
-};
-
-export function normalizeMaxTokens(value: unknown): number {
-  const maxTokens = Number(value);
-  return Number.isSafeInteger(maxTokens) && maxTokens > 0 ? maxTokens : DEFAULT_MAX_OUTPUT_TOKENS;
-}
-
-export function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
-  const trimmedUrl = settings.baseUrl?.trim().replace(/\/+$/, "");
-  const baseUrl = trimmedUrl === LEGACY_AICREDITS_BASE_URL || trimmedUrl === `${LEGACY_AICREDITS_BASE_URL}/chat/completions`
-    ? trimmedUrl.replace(LEGACY_AICREDITS_BASE_URL, AICREDITS_BASE_URL)
-    : settings.baseUrl;
-
-  return {
-    ...DEFAULT_SETTINGS,
-    ...settings,
-    baseUrl: baseUrl ?? DEFAULT_SETTINGS.baseUrl,
-    maxTokens: normalizeMaxTokens(settings.maxTokens),
-    maxPageContentLength: Number.isSafeInteger(settings.maxPageContentLength) && settings.maxPageContentLength > 0
-      ? settings.maxPageContentLength : DEFAULT_SETTINGS.maxPageContentLength,
-    qaAgentMemory: typeof settings.qaAgentMemory === 'string' && settings.qaAgentMemory.trim()
-      ? settings.qaAgentMemory : DEFAULT_QA_AGENT_MEMORY,
-  };
-}
-
-export function readSavedSettings(): AppSettings {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    return stored ? normalizeSettings(JSON.parse(stored)) : DEFAULT_SETTINGS;
-  } catch {
-    return DEFAULT_SETTINGS;
-  }
-}
-
+import { useEffect, useState } from 'react';
+import { api } from '../lib/api';
+import { DEFAULT_SETTINGS, editableSettings, normalizeSettings, type AppSettings } from '../lib/providerSettings';
+export { normalizeSettings, normalizeMaxTokens } from '../lib/providerSettings';
+export type { AppSettings } from '../lib/providerSettings';
 export function useSettings() {
-  const [settings, setSettings] = useState<AppSettings>(readSavedSettings);
-  const [legacyMemory, setLegacyMemory] = useState(settings.qaAgentMemory);
-  const [isMemoryLoading, setIsMemoryLoading] = useState(true);
-  const [memoryError, setMemoryError] = useState("");
-
-  useEffect(() => {
-    let active = true;
-    fetchQaConfiguration().then(config => {
-      if (active) setSettings(current => ({ ...current, qaAgentMemory: config.qaAgentMemory }));
-    }).catch(error => {
-      if (active) setMemoryError(error.message);
-    }).finally(() => {
-      if (active) setIsMemoryLoading(false);
-    });
-    return () => { active = false; };
-  }, []);
-
-  const saveSettings = async (newSettings: AppSettings) => {
-    const normalized = normalizeSettings(newSettings);
-    normalized.qaAgentMemory = await saveQaAgentMemory(normalized.qaAgentMemory);
-    // This is only a local cache; QA jobs always fetch the database configuration.
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
-    setSettings(normalized);
-    setLegacyMemory(normalized.qaAgentMemory);
-    setMemoryError("");
+  const [settings,setSettings]=useState(DEFAULT_SETTINGS);
+  const [isMemoryLoading,setLoading]=useState(true);
+  const [memoryError,setError]=useState('');
+  useEffect(()=>{
+    let active=true;
+    try { localStorage.removeItem('qa-analyzer-settings'); } catch { /* Storage can be disabled. */ }
+    api<AppSettings>('/api/provider-settings').then(value=>{if(active) setSettings(normalizeSettings(value));})
+      .catch(error=>{if(active)setError(error.message);}).finally(()=>{if(active)setLoading(false);});
+    return ()=>{active=false;};
+  },[]);
+  const saveSettings=async(value:AppSettings)=>{
+    const saved=await api<AppSettings>('/api/provider-settings',{method:'PUT',body:JSON.stringify(editableSettings(value))});
+    setSettings(saved);setError('');
   };
-
-  return { settings, saveSettings, defaultSettings: DEFAULT_SETTINGS, legacyMemory, isMemoryLoading, memoryError };
+  return {settings,saveSettings,defaultSettings:DEFAULT_SETTINGS,isMemoryLoading,memoryError};
 }

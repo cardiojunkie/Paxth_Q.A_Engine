@@ -12,7 +12,7 @@ import { scrapeUrl } from "../lib/scrapeRequest";
 type FilterType = "all" | "ready" | "cannot_qa" | "completed" | "failed";
 
 export function DashboardModule() {
-  const { skuDataList, addParsedData, clearData, updateSku, deleteSku, removeSkus, isLoadingSkuData, jobs, addJobs, addNotification } = useAppContext();
+  const { user, catalogError, skuDataList, addParsedData, clearData, updateSku, removeSkus, isLoadingSkuData, jobs, addJobs, addNotification } = useAppContext();
   const [fileName, setFileName] = useState<string | null>(localStorage.getItem('lastFileName') || null);
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -141,7 +141,11 @@ export function DashboardModule() {
       if (skuItem.source.url) {
         try {
           const markdown = await scrapeUrl(skuItem.source.url);
-          await updateSku(skuItem.sku, { scraped_markdown: markdown, scrape_status: "success" });
+          if (!await updateSku(skuItem.sku, { scraped_markdown: markdown, scrape_status: "success" })) {
+            setViewedMarkdown({sku:skuItem.sku, markdown});
+            setMarkdownSaveError("Scraped content could not be saved. The draft is preserved here; retry Save.");
+            throw new Error("Could not save scraped content");
+          }
         } catch (err: any) {
           const error = err.message || "Scraping failed";
           await updateSku(skuItem.sku, { scrape_status: "failed", error });
@@ -173,7 +177,7 @@ export function DashboardModule() {
     }
   };
 
-  const handleCreateJob = () => {
+  const handleCreateJob = async () => {
     if (selectedSkus.size === 0) return;
     
     const skusToProcess = skuDataList.filter(s => selectedSkus.has(s.sku));
@@ -221,7 +225,7 @@ export function DashboardModule() {
       status: "pending"
     };
 
-    addJobs([job]);
+    if (!await addJobs([job])) return;
     setSelectedSkus(new Set());
     addNotification({
       type: "success",
@@ -342,7 +346,7 @@ export function DashboardModule() {
   const handleFileUpload = (file: File) => {
     setError(null);
     const reader = new FileReader();
-    reader.onload = (e) => {
+    reader.onload = async (e) => {
       try {
         const data = new Uint8Array(e.target?.result as ArrayBuffer);
         const workbook = XLSX.read(data, { type: "array" });
@@ -362,8 +366,6 @@ export function DashboardModule() {
           return;
         }
 
-        setFileName(file.name);
-        localStorage.setItem('lastFileName', file.name);
         const parsedSkus: SkuData[] = [];
         let missingSkuCount = 0;
         const seenInFile = new Set<string>();
@@ -417,41 +419,14 @@ export function DashboardModule() {
           return;
         }
 
-        // Check against existing catalog SKUs
-        const existingSkuMap = new Map(skuDataList.map(item => [item.sku, item]));
-        const duplicateSkus = parsedSkus.filter(item => existingSkuMap.has(item.sku));
-        const newSkus = parsedSkus.filter(item => !existingSkuMap.has(item.sku));
-
-        if (duplicateSkus.length > 0) {
-          const dupSkusStr = duplicateSkus.length <= 3 
-            ? duplicateSkus.map(s => s.sku).join(", ") 
-            : `${duplicateSkus.slice(0, 3).map(s => s.sku).join(", ")} and ${duplicateSkus.length - 3} more`;
-
-          if (newSkus.length === 0) {
-            addNotification({
-              type: "warning",
-              title: "SKU Already Indexed",
-              message: duplicateSkus.length === 1
-                ? `SKU ${duplicateSkus[0].sku} is already indexed in the database. Duplicates were not created.`
-                : `${duplicateSkus.length} SKU(s) (${dupSkusStr}) are already indexed in the database. Duplicates were not created.`
-            });
-            return;
-          } else {
-            addParsedData(newSkus);
-            addNotification({
-              type: "warning",
-              title: "Duplicate SKUs Skipped",
-              message: `${duplicateSkus.length} SKU(s) (${dupSkusStr}) were already indexed and skipped. Indexed ${newSkus.length} new SKU(s).`
-            });
-            return;
-          }
-        }
-
-        addParsedData(parsedSkus);
+        const saved = await addParsedData(parsedSkus);
+        if (!saved) { setError("Import could not be saved. Your existing catalog is unchanged; retry the upload."); return; }
+        setFileName(file.name);
+        localStorage.setItem('lastFileName', file.name);
         addNotification({
-          type: "info",
-          title: "File Uploaded",
-          message: `Successfully parsed and indexed ${parsedSkus.length} new SKU(s).`
+          type: saved.skipped.length ? "warning" : "success",
+          title: saved.skipped.length ? "Duplicate SKUs Skipped" : "File Uploaded",
+          message: `Saved ${saved.inserted.length} new SKU(s); skipped ${saved.skipped.length} existing SKU(s) and ${missingSkuCount} row(s) without a SKU.`
         });
       } catch (err) {
         console.error("Error parsing Excel:", err);
@@ -525,6 +500,7 @@ export function DashboardModule() {
 
   return (
     <div className="flex-1 flex flex-col h-full bg-[#FDFCFB] overflow-hidden">
+      {(error || catalogError) && <p role="alert" className="relative z-[60] px-8 py-3 bg-red-50 text-red-700">{error || catalogError}</p>}
       {/* Top Header */}
       <header className="px-8 py-5 border-b border-[#E5E2DE] shrink-0 flex items-center justify-between bg-white">
         <div className="flex items-center gap-5">
@@ -562,7 +538,7 @@ export function DashboardModule() {
         </div>
 
         <div className="flex items-center gap-3">
-          {skuDataList.length > 0 && (
+          {user?.role === "admin" && skuDataList.length > 0 && (
             <button
               onClick={() => setShowClearAllModal(true)}
               className="text-xs text-rose-600 hover:text-rose-700 px-3 py-1.5 rounded border border-rose-200 hover:bg-rose-50 transition-colors font-medium flex items-center gap-1.5"
@@ -638,6 +614,7 @@ export function DashboardModule() {
             <div className="flex items-center gap-3">
               {selectedSkus.size > 0 && (
                 <button
+                  disabled={user?.role !== "admin"}
                   onClick={() => setShowDeleteSelectedModal(true)}
                   className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] uppercase font-bold tracking-widest text-white bg-rose-600 hover:bg-rose-700 rounded-sm transition-colors shadow-xs"
                 >
@@ -794,6 +771,7 @@ export function DashboardModule() {
                       </td>
                       <td className="p-3 text-right">
                          <button 
+                           disabled={user?.role !== "admin"}
                            onClick={() => setSkuToDelete(sku.sku)}
                            className="text-[#B8B4AE] hover:text-rose-600 transition-colors p-1"
                            title="Delete SKU"
@@ -850,9 +828,8 @@ export function DashboardModule() {
                 Cancel
               </button>
               <button 
-                onClick={() => {
-                  if (removeSkus) removeSkus([skuToDelete]);
-                  else deleteSku(skuToDelete);
+                onClick={async () => {
+                  if (!await removeSkus([skuToDelete])) return;
                   setSkuToDelete(null);
                   addNotification({ type: "success", title: "SKU Deleted", message: `SKU ${skuToDelete} has been removed.` });
                 }}
@@ -881,10 +858,10 @@ export function DashboardModule() {
                 Cancel
               </button>
               <button 
-                onClick={() => {
+                onClick={async () => {
                   const skusToDelete = Array.from(selectedSkus);
                   const count = skusToDelete.length;
-                  removeSkus(skusToDelete);
+                  if (!await removeSkus(skusToDelete)) return;
                   setSelectedSkus(new Set());
                   setShowDeleteSelectedModal(false);
                   addNotification({
@@ -918,8 +895,8 @@ export function DashboardModule() {
                 Cancel
               </button>
               <button 
-                onClick={() => {
-                  clearData();
+                onClick={async () => {
+                  if (!await clearData()) { setError("Could not clear data. Check the connection and cancel active jobs before retrying."); return; }
                   setSelectedSkus(new Set());
                   setFileName(null);
                   localStorage.removeItem('lastFileName');
@@ -1032,11 +1009,11 @@ export function DashboardModule() {
                 Skip This SKU
               </button>
               <button
-                onClick={() => {
+                onClick={async () => {
                   const textarea = document.getElementById("manualScrapeTextarea") as HTMLTextAreaElement;
                   const text = textarea?.value || "";
                   if (text.trim()) {
-                    updateSku(manualScrapeQueue[0], { scraped_markdown: text, scrape_status: "success" });
+                    if (!await updateSku(manualScrapeQueue[0], { scraped_markdown: text, scrape_status: "success" })) return;
                     addNotification({
                       type: "success",
                       title: "Content Saved",

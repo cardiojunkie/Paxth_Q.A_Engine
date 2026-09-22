@@ -1,366 +1,43 @@
 import express from "express";
-import { scrapeWithAgent, ScrapeError, validateScrapeInput } from "./src/lib/scrapeAgent.js";
-import { fetchChatCompletion } from "./src/lib/chatCompletion.js";
-import path from "path";
-import cors from "cors";
-import axios from "axios";
-import { getDatabaseErrorDetails } from "./src/lib/databaseError.js";
-import { isCompleteWebsiteDomain, normalizeWebsite } from "./src/lib/siteSelectorWebsite.js";
-import { db } from "./src/db/index.js";
+import path from "node:path";
+import { eq } from "drizzle-orm";
+import { pool, db } from "./src/db/index.js";
+import { siteSelectors } from "./src/db/schema.js";
 import { initializeQaConfiguration, registerQaConfigurationRoutes } from "./src/db/qaConfiguration.js";
-import { skuData, attributeSets, jobs, siteSelectors } from "./src/db/schema.js";
-import { eq, inArray, sql } from "drizzle-orm";
+import { isCompleteWebsiteDomain, normalizeWebsite } from "./src/lib/siteSelectorWebsite.js";
+import { scrapeWithAgent, ScrapeError, validateScrapeInput } from "./src/lib/scrapeAgent.js";
+import { ProviderError } from "./src/lib/chatCompletion.js";
+import { initializeDatabase, verifySchema } from "./src/server/database.js";
+import { ApiError, registerCatalogRoutes } from "./src/server/catalog.js";
+import { initializeAuth, registerAuth } from "./src/server/auth.js";
+import { initializeProvider, registerProviderRoutes, getProviderSettings, getProviderCredentials } from "./src/server/provider.js";
+import { initializeJobRuns, registerJobRunRoutes, startJobWorker } from "./src/server/jobRunner.js";
 
 async function startServer() {
+  if (!pool || !db) throw new Error("DATABASE_URL is required");
+  await initializeDatabase(pool);
+  await initializeQaConfiguration(db);
+  await initializeAuth(pool);
+  await initializeProvider(pool);
+  await initializeJobRuns(pool);
+  await verifySchema(pool);
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
-
-  app.use(cors());
-  app.use(express.json({ limit: '50mb' }));
-  app.use(express.urlencoded({ limit: '50mb', extended: true }));
-
-  // Database Health Check Endpoint
-  app.get("/api/db-status", async (req, res) => {
-    if (!db) {
-      return res.status(503).json({ status: "disconnected", message: "DATABASE_URL is not configured." });
-    }
-    try {
-      await db.execute(sql`SELECT 1`);
-      return res.json({ status: "connected", message: "Database connection successful." });
-    } catch (error: unknown) {
-      const details = getDatabaseErrorDetails(error);
-      const message = details.code
-        ? `Database unavailable (${details.code}): ${details.message}`
-        : `Database unavailable: ${details.message}`;
-      console.error("Database health check failed:", message);
-      return res.status(503).json({ status: "error", message });
-    }
+  app.disable('x-powered-by');
+  app.use(express.json({limit:'50mb'}));
+  app.get('/healthz', async (_req,res) => {
+    try { await verifySchema(pool); res.json({status:'ready'}); }
+    catch { res.status(503).json({status:'unavailable'}); }
   });
-
-  // Error handler for bad JSON payloads
-  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    if (err instanceof SyntaxError && 'body' in err) {
-      return res.status(400).json({ error: "Invalid JSON payload format" });
-    }
-    next(err);
+  registerAuth(app,pool);
+  app.get('/api/db-status', async (_req,res) => {
+    try { await verifySchema(pool); res.json({status:'connected',message:'Database schema ready'}); }
+    catch { res.status(503).json({status:'error',message:'Database schema unavailable'}); }
   });
-
-  // Auto-migrate tables on start
-  if (db) {
-    let migrationsCanRun = false;
-    try {
-      await db.execute(sql`SELECT 1`);
-      migrationsCanRun = true;
-    } catch (error: unknown) {
-      const details = getDatabaseErrorDetails(error);
-      console.warn(
-        `Database unavailable at startup${details.code ? ` (${details.code})` : ""}; schema initialization skipped: ${details.message}`,
-      );
-    }
-
-    if (migrationsCanRun) {
-      try {
-        await initializeQaConfiguration(db);
-      } catch (error) {
-        console.error("Shared QA configuration initialization failed:", getDatabaseErrorDetails(error).message);
-      }
-      let migrationFailures = 0;
-      const runMigrate = async (query: any) => {
-        try {
-          await db.execute(query);
-        } catch (error: unknown) {
-          migrationFailures += 1;
-          const details = getDatabaseErrorDetails(error);
-          console.warn(
-            `Database schema migration failed${details.code ? ` (${details.code})` : ""}: ${details.message}`,
-          );
-        }
-      };
-
-      await runMigrate(sql`
-        CREATE TABLE IF NOT EXISTS jobs (
-          id TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          attribute_set TEXT,
-          skus JSONB,
-          status TEXT DEFAULT 'pending',
-          tokens_used JSONB,
-          time_taken INTEGER,
-          error TEXT
-        );
-      `);
-      await runMigrate(sql`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_attribute_set_id_attribute_sets_id_fk;`);
-      await runMigrate(sql`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_attribute_set_id_fkey;`);
-      await runMigrate(sql`ALTER TABLE jobs ALTER COLUMN created_at TYPE TEXT USING created_at::text;`);
-      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attribute_set TEXT;`);
-      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS skus JSONB;`);
-      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';`);
-      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tokens_used JSONB;`);
-      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS time_taken INTEGER;`);
-      await runMigrate(sql`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS error TEXT;`);
-      await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS qa_result JSONB;`);
-      await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS export_data JSONB;`);
-      await runMigrate(sql`ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS last_job_id TEXT;`);
-      await runMigrate(sql`
-        CREATE TABLE IF NOT EXISTS site_selectors (
-          id TEXT PRIMARY KEY,
-          website TEXT NOT NULL,
-          selectors TEXT NOT NULL,
-          tab_selector TEXT,
-          tab_content_selector TEXT,
-          tab_wait_ms INTEGER,
-          enabled BOOLEAN NOT NULL DEFAULT TRUE,
-          created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-        );
-      `);
-      await runMigrate(sql`ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_selector TEXT;`);
-      await runMigrate(sql`ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_content_selector TEXT;`);
-      await runMigrate(sql`ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_wait_ms INTEGER;`);
-      if (migrationFailures) {
-        console.warn(`Database schema initialization completed with ${migrationFailures} failed migration step(s).`);
-      } else {
-        console.log("Database schema initialized.");
-      }
-    }
-  }
-
-  registerQaConfigurationRoutes(app, db);
-
-  // --- SKU Data Endpoints ---
-  app.get("/api/catalog", async (req, res) => {
-    if (!db) return res.status(503).json({ error: "DB not connected" });
-    try {
-      const data = await db.select().from(skuData);
-      const mapped = data.map(row => ({
-        sku: row.sku,
-        upload_attributes: row.uploadAttributes,
-        source: row.source,
-        raw_row: row.rawRow,
-        status: row.status,
-        attribute_set: row.attributeSet || row.attributeSetId,
-        scraped_markdown: row.scrapedMarkdown,
-        scrape_status: row.scrapeStatus,
-        tokensUsed: row.tokensUsed,
-        timeTaken: row.timeTaken,
-        error: row.error,
-        qa_result: row.qaResult || (row.rawRow && (row.rawRow as any).qa_result) || undefined,
-        export_data: row.exportData || undefined,
-        last_job_id: row.lastJobId || undefined
-      }));
-      res.json(mapped);
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.post("/api/catalog", async (req, res) => {
-    if (!db) return res.status(503).json({ error: "DB not connected" });
-    try {
-      const items = req.body; // array of skus
-      const toInsert = items.map((item: any) => ({
-        sku: item.sku,
-        uploadAttributes: item.upload_attributes,
-        source: item.source,
-        rawRow: item.raw_row,
-        status: item.status || 'pending',
-        attributeSet: item.attribute_set || null,
-        attributeSetId: item.attribute_set || null,
-        scrapedMarkdown: item.scraped_markdown || null,
-        scrapeStatus: item.scrape_status || null,
-        tokensUsed: item.tokensUsed || null,
-        timeTaken: item.timeTaken || null,
-        error: item.error || null,
-        qaResult: item.qa_result || null,
-        exportData: item.export_data || null,
-        lastJobId: item.last_job_id || null
-      }));
-      
-      // Upsert using onConflictDoUpdate
-      for (const item of toInsert) {
-        await db.insert(skuData).values(item).onConflictDoUpdate({
-          target: skuData.sku,
-          set: {
-            uploadAttributes: sql`EXCLUDED.upload_attributes`,
-            source: sql`EXCLUDED.source`,
-            rawRow: sql`EXCLUDED.raw_row`,
-            status: sql`EXCLUDED.status`,
-            attributeSet: sql`COALESCE(EXCLUDED.attribute_set, sku_data.attribute_set)`,
-            attributeSetId: sql`COALESCE(EXCLUDED.attribute_set_id, sku_data.attribute_set_id)`,
-            scrapedMarkdown: sql`COALESCE(EXCLUDED.scraped_markdown, sku_data.scraped_markdown)`,
-            scrapeStatus: sql`COALESCE(EXCLUDED.scrape_status, sku_data.scrape_status)`,
-            tokensUsed: sql`COALESCE(EXCLUDED.tokens_used, sku_data.tokens_used)`,
-            timeTaken: sql`COALESCE(EXCLUDED.time_taken, sku_data.time_taken)`,
-            error: sql`COALESCE(EXCLUDED.error, sku_data.error)`,
-            qaResult: sql`COALESCE(EXCLUDED.qa_result, sku_data.qa_result)`,
-            exportData: sql`COALESCE(EXCLUDED.export_data, sku_data.export_data)`,
-            lastJobId: sql`COALESCE(EXCLUDED.last_job_id, sku_data.last_job_id)`
-          }
-        });
-      }
-      res.json({ success: true });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.put("/api/catalog/:sku", async (req, res) => {
-    if (!db) return res.status(503).json({ error: "DB not connected" });
-    try {
-      const { sku } = req.params;
-      const item = req.body;
-      const toUpdate: Record<string, any> = {};
-
-      if (item.upload_attributes !== undefined) toUpdate.uploadAttributes = item.upload_attributes;
-      if (item.source !== undefined) toUpdate.source = item.source;
-      if (item.raw_row !== undefined) toUpdate.rawRow = item.raw_row;
-      if (item.status !== undefined) toUpdate.status = item.status;
-      if (item.attribute_set !== undefined) {
-        toUpdate.attributeSet = item.attribute_set;
-        toUpdate.attributeSetId = item.attribute_set;
-      }
-      if (item.scraped_markdown !== undefined) toUpdate.scrapedMarkdown = item.scraped_markdown;
-      if (item.scrape_status !== undefined) toUpdate.scrapeStatus = item.scrape_status;
-      if (item.tokensUsed !== undefined) toUpdate.tokensUsed = item.tokensUsed;
-      if (item.timeTaken !== undefined) toUpdate.timeTaken = item.timeTaken;
-      if (item.error !== undefined) toUpdate.error = item.error;
-      if (item.qa_result !== undefined) toUpdate.qaResult = item.qa_result;
-      if (item.export_data !== undefined) toUpdate.exportData = item.export_data;
-      if (item.last_job_id !== undefined) toUpdate.lastJobId = item.last_job_id;
-
-      if (Object.keys(toUpdate).length > 0) {
-        await db.update(skuData).set(toUpdate).where(eq(skuData.sku, sku));
-      }
-      res.json({ success: true });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.delete("/api/catalog", async (req, res) => {
-    if (!db) return res.status(503).json({ error: "DB not connected" });
-    try {
-      const { skus, all } = req.body || {};
-      if (all) {
-        await db.delete(skuData);
-      } else if (skus && Array.isArray(skus) && skus.length > 0) {
-        await db.delete(skuData).where(inArray(skuData.sku, skus));
-      }
-      res.json({ success: true });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  // --- Jobs Endpoints ---
-  app.get("/api/jobs", async (req, res) => {
-    if (!db) return res.status(503).json({ error: "DB not connected" });
-    try {
-      const data = await db.select().from(jobs);
-      const mapped = data.map(row => ({
-        id: row.id,
-        name: row.name,
-        createdAt: row.createdAt,
-        attribute_set: row.attributeSet || "",
-        skus: (row.skus as string[]) || [],
-        status: row.status || "pending",
-        tokensUsed: row.tokensUsed || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        timeTaken: row.timeTaken || 0,
-        error: row.error || undefined
-      }));
-      res.json(mapped);
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.post("/api/jobs", async (req, res) => {
-    if (!db) return res.status(503).json({ error: "DB not connected" });
-    try {
-      const items = Array.isArray(req.body) ? req.body : [req.body];
-      for (const item of items) {
-        const val = {
-          id: item.id,
-          name: item.name,
-          createdAt: item.createdAt || new Date().toISOString(),
-          attributeSet: item.attribute_set || null,
-          skus: item.skus || [],
-          status: item.status || 'pending',
-          tokensUsed: item.tokensUsed || null,
-          timeTaken: item.timeTaken || null,
-          error: item.error || null
-        };
-        await db.insert(jobs).values(val).onConflictDoUpdate({
-          target: jobs.id,
-          set: {
-            name: sql`EXCLUDED.name`,
-            createdAt: sql`EXCLUDED.created_at`,
-            attributeSet: sql`EXCLUDED.attribute_set`,
-            skus: sql`EXCLUDED.skus`,
-            status: sql`EXCLUDED.status`,
-            tokensUsed: sql`EXCLUDED.tokens_used`,
-            timeTaken: sql`EXCLUDED.time_taken`,
-            error: sql`EXCLUDED.error`
-          }
-        });
-      }
-      res.json({ success: true });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.put("/api/jobs/:id", async (req, res) => {
-    if (!db) return res.status(503).json({ error: "DB not connected" });
-    try {
-      const { id } = req.params;
-      const item = req.body;
-      const toUpdate: Record<string, any> = {};
-
-      if (item.name !== undefined) toUpdate.name = item.name;
-      if (item.attribute_set !== undefined) toUpdate.attributeSet = item.attribute_set;
-      if (item.skus !== undefined) toUpdate.skus = item.skus;
-      if (item.status !== undefined) toUpdate.status = item.status;
-      if (item.tokensUsed !== undefined) toUpdate.tokensUsed = item.tokensUsed;
-      if (item.timeTaken !== undefined) toUpdate.timeTaken = item.timeTaken;
-      if (item.error !== undefined) toUpdate.error = item.error;
-
-      if (Object.keys(toUpdate).length > 0) {
-        await db.update(jobs).set(toUpdate).where(eq(jobs.id, id));
-      }
-      res.json({ success: true });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.delete("/api/jobs/:id", async (req, res) => {
-    if (!db) return res.status(503).json({ error: "DB not connected" });
-    try {
-      const { id } = req.params;
-      await db.delete(jobs).where(eq(jobs.id, id));
-      res.json({ success: true });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.delete("/api/jobs", async (req, res) => {
-    if (!db) return res.status(503).json({ error: "DB not connected" });
-    try {
-      const { ids, all } = req.body || {};
-      if (all) {
-        await db.delete(jobs);
-      } else if (ids && Array.isArray(ids) && ids.length > 0) {
-        await db.delete(jobs).where(inArray(jobs.id, ids));
-      }
-      res.json({ success: true });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
+  registerQaConfigurationRoutes(app,db);
+  registerCatalogRoutes(app,pool);
+  registerProviderRoutes(app,pool);
+  registerJobRunRoutes(app,pool);
   // --- Site Selector Endpoints ---
   const matchesWebsite = (hostname: string, website: string) => {
     const host = hostname.replace(/^www\./, "");
@@ -390,7 +67,10 @@ async function startServer() {
       ? 300
       : Number(body.tabWaitMs);
     let error = "";
-    if (!websiteInput.trim() || !selectors) error = "website and selectors are required";
+    if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.website !== 'string' || typeof body.selectors !== 'string' ||
+      ['tabSelector','tabContentSelector'].some(key => body[key] != null && typeof body[key] !== 'string') ||
+      (body.enabled !== undefined && typeof body.enabled !== 'boolean')) error = "Invalid site selector fields";
+    else if (!websiteInput.trim() || !selectors) error = "website and selectors are required";
     else if (!isCompleteWebsiteDomain(websiteInput)) error = "website must be a complete domain, for example tcl.com";
     else if (Boolean(tabSelector) !== Boolean(tabContentSelector)) {
       error = "tabSelector and tabContentSelector must be provided together";
@@ -405,20 +85,18 @@ async function startServer() {
     try {
       res.json((await db.select().from(siteSelectors)).map(mapSiteSelector));
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      const duplicate = e.code === "23505" || e.cause?.code === "23505";
+      res.status(duplicate ? 409 : 503).json({ error: duplicate ? "A selector for that website already exists" : "Site selector operation failed" });
     }
   });
 
   app.post("/api/site-selectors", async (req, res) => {
     if (!db) return res.status(503).json({ error: "DB not connected" });
     const input = parseSiteSelectorInput(req.body);
-    if (!req.body?.id) return res.status(400).json({ error: "id is required" });
+    if (typeof req.body?.id !== "string" || !req.body.id.trim() || req.body.id.length > 256) return res.status(400).json({ error: "id is required" });
     if (input.error) return res.status(400).json({ error: input.error });
     try {
       const now = new Date();
-      const duplicate = (await db.select().from(siteSelectors))
-        .find(rule => normalizeWebsite(rule.website) === input.website);
-      if (duplicate) return res.status(409).json({ error: `A rule for ${input.website} already exists` });
       const rule = {
         id: req.body.id,
         website: input.website,
@@ -433,7 +111,8 @@ async function startServer() {
       await db.insert(siteSelectors).values(rule);
       res.status(201).json(mapSiteSelector(rule));
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      const duplicate = e.code === "23505" || e.cause?.code === "23505";
+      res.status(duplicate ? 409 : 503).json({ error: duplicate ? "A selector for that website already exists" : "Site selector operation failed" });
     }
   });
 
@@ -442,9 +121,6 @@ async function startServer() {
     const input = parseSiteSelectorInput(req.body);
     if (input.error) return res.status(400).json({ error: input.error });
     try {
-      const duplicate = (await db.select().from(siteSelectors))
-        .find(rule => rule.id !== req.params.id && normalizeWebsite(rule.website) === input.website);
-      if (duplicate) return res.status(409).json({ error: `A rule for ${input.website} already exists` });
       const [updated] = await db.update(siteSelectors).set({
         website: input.website,
         selectors: input.selectors,
@@ -457,17 +133,20 @@ async function startServer() {
       if (!updated) return res.status(404).json({ error: "Site selector rule not found" });
       res.json(mapSiteSelector(updated));
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      const duplicate = e.code === "23505" || e.cause?.code === "23505";
+      res.status(duplicate ? 409 : 503).json({ error: duplicate ? "A selector for that website already exists" : "Site selector operation failed" });
     }
   });
 
   app.delete("/api/site-selectors/:id", async (req, res) => {
     if (!db) return res.status(503).json({ error: "DB not connected" });
     try {
-      await db.delete(siteSelectors).where(eq(siteSelectors.id, req.params.id));
+      const removed = await db.delete(siteSelectors).where(eq(siteSelectors.id, req.params.id)).returning();
+      if (!removed.length) return res.status(404).json({ error:"Site selector not found" });
       res.json({ success: true });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      const duplicate = e.code === "23505" || e.cause?.code === "23505";
+      res.status(duplicate ? 409 : 503).json({ error: duplicate ? "A selector for that website already exists" : "Site selector operation failed" });
     }
   });
 
@@ -477,7 +156,9 @@ async function startServer() {
     const disconnect = () => { if (!res.writableEnded) controller.abort(); };
     res.on("close", disconnect);
     try {
-      const { url, llm } = validateScrapeInput(req.body);
+      if (Object.keys(req.body || {}).some(key => key !== "url")) throw new ScrapeError("Only a product URL is accepted", 400);
+      const settings = await getProviderSettings(pool);
+      const { url, llm } = validateScrapeInput({url:req.body?.url, llm:{...getProviderCredentials(), modelName:settings.modelName}});
       const hostname = new URL(url).hostname.toLowerCase();
       let selectorRule: typeof siteSelectors.$inferSelect | undefined;
       if (db) {
@@ -501,91 +182,12 @@ async function startServer() {
     }
   });
 
-  // LLM Proxy endpoint to bypass CORS
-  app.post("/api/chat", async (req, res) => {
-    try {
-      const { baseUrl, apiKey, payload } = req.body;
-      if (!baseUrl || !payload) {
-        return res.status(400).json({ error: "baseUrl and payload are required" });
-      }
-
-      let currentPayload = { ...payload };
-      let attempts = 0;
-      const maxServerAttempts = 3;
-      let lastResponse: Response | null = null;
-      let lastErrorText = "";
-
-      while (attempts < maxServerAttempts) {
-        attempts++;
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 90000); // 90s per request attempt
-
-        try {
-          const response = await fetchChatCompletion(String(baseUrl), apiKey, currentPayload, controller.signal);
-          clearTimeout(timeout);
-          lastResponse = response;
-
-          if (response.ok) {
-            const text = await response.text();
-            try {
-              const data = JSON.parse(text);
-              return res.json(data);
-            } catch (e) {
-              return res.status(502).json({ error: "Invalid JSON response from LLM API", details: text.substring(0, 200) });
-            }
-          }
-
-          lastErrorText = await response.text();
-
-          // If status >= 400 and response_format was set, remove it and retry
-          if (response.status >= 400 && currentPayload.response_format) {
-            console.warn(`[Proxy Chat] Endpoint returned ${response.status} with response_format. Removing response_format and retrying...`);
-            delete currentPayload.response_format;
-          }
-
-          // If status is retryable (429, 500, 502, 503, 504) and we have retries left
-          if (response.status >= 400 && response.status !== 401 && response.status !== 402 && response.status !== 403 && attempts < maxServerAttempts) {
-            const delay = attempts * 1000;
-            console.warn(`[Proxy Chat] Endpoint returned ${response.status}. Retrying in ${delay}ms (attempt ${attempts}/${maxServerAttempts})...`);
-            await new Promise(r => setTimeout(r, delay));
-            continue;
-          }
-
-          break;
-        } catch (fetchErr: any) {
-          clearTimeout(timeout);
-          lastErrorText = fetchErr.message || String(fetchErr);
-          if (attempts < maxServerAttempts) {
-            await new Promise(r => setTimeout(r, 1500));
-            continue;
-          }
-        }
-      }
-
-      let cleanDetails = lastErrorText;
-      try {
-        const parsed = JSON.parse(lastErrorText);
-        if (parsed.error) {
-          if (typeof parsed.error === "string") cleanDetails = parsed.error;
-          else if (parsed.error.message) cleanDetails = parsed.error.message;
-          else cleanDetails = JSON.stringify(parsed.error);
-        } else if (parsed.message) {
-          cleanDetails = parsed.message;
-        }
-      } catch (e) {
-        // Not JSON
-      }
-
-      const status = lastResponse ? lastResponse.status : 500;
-      return res.status(status).json({
-        error: `LLM API returned ${status}`,
-        details: cleanDetails || "Internal Server Error"
-      });
-
-    } catch (error: any) {
-      console.error("LLM Proxy error:", error.message);
-      return res.status(500).json({ error: "Failed to communicate with LLM API", details: error.message });
-    }
+  app.use('/api', (_req,res) => { res.status(404).json({error:'Endpoint not found'}); });
+  app.use((error: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const known = error instanceof ApiError || error instanceof ProviderError;
+    const duplicate = error.code === '23505' || error.cause?.code === '23505';
+    const status = known ? error.status : duplicate ? 409 : error.type === 'entity.too.large' ? 413 : error instanceof SyntaxError ? 400 : 503;
+    res.status(status).json({error: known ? error.message : duplicate ? 'A record with this identifier already exists' : status === 400 ? 'Invalid JSON payload' : status === 413 ? 'Request is too large' : 'The operation could not be saved. Please retry.'});
   });
 
   // Vite middleware for development
@@ -604,9 +206,23 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const listener = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
+  const stopWorker = startJobWorker(pool);
+  let stopping = false;
+  const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
+    listener.close();
+    await stopWorker();
+    await pool.end();
+  };
+  process.once('SIGTERM', () => void shutdown());
+  process.once('SIGINT', () => void shutdown());
 }
 
-startServer();
+startServer().catch(error => {
+  console.error("Startup failed; API and worker remain unavailable:", error.message);
+  void pool?.end().finally(() => { process.exitCode = 1; });
+});

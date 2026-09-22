@@ -1,41 +1,25 @@
 import React, { useState } from 'react';
-import { Shield, Lock, User, Eye, EyeOff, ArrowRight, AlertCircle, Key, Sparkles, CheckCircle2 } from 'lucide-react';
+import { Shield, Lock, User, Eye, EyeOff, ArrowRight, AlertCircle } from 'lucide-react';
 import { useAppContext } from '../context/AppContext';
 
 export function LoginScreen() {
   const { login, addNotification } = useAppContext();
-  const [username, setUsername] = useState('Aswath');
-  const [password, setPassword] = useState('potusdown@2230');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [rememberMe, setRememberMe] = useState(true);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setIsLoading(true);
-
-    setTimeout(() => {
-      const result = login(username, password);
-      setIsLoading(false);
-
-      if (result.success) {
-        addNotification({
-          type: 'success',
-          title: 'Welcome back, Aswath',
-          message: 'Successfully authenticated as Administrator.'
-        });
-      } else {
-        setError(result.error || 'Invalid credentials');
-      }
-    }, 400);
-  };
-
-  const fillDefaultCredentials = () => {
-    setUsername('Aswath');
-    setPassword('potusdown@2230');
-    setError(null);
+    const result = await login(username, password);
+    setIsLoading(false);
+    if (result.success) {
+      setPassword('');
+      addNotification({ type: 'success', title: 'Signed in', message: `Welcome, ${username.trim()}.` });
+    } else setError(result.error || 'Invalid credentials');
   };
 
   return (
@@ -77,7 +61,7 @@ export function LoginScreen() {
             </div>
             <h1 className="text-2xl font-serif font-normal text-[#1A1A1A] tracking-tight">System Sign In</h1>
             <p className="text-xs text-[#8C8882] mt-1.5 leading-relaxed">
-              Enter your admin credentials to access the catalog QA engine & rules suite.
+              Enter your credentials to access the catalog QA engine & rules suite.
             </p>
           </div>
 
@@ -92,30 +76,11 @@ export function LoginScreen() {
             </div>
           )}
 
-          {/* Quick Preset Button */}
-          <div className="mb-6 bg-[#FDFCFB] border border-[#E5E2DE] p-3 rounded-sm flex items-center justify-between gap-3 text-xs">
-            <div className="flex items-center gap-2 text-[#8C8882] overflow-hidden">
-              <Key className="w-4 h-4 text-[#1A1A1A] shrink-0" />
-              <div className="truncate">
-                <span className="font-semibold text-[#1A1A1A]">Default Admin:</span>{' '}
-                <span className="font-mono text-[11px] bg-[#E5E2DE]/50 px-1 py-0.5 rounded text-[#1A1A1A]">Aswath</span>
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={fillDefaultCredentials}
-              className="px-2.5 py-1 text-[11px] uppercase tracking-wider font-bold bg-[#1A1A1A] text-white rounded-sm hover:bg-[#333] transition-colors shrink-0 flex items-center gap-1"
-            >
-              <Sparkles className="w-3 h-3" />
-              Auto-fill
-            </button>
-          </div>
-
           <form onSubmit={handleSubmit} className="space-y-5">
             {/* Username field */}
             <div>
               <label htmlFor="username" className="block text-[11px] uppercase tracking-widest font-bold text-[#1A1A1A] mb-1.5">
-                Username / Admin ID
+                Username
               </label>
               <div className="relative">
                 <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-[#8C8882]">
@@ -127,7 +92,8 @@ export function LoginScreen() {
                   required
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="e.g. Aswath"
+                  autoComplete="username"
+                  placeholder="Username"
                   className="w-full pl-10 pr-3.5 py-2.5 bg-white border border-[#E5E2DE] rounded-sm text-sm text-[#1A1A1A] placeholder-[#8C8882]/60 focus:outline-none focus:border-[#1A1A1A] focus:ring-1 focus:ring-[#1A1A1A] transition-all"
                 />
               </div>
@@ -146,6 +112,7 @@ export function LoginScreen() {
                 </div>
                 <input
                   id="password-input"
+                  autoComplete="current-password"
                   type={showPassword ? 'text' : 'password'}
                   required
                   value={password}
@@ -162,19 +129,6 @@ export function LoginScreen() {
                   {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
               </div>
-            </div>
-
-            {/* Remember me */}
-            <div className="flex items-center justify-between pt-1">
-              <label className="flex items-center gap-2 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={rememberMe}
-                  onChange={(e) => setRememberMe(e.target.checked)}
-                  className="w-4 h-4 border-[#E5E2DE] text-[#1A1A1A] rounded-sm focus:ring-[#1A1A1A] accent-[#1A1A1A]"
-                />
-                <span className="text-xs text-[#8C8882]">Keep session signed in</span>
-              </label>
             </div>
 
             {/* Submit Button */}
@@ -194,24 +148,14 @@ export function LoginScreen() {
             </button>
           </form>
 
-          {/* Credentials Summary Box */}
-          <div className="mt-8 pt-6 border-t border-[#E5E2DE] text-[11px] text-[#8C8882] space-y-2 bg-[#FDFCFB] -mx-8 -mb-8 p-6">
-            <p className="font-semibold text-[#1A1A1A] flex items-center gap-1.5">
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-              Default Administrator Credentials:
-            </p>
-            <div className="font-mono text-[11px] bg-white border border-[#E5E2DE] p-2 rounded-sm space-y-1">
-              <div><span className="text-[#8C8882]">Admin User:</span> <strong className="text-[#1A1A1A]">Aswath</strong></div>
-              <div><span className="text-[#8C8882]">Password:</span> <strong className="text-[#1A1A1A]">potusdown@2230</strong></div>
-            </div>
-          </div>
+
         </div>
       </div>
 
       {/* Footer */}
       <div className="w-full max-w-md text-center text-[11px] text-[#8C8882] z-10">
         <p>Paxth Enterprise QA Automation & Catalog Engine</p>
-        <p className="text-[10px] text-[#8C8882]/70 mt-1">Authorized Access Only • All session activity logged</p>
+        <p className="text-[10px] text-[#8C8882]/70 mt-1">Authorized Access Only • Sessions expire after eight hours</p>
       </div>
     </div>
   );

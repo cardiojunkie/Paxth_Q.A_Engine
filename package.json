@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build --outDir dist/public && esbuild server.ts --bundle --platform=node --format=esm --packages=external --sourcemap --outfile=dist/server.mjs",
+    "build": "vite build --outDir dist/public && esbuild server.ts --bundle --platform=node --format=esm --packages=external --sourcemap --outfile=dist/server.mjs && esbuild scripts/bootstrap-admin.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/bootstrap-admin.mjs",
     "start": "node dist/server.mjs",
     "preview": "vite preview --outDir dist/public",
     "clean": "rm -rf dist server.js",
@@ -24,7 +24,11 @@
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
     "test:scrape-agent": "tsx src/lib/scrapeAgent.test.ts && tsx src/lib/scrapeRequest.test.ts",
-    "test:crawl-worker": "\"${CRAWL4AI_PYTHON:-.venv/bin/python}\" scraper/worker_test.py"
+    "test:crawl-worker": "\"${CRAWL4AI_PYTHON:-.venv/bin/python}\" scraper/worker_test.py",
+    "admin:bootstrap": "tsx scripts/bootstrap-admin.ts",
+    "test:provider": "tsx src/server/provider.test.ts",
+    "test:security-db": "tsx src/server/security.test.ts",
+    "test": "npm run lint && npm run test:provider && npm run test:job-state && npm run test:site-selector && npm run test:blocked-page && npm run test:db-error && npm run test:llm-response && npm run test:qa-agent && npm run test:scrape-agent"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

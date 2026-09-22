@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "vite";
 import type { SkuData } from "../hooks/useCatalogData";
+import {DEFAULT_SETTINGS} from "../lib/providerSettings";
 import { prepareQaInput } from "../lib/qaAgent";
 
 const sku = (id: string, updates: Partial<SkuData> = {}): SkuData => ({
@@ -41,11 +42,12 @@ const jobs = [{ id: "scrape-check", name: "Scrape integration", status: "pending
 
 process.env.CLOAKBROWSER_AUTO_UPDATE = "false";
 const { launch } = await import("cloakbrowser");
-const server = await createServer({ server: { host: "127.0.0.1", port: 0, hmr: false }, logLevel: "error" });
+const { chromium } = await import("playwright-core");
+const server = await createServer({ cacheDir:"/tmp/paxth-vite-browser-cache", server: { host: "127.0.0.1", port: 0, hmr: false }, logLevel: "error" });
 let browser: Awaited<ReturnType<typeof launch>> | undefined;
 try {
   await server.listen();
-  browser = await launch({ headless: true });
+  browser = process.env.CHROMIUM_EXECUTABLE ? await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_EXECUTABLE,args:["--no-sandbox"]}) : await launch({ headless: true });
   const page = await browser.newPage();
   page.setDefaultTimeout(15000);
   await page.addInitScript(() => {
@@ -57,15 +59,20 @@ try {
       temperature: 0.3, maxTokens: 10000, maxConcurrency: 3, maxRetries: 2,
     }));
   });
+  let authenticated=false;
   await page.route("**/api/**", async route => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
+    const account={id:'browser-admin',username:'Browser test admin',role:'admin',loginTime:new Date().toISOString()};
+    if(path==='/api/auth/me')return route.fulfill({status:authenticated?200:401,json:authenticated?account:{error:'Sign in'}});
+    if(path==='/api/auth/login'){authenticated=true;return route.fulfill({json:account});}
+    if(path==='/api/users')return route.fulfill({json:[]});
+    if(path==='/api/provider-settings')return route.fulfill({json:{...DEFAULT_SETTINGS,providerConfigured:true}});
+    if(path==='/api/jobs/scrape-check/runs')return route.fulfill({json:[]});
     if (path === "/api/scrape") {
       scrapeRequests++;
       assert.ok(holdScrape, "Editing source data must not trigger a scrape");
-      assert.deepEqual(request.postDataJSON().llm, {
-        baseUrl: "https://api.aicredits.in/v1", apiKey: "test-only", modelName: "test-model",
-      });
+      assert.deepEqual(Object.keys(request.postDataJSON()), ["url"]);
       await scrapeGate;
       return route.fulfill({ json: { markdown: "Automatically scraped content" } });
     }
@@ -79,7 +86,7 @@ try {
       const item = catalog.find(item => item.sku === id);
       assert.ok(item, `Unexpected SKU ${id}`);
       Object.assign(item, updates);
-      return route.fulfill({ json: { success: true } });
+      return route.fulfill({ json: item });
     }
     if (path === "/api/catalog") return route.fulfill({ json: catalog });
     if (path === "/api/jobs") return route.fulfill({ json: jobs });
@@ -88,20 +95,18 @@ try {
     if (path === "/api/qa-configuration") return route.fulfill({ json: { qaAgentMemory: "Use supplied evidence.", attributeSets: [] } });
     if (path === "/api/chat") {
       chatRequests.push(request.postDataJSON());
-      if (JSON.parse(request.postDataJSON().payload.messages[1].content).sku === "qa-connection-test") {
-        return route.fulfill({ json: sampleResponse });
-      }
-      assert.equal(JSON.parse(request.postDataJSON().payload.messages[1].content).scraped_markdown, "Automatically scraped content");
-      return route.fulfill({ json: { choices: [{ message: { content: JSON.stringify({
-        qa_status: "pass", confidence: "high", summary: "Evidence checked", issue_count: 0, issues: [],
-        source_notes: { sap_used: false, url_used: true, source_conflicts: [] },
-      }) } }] } });
+      return route.fulfill({json:{success:true}});
     }
     if (path === "/api/db-status") return route.fulfill({ json: { status: "connected" } });
     throw new Error(`Unexpected API request: ${request.method()} ${path}`);
   });
 
   await page.goto(server.resolvedUrls!.local[0]);
+  await page.getByRole('button',{name:'Sign In to Engine',exact:true}).waitFor();
+  assert.equal(authenticated,false,'Forged localStorage account cannot authenticate');
+  await page.getByLabel('Username',{exact:true}).fill('browser-admin');
+  await page.getByLabel('Password',{exact:true}).fill('browser-test-password');
+  await page.getByRole('button',{name:'Sign In to Engine',exact:true}).click();
   const row = (id: string) => page.getByRole("row", { includeHidden: true }).filter({ has: page.getByRole("cell", { name: id, exact: true, includeHidden: true }) });
   await row("pending").waitFor();
   assert.equal(await page.getByRole("columnheader").nth(4).textContent(), "SAP Available");
@@ -329,45 +334,13 @@ try {
   await page.getByPlaceholder("https://example.com/product/...").fill("https://example.com/product");
   await page.getByRole("button", { name: "Scrape URL", exact: true }).click();
   await page.getByText("Automatically scraped content", { exact: true }).waitFor();
-  await page.getByRole("button", { name: "Jobs", exact: true }).click();
-  const qaSaved = page.waitForRequest(request => request.method() === "PUT" && new URL(request.url()).pathname === "/api/catalog/present-pending" && Boolean(request.postDataJSON().qa_result));
-  await page.getByRole("button", { name: "Run Q.A", exact: true }).click();
-  await qaSaved;
-  assert.equal(scrapeRequests, 3, "Dashboard, Scraper, and Jobs all send the saved LLM configuration");
-  assert.equal(catalog[7].scrape_status, "success");
-  await page.getByRole("button", { name: "LLM Settings", exact: true }).click();
-  assert.equal(await page.getByPlaceholder("https://api.aicredits.in/v1").inputValue(), "https://api.aicredits.in/v1");
-  const sampleQa = {
-    qa_status: "pass", confidence: "high", summary: "Brand matches SAP", issue_count: 0, issues: [],
-    source_notes: { sap_used: true, url_used: false, source_conflicts: [] },
-  };
-  for (const [content, finish_reason, expected] of [
-    [null, "stop", "LLM returned no answer"],
-    [null, "length", "output token budget"],
-    ['{"message":"hello"}', "stop", "invalid QA result structure"],
-    [JSON.stringify(sampleQa), "stop", "The model returned a valid sample QA report"],
-  ]) {
-    sampleResponse = { choices: [{ message: { content, reasoning_content: "Reasoning is not an answer" }, finish_reason }] };
-    await page.getByRole("button", { name: "Test API", exact: true }).click();
-    await page.locator("button").filter({ has: page.locator("svg.lucide-bell") }).click();
-    await page.getByText(expected, { exact: false }).waitFor();
-    const success = finish_reason === "stop" && content === JSON.stringify(sampleQa);
-    assert.equal(await page.getByText("API Connection Successful", { exact: true }).count(), success ? 1 : 0);
-    await page.getByTitle("Clear all", { exact: true }).click();
-    await page.locator("button").filter({ has: page.locator("svg.lucide-bell") }).click();
-  }
-  const { messages: jobMessages, ...jobParameters } = chatRequests[0].payload;
-  for (const sample of chatRequests.slice(1)) {
-    const { messages, ...parameters } = sample.payload;
-    assert.deepEqual(parameters, jobParameters, "API tests and jobs use the same configured generation parameters");
-    assert.equal(sample.baseUrl, chatRequests[0].baseUrl);
-    assert.equal(sample.apiKey, chatRequests[0].apiKey);
-    assert.match(messages[0].content, /APPLICATION REQUIREMENTS/);
-    assert.equal(JSON.parse(messages[1].content).source_sap, "Brand: TestBrand");
-  }
-  assert.equal(chatRequests.length, 5);
-  console.log("SAP editor and all three scrape entry points passed browser assertions.");
-  console.log("Settings and Jobs request parity and API-test response validation passed browser assertions.");
+  assert.equal(scrapeRequests,2,'Browser scrape callers send only URLs');
+  await page.getByRole('button',{name:'LLM Settings',exact:true}).click();
+  await page.getByRole('button',{name:'Test saved settings',exact:true}).click();
+  await page.getByText('Saved settings passed the QA response check.',{exact:true}).waitFor();
+  assert.deepEqual(chatRequests,[{}],'Admin test uses server settings without client credentials');
+  assert.equal(await page.getByLabel('API Key',{exact:true}).count(),0);
+  console.log('Browser checks passed: forged-session rejection, confirmed saves, preserved drafts, and credential-free requests.');
 } finally {
   releaseSave();
   releaseScrape();

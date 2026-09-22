@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, ReactNode, useEffect } from 'react';
-import { SkuData, QAStatus, useCatalogData } from '../hooks/useCatalogData';
-import { User, UserAccount } from '../types';
+import { useCatalogData } from '../hooks/useCatalogData';
+import { User, UserAccount, UserAccountInput } from '../types';
+import { api, ApiError } from '../lib/api';
 
 export interface Job {
   id: string;
@@ -8,331 +9,183 @@ export interface Job {
   createdAt: string;
   attribute_set: string;
   skus: string[];
-  status: "pending" | "running" | "completed" | "failed";
-  tokensUsed?: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  tokensUsed?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
   timeTaken?: number;
   error?: string | null;
 }
 
 export interface AppNotification {
   id: string;
-  type: "success" | "error" | "info" | "warning";
+  type: 'success' | 'error' | 'info' | 'warning';
   title: string;
   message: string;
   timestamp: string;
   read: boolean;
 }
 
+type AccountResult = { success: boolean; error?: string };
+type Catalog = ReturnType<typeof useCatalogData>;
 interface AppContextType {
   user: User | null;
-  login: (username: string, password: string) => { success: boolean; error?: string };
-  logout: () => void;
-
+  sessionLoading: boolean;
+  login: (username: string, password: string) => Promise<AccountResult>;
+  logout: () => Promise<boolean>;
   usersList: UserAccount[];
-  addUserAccount: (user: Omit<UserAccount, 'id' | 'createdAt'>) => { success: boolean; error?: string };
-  updateUserAccount: (id: string, updates: Partial<UserAccount>) => { success: boolean; error?: string };
-  deleteUserAccount: (id: string) => { success: boolean; error?: string };
-
-  skuDataList: SkuData[];
-  addParsedData: (data: SkuData[]) => void;
-  updateSku: (sku: string, updates: Partial<SkuData>) => Promise<boolean>;
-  deleteSku: (sku: string) => void;
-  clearData: () => void;
-  removeSkus: (skus: string[]) => void;
-  updateSkuStatus: (skus: string[], newStatus: QAStatus) => void;
+  addUserAccount: (user: UserAccountInput) => Promise<AccountResult>;
+  updateUserAccount: (id: string, updates: Partial<UserAccountInput>) => Promise<AccountResult>;
+  deleteUserAccount: (id: string) => Promise<AccountResult>;
+  skuDataList: Catalog['skuDataList'];
+  addParsedData: Catalog['addParsedData'];
+  updateSku: Catalog['updateSku'];
+  deleteSku: (sku: string) => Promise<boolean>;
+  clearData: () => Promise<boolean>;
+  removeSkus: Catalog['removeSkus'];
+  catalogError: string;
   isLoadingSkuData: boolean;
-  
   jobs: Job[];
-  addJobs: (newJobs: Job[]) => void;
-  updateJob: (id: string, updates: Partial<Job>) => void;
-  removeJob: (id: string) => void;
-
+  addJobs: (newJobs: Job[]) => Promise<boolean>;
+  updateJob: (id: string, updates: Partial<Job>) => Promise<boolean>;
+  removeJob: (id: string) => Promise<boolean>;
+  refreshData: () => Promise<void>;
   notifications: AppNotification[];
-  addNotification: (notification: Omit<AppNotification, "id" | "timestamp" | "read">) => void;
+  addNotification: (notification: Omit<AppNotification, 'id' | 'timestamp' | 'read'>) => void;
   markNotificationRead: (id: string) => void;
   clearNotifications: () => void;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
-
-const DEFAULT_ADMIN_USER = 'Aswath';
-const DEFAULT_ADMIN_PASS = 'potusdown@2230';
-const SESSION_STORAGE_KEY = 'paxth_qa_user_session';
-const USERS_STORAGE_KEY = 'paxth_qa_users_db_v1';
-
-const INITIAL_USERS: UserAccount[] = [
-  {
-    id: 'user-admin-default',
-    username: DEFAULT_ADMIN_USER,
-    password: DEFAULT_ADMIN_PASS,
-    role: 'admin',
-    createdAt: new Date().toISOString(),
-  }
-];
+const messageOf = (error: unknown) => error instanceof Error ? error.message : 'Request failed. Please retry.';
 
 export function AppProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(() => {
-    try {
-      const stored = localStorage.getItem(SESSION_STORAGE_KEY);
-      if (stored) {
-        return JSON.parse(stored) as User;
-      }
-    } catch (e) {
-      console.error('Failed to parse stored user session', e);
-    }
-    return null;
-  });
-
-  const [usersList, setUsersList] = useState<UserAccount[]>(() => {
-    try {
-      const storedUsers = localStorage.getItem(USERS_STORAGE_KEY);
-      if (storedUsers) {
-        const parsed = JSON.parse(storedUsers);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          // Ensure default admin exists if deleted accidentally or modified
-          const hasAdmin = parsed.some((u: UserAccount) => u.username.toLowerCase() === DEFAULT_ADMIN_USER.toLowerCase());
-          if (!hasAdmin) {
-            return [...INITIAL_USERS, ...parsed];
-          }
-          return parsed;
-        }
-      }
-    } catch (e) {
-      console.error('Failed to parse stored user database', e);
-    }
-    return INITIAL_USERS;
-  });
-
-  const { skuDataList, addParsedData, updateSkuStatus, updateSku, removeSkus, clearAllData, isLoading } = useCatalogData();
+  const [user, setUser] = useState<User | null>(null);
+  const [sessionLoading, setSessionLoading] = useState(true);
+  const [usersList, setUsersList] = useState<UserAccount[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const { skuDataList, addParsedData, catalogError, updateSku, removeSkus, refreshCatalog, resetCatalog, isLoading } = useCatalogData(Boolean(user));
 
-  // Fetch initial jobs from database
-  useEffect(() => {
-    fetch('/api/jobs')
-      .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) {
-          setJobs(data);
-        }
-      })
-      .catch(err => {
-        console.error("Failed to fetch jobs from database", err);
-      });
+  const addNotification = useCallback((notification: Omit<AppNotification, 'id' | 'timestamp' | 'read'>) => {
+    setNotifications(prev => [{ ...notification, id: crypto.randomUUID(), timestamp: new Date().toISOString(), read: false }, ...prev]);
   }, []);
+  const notifyFailure = useCallback((error: unknown) => {
+    addNotification({ type: 'error', title: 'Request failed', message: messageOf(error) });
+  }, [addNotification]);
 
-  // Persist users database changes
   useEffect(() => {
+    // Discard browser-owned credentials; only the server session can establish identity.
+    for (const key of ['paxth_qa_user_session', 'paxth_qa_users_db_v1', 'qa-analyzer-settings']) {
+      try { localStorage.removeItem(key); } catch { /* Storage may be disabled. */ }
+    }
+    const expire = () => { setUser(null); setJobs([]); setUsersList([]); };
+    window.addEventListener('session-expired', expire);
+    let active = true;
+    api<User>('/api/auth/me').then(value => { if (active) setUser(value); }).catch(error => {
+      if (active && !(error instanceof ApiError && error.status === 401)) notifyFailure(error);
+    }).finally(() => { if (active) setSessionLoading(false); });
+    return () => { active = false; window.removeEventListener('session-expired', expire); };
+  }, [notifyFailure]);
+
+  const refreshJobs = useCallback(async () => { setJobs(await api<Job[]>('/api/jobs')); }, []);
+  const refreshData = useCallback(async () => {
+    await Promise.all([refreshCatalog(), refreshJobs()]);
+  }, [refreshCatalog, refreshJobs]);
+
+  useEffect(() => {
+    if (!user) { setJobs([]); setUsersList([]); return; }
+    let active = true;
+    api<Job[]>('/api/jobs').then(value => { if (active) setJobs(value); }).catch(error => { if (active) notifyFailure(error); });
+    if (user.role === 'admin') api<UserAccount[]>('/api/users').then(value => { if (active) setUsersList(value); }).catch(error => { if (active) notifyFailure(error); });
+    else setUsersList([]);
+    return () => { active = false; };
+  }, [user, notifyFailure]);
+
+  const login = useCallback(async (username: string, password: string): Promise<AccountResult> => {
     try {
-      localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(usersList));
-    } catch (e) {
-      console.error('Failed to save users database', e);
-    }
-  }, [usersList]);
-
-  const login = useCallback((usernameInput: string, passwordInput: string) => {
-    const trimmedUsername = usernameInput.trim();
-    if (!trimmedUsername || !passwordInput) {
-      return { success: false, error: 'Please enter both username and password.' };
-    }
-
-    // Check against usersList
-    const matchedAccount = usersList.find(
-      u => u.username.toLowerCase() === trimmedUsername.toLowerCase() && u.password === passwordInput
-    );
-
-    if (matchedAccount) {
-      const authenticatedUser: User = {
-        username: matchedAccount.username,
-        role: matchedAccount.role,
-        loginTime: new Date().toISOString(),
-      };
-
-      // Update last login timestamp
-      setUsersList(prev => prev.map(u => u.id === matchedAccount.id ? { ...u, lastLogin: new Date().toISOString() } : u));
-
-      setUser(authenticatedUser);
-      try {
-        localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(authenticatedUser));
-      } catch (e) {
-        console.error('Failed to save user session', e);
-      }
+      setUser(await api<User>('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }));
       return { success: true };
-    }
-    
-    return { 
-      success: false, 
-      error: 'Invalid username or password. Please verify your credentials.' 
-    };
-  }, [usersList]);
-
-  const logout = useCallback(() => {
-    setUser(null);
-    try {
-      localStorage.removeItem(SESSION_STORAGE_KEY);
-    } catch (e) {
-      console.error('Failed to remove user session', e);
-    }
+    } catch (error) { return { success: false, error: messageOf(error) }; }
   }, []);
 
-  const addUserAccount = useCallback((newUser: Omit<UserAccount, 'id' | 'createdAt'>) => {
-    const trimmedUsername = newUser.username.trim();
-    if (!trimmedUsername) {
-      return { success: false, error: 'Username cannot be empty.' };
-    }
+  const logout = useCallback(async () => {
+    try { await api('/api/auth/logout', { method: 'POST' }); setUser(null); setJobs([]); setUsersList([]); return true; }
+    catch (error) { notifyFailure(error); return false; }
+  }, [notifyFailure]);
 
-    if (!newUser.password || newUser.password.length < 4) {
-      return { success: false, error: 'Password must be at least 4 characters long.' };
-    }
-
-    // Check for existing duplicate username
-    const exists = usersList.some(u => u.username.toLowerCase() === trimmedUsername.toLowerCase());
-    if (exists) {
-      return { success: false, error: `A user with username "${trimmedUsername}" already exists.` };
-    }
-
-    const createdAccount: UserAccount = {
-      ...newUser,
-      username: trimmedUsername,
-      id: `user-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      createdAt: new Date().toISOString(),
-    };
-
-    setUsersList(prev => [createdAccount, ...prev]);
-    return { success: true };
-  }, [usersList]);
-
-  const updateUserAccount = useCallback((id: string, updates: Partial<UserAccount>) => {
-    if (updates.username) {
-      const trimmed = updates.username.trim();
-      const duplicate = usersList.some(u => u.id !== id && u.username.toLowerCase() === trimmed.toLowerCase());
-      if (duplicate) {
-        return { success: false, error: `Username "${trimmed}" is already taken.` };
-      }
-      updates.username = trimmed;
-    }
-
-    setUsersList(prev => prev.map(u => u.id === id ? { ...u, ...updates } : u));
-    return { success: true };
-  }, [usersList]);
-
-  const deleteUserAccount = useCallback((id: string) => {
-    const target = usersList.find(u => u.id === id);
-    if (!target) {
-      return { success: false, error: 'User not found.' };
-    }
-
-    // Do not allow deleting current logged in admin
-    if (user && target.username.toLowerCase() === user.username.toLowerCase()) {
-      return { success: false, error: 'You cannot delete your own active session account.' };
-    }
-
-    // Do not allow deleting default admin Aswath
-    if (target.username.toLowerCase() === DEFAULT_ADMIN_USER.toLowerCase()) {
-      return { success: false, error: `The default system administrator "${DEFAULT_ADMIN_USER}" cannot be deleted.` };
-    }
-
-    setUsersList(prev => prev.filter(u => u.id !== id));
-    return { success: true };
-  }, [usersList, user]);
-
-
-  const deleteSku = useCallback((sku: string) => {
-    removeSkus([sku]);
-  }, [removeSkus]);
-
-  const clearData = useCallback(async () => {
-    clearAllData();
-    setJobs([]);
+  const addUserAccount = useCallback(async (newUser: UserAccountInput): Promise<AccountResult> => {
     try {
-      await fetch('/api/jobs', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ all: true })
-      });
-    } catch(e) {
-      console.error("Failed to clear jobs in database", e);
-    }
-  }, [clearAllData]);
+      const account = await api<UserAccount>('/api/users', { method: 'POST', body: JSON.stringify(newUser) });
+      setUsersList(prev => [account, ...prev]);
+      return { success: true };
+    } catch (error) { return { success: false, error: messageOf(error) }; }
+  }, []);
+
+  const updateUserAccount = useCallback(async (id: string, updates: Partial<UserAccountInput>): Promise<AccountResult> => {
+    try {
+      const account = await api<UserAccount>(`/api/users/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(updates) });
+      setUsersList(prev => prev.map(item => item.id === id ? account : item));
+      if (id === user?.id) setUser(null); // Account changes revoke every session, including this one.
+      return { success: true };
+    } catch (error) { return { success: false, error: messageOf(error) }; }
+  }, [user?.id]);
+
+  const deleteUserAccount = useCallback(async (id: string): Promise<AccountResult> => {
+    try {
+      await api(`/api/users/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      setUsersList(prev => prev.filter(account => account.id !== id));
+      if (id === user?.id) setUser(null);
+      return { success: true };
+    } catch (error) { return { success: false, error: messageOf(error) }; }
+  }, [user?.id]);
+
+  const deleteSku = useCallback((sku: string) => removeSkus([sku]), [removeSkus]);
+  const clearData = useCallback(async () => {
+    try {
+      await api('/api/data', { method: 'DELETE' });
+      setJobs([]);
+      resetCatalog();
+      return true;
+    } catch (error) { notifyFailure(error); return false; }
+  }, [resetCatalog, notifyFailure]);
 
   const addJobs = useCallback(async (newJobs: Job[]) => {
-    setJobs(prev => [...prev, ...newJobs]);
     try {
-      await fetch('/api/jobs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newJobs)
-      });
-    } catch(e) {
-      console.error("Failed to add jobs to database", e);
-    }
-  }, []);
+      const saved = await api<Job[]>('/api/jobs', { method: 'POST', body: JSON.stringify(newJobs) });
+      setJobs(prev => [...prev, ...saved]);
+      return true;
+    } catch (error) { notifyFailure(error); return false; }
+  }, [notifyFailure]);
 
   const updateJob = useCallback(async (id: string, updates: Partial<Job>) => {
-    setJobs(prev => prev.map(job => job.id === id ? { ...job, ...updates } : job));
     try {
-      await fetch(`/api/jobs/${id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates)
-      });
-    } catch(e) {
-      console.error("Failed to update job in database", e);
-    }
-  }, []);
+      const saved = await api<Job>(`/api/jobs/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(updates) });
+      setJobs(prev => prev.map(job => job.id === id ? saved : job));
+      return true;
+    } catch (error) { notifyFailure(error); return false; }
+  }, [notifyFailure]);
 
   const removeJob = useCallback(async (id: string) => {
-    setJobs(prev => prev.filter(job => job.id !== id));
     try {
-      await fetch(`/api/jobs/${id}`, {
-        method: 'DELETE'
-      });
-    } catch(e) {
-      console.error("Failed to remove job from database", e);
-    }
-  }, []);
+      await api(`/api/jobs/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      setJobs(prev => prev.filter(job => job.id !== id));
+      return true;
+    } catch (error) { notifyFailure(error); return false; }
+  }, [notifyFailure]);
 
-  const addNotification = useCallback((notification: Omit<AppNotification, "id" | "timestamp" | "read">) => {
-    setNotifications(prev => [
-      {
-        ...notification,
-        id: Math.random().toString(36).substring(2, 9),
-        timestamp: new Date().toISOString(),
-        read: false,
-      },
-      ...prev
-    ]);
-  }, []);
-
-  const markNotificationRead = useCallback((id: string) => {
-    setNotifications(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
-  }, []);
-
-  const clearNotifications = useCallback(() => {
-    setNotifications([]);
-  }, []);
-
+  const markNotificationRead = useCallback((id: string) => setNotifications(prev => prev.map(item => item.id === id ? { ...item, read: true } : item)), []);
+  const clearNotifications = useCallback(() => setNotifications([]), []);
   return (
     <AppContext.Provider value={{
-      user, login, logout,
-      usersList, addUserAccount, updateUserAccount, deleteUserAccount,
-      skuDataList, addParsedData, updateSku, deleteSku, clearData, removeSkus, updateSkuStatus, isLoadingSkuData: isLoading,
-      jobs, addJobs, updateJob, removeJob,
-      notifications, addNotification, markNotificationRead, clearNotifications
-    }}>
-      {children}
-    </AppContext.Provider>
+      user, sessionLoading, login, logout, usersList, addUserAccount, updateUserAccount, deleteUserAccount,
+      skuDataList, addParsedData, updateSku, deleteSku, clearData, removeSkus, catalogError, isLoadingSkuData: isLoading,
+      jobs, addJobs, updateJob, removeJob, refreshData,
+      notifications, addNotification, markNotificationRead, clearNotifications,
+    }}>{children}</AppContext.Provider>
   );
 }
 
 export function useAppContext() {
   const context = useContext(AppContext);
-  if (context === undefined) {
-    throw new Error('useAppContext must be used within an AppProvider');
-  }
+  if (!context) throw new Error('useAppContext must be used within an AppProvider');
   return context;
 }

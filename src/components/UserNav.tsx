@@ -19,8 +19,8 @@ export function UserNav() {
 
   if (!user) return null;
 
-  const handleLogout = () => {
-    logout();
+  const handleLogout = async () => {
+    if (!await logout()) return;
     addNotification({
       type: 'info',
       title: 'Logged Out',

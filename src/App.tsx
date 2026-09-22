@@ -16,19 +16,20 @@ import { LoginScreen } from './components/LoginScreen';
 import { AppProvider, useAppContext } from './context/AppContext';
 import { cn } from './lib/utils';
 import { Shield } from 'lucide-react';
+import { api } from './lib/api';
 
 type ModuleType = 'dashboard' | 'scraper' | 'attribute-sets' | 'jobs' | 'llm-settings' | 'users';
 
 function MainLayout() {
-  const { user } = useAppContext();
+  const { user, sessionLoading } = useAppContext();
   const [activeModule, setActiveModule] = useState<ModuleType>('dashboard');
   const [dbStatus, setDbStatus] = useState<'checking' | 'connected' | 'disconnected' | 'error'>('checking');
 
   useEffect(() => {
+    if (!user) return;
     let isMounted = true;
     const checkStatus = () => {
-      fetch('/api/db-status')
-        .then((res) => res.json())
+      api<{ status: string }>('/api/db-status')
         .then((data) => {
           if (isMounted) {
             if (data.status === 'connected') setDbStatus('connected');
@@ -46,7 +47,9 @@ function MainLayout() {
       isMounted = false;
       clearInterval(interval);
     };
-  }, []);
+  }, [user]);
+
+  if (sessionLoading) return <div role="status" className="p-8 text-center">Checking session…</div>;
 
   if (!user) {
     return <LoginScreen />;
@@ -59,7 +62,7 @@ function MainLayout() {
     { id: 'scraper', label: 'Scraper' },
     { id: 'attribute-sets', label: 'Attribute Sets' },
     { id: 'jobs', label: 'Jobs' },
-    { id: 'llm-settings', label: 'LLM Settings' },
+    ...(isSystemAdmin ? [{ id: 'llm-settings', label: 'LLM Settings', adminOnly: true }] : []),
     ...(isSystemAdmin ? [{ id: 'users', label: 'Users', adminOnly: true }] : []),
   ];
 
@@ -113,8 +116,8 @@ function MainLayout() {
         {activeModule === 'scraper' && <ScraperModule />}
         {activeModule === 'attribute-sets' && <AttributeSetsModule />}
         {activeModule === 'jobs' && <JobsModule />}
-        {activeModule === 'llm-settings' && <LLMSettingsModule />}
-        {activeModule === 'users' && <UsersModule />}
+        {activeModule === 'llm-settings' && isSystemAdmin && <LLMSettingsModule />}
+        {activeModule === 'users' && isSystemAdmin && <UsersModule />}
       </main>
     </div>
   );

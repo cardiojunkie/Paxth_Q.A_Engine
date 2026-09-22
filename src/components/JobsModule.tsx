@@ -1,332 +1,123 @@
-import React, { useState, useRef } from "react";
-import { Play, StopCircle, CheckCircle, AlertCircle, Clock, Download, Eye, Trash2, X, AlertTriangle, FileSpreadsheet, ChevronDown, ChevronUp } from "lucide-react";
+import React, { useState, useRef, useEffect } from "react";
+import { Play, Clock, StopCircle, CheckCircle, AlertCircle, Download, Eye, Trash2, X, AlertTriangle, FileSpreadsheet, ChevronDown, ChevronUp } from "lucide-react";
 import { useAppContext, Job } from "../context/AppContext";
-import { useSettings } from "../hooks/useSettings";
-import { fetchQaConfiguration, type QaConfiguration } from "../lib/qaConfiguration";
-import {
-  getCommonAttributeSet,
-  getCommonHeaderOrder,
-  getCompletedJobSkuIds,
-  getJobRunStatus,
-  hasCompletedQa,
-  selectJobSkus,
-} from "../lib/jobRunState";
-import { buildQaRequest, parseQaResponse } from "../lib/qaRequest";
+import type { SkuData } from "../hooks/useCatalogData";
+import { getCommonAttributeSet, getCommonHeaderOrder, hasCompletedQa } from "../lib/jobRunState";
 import { populateQaWorksheet } from "../lib/qaExcelExport";
-import { prepareQaInput } from "../lib/qaAgent";
-import { scrapeUrl } from "../lib/scrapeRequest";
+import { api } from "../lib/api";
 import { cn } from "../lib/utils";
 import ExcelJS from "exceljs";
 import { saveAs } from "file-saver";
 
-function parseApiErrorMessage(status: number, rawText: string): string {
-  if (!rawText) return status ? `LLM API returned HTTP ${status}` : "Unknown error";
-  try {
-    const json = JSON.parse(rawText);
-    if (json.details) {
-      if (typeof json.details === "string") return json.details;
-      if (json.details.message) return json.details.message;
-      return JSON.stringify(json.details);
-    }
-    if (json.error) {
-      if (typeof json.error === "string") return json.error;
-      if (json.error.message) return json.error.message;
-      return JSON.stringify(json.error);
-    }
-    if (json.message) return json.message;
-  } catch (e) {
-    // Not JSON
-  }
-  return rawText;
-}
+type Run = {
+  id: string; jobId: string; actorId: string; actorName: string; status: string;
+  createdAt: string; finishedAt?: string; error?: string;
+  items?: Array<{ sku: string; status: string; attempts: number; error?: string; snapshot: SkuData; result?: SkuData }>;
+};
+const active = (run: Run) => ["queued", "running", "cancelling"].includes(run.status);
+const request = <T,>(url: string, body?: unknown) => api<T>(url, body === undefined ? {cache:'no-store'} : {method:'POST',body:JSON.stringify(body)});
+const runSkus = (run: Run) => (run.items || []).map(item => item.result || {
+  ...item.snapshot,
+  ...(["queued", "running", "cancelled", "failed"].includes(item.status) ? {
+    status: item.status === "running" ? "running" : item.status === "queued" ? "pending" : "failed",
+    qa_result: undefined, raw_row: { ...item.snapshot.raw_row, qa_result: undefined },
+    error: item.error || (item.status === "cancelled" ? "Cancelled" : null),
+  } : {}),
+} as SkuData);
 
 export function JobsModule() {
-  const { skuDataList, updateSku, jobs, updateJob, removeJob, addNotification } = useAppContext();
-  const { settings } = useSettings();
-  
-  const [runningJobId, setRunningJobId] = useState<string | null>(null);
-  const [stopRequested, setStopRequested] = useState(false);
-  const stopRequestedRef = useRef(false);
-  const [progress, setProgress] = useState({ current: 0, total: 0, currentSku: "", action: "" });
-  
-  // State for inspecting job results modal
+  const { skuDataList, jobs, removeJob, addNotification, refreshData, user } = useAppContext();
+  const [histories, setHistories] = useState<Record<string, Run[]>>({});
+  const [activeRuns, setActiveRuns] = useState<Run[]>([]);
+  const [submitting, setSubmitting] = useState(false);
+  const [pollError, setPollError] = useState("");
   const [selectedJobToView, setSelectedJobToView] = useState<Job | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState("");
+  const [viewRun, setViewRun] = useState<Run | null>(null);
   const [expandedSku, setExpandedSku] = useState<string | null>(null);
   const [selectedJobs, setSelectedJobs] = useState<Set<string>>(new Set());
+  const latest = useRef({ refreshData, jobs });
+  latest.current = { refreshData, jobs };
+  const jobIds = jobs.map(job => job.id).join("\n");
+  const pendingRequests = useRef(new Map<string, string>());
 
-  const runSelectedJobs = async () => {
-    if (runningJobId || selectedJobs.size === 0) return;
-    
-    // Sort selected jobs by their current index to run sequentially
-    const jobsToRun = Array.from(selectedJobs);
-    
-    for (const jobId of jobsToRun) {
-      if (stopRequestedRef.current) break;
-      if (await runJob(jobId, true)) break;
-    }
-  };
+  useEffect(() => {
+    let disposed = false;
+    let busy = false;
+    const poll = async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        const pairs = await Promise.all(latest.current.jobs.map(async job => [job.id, await request<Run[]>(`/api/jobs/${encodeURIComponent(job.id)}/runs`)] as const));
+        const runs = await Promise.all(pairs.flatMap(([, history]) => history.filter(active)).map(run => request<Run>(`/api/job-runs/${run.id}`)));
+        if (!disposed) { setHistories(Object.fromEntries(pairs)); setActiveRuns(runs); setPollError(""); await latest.current.refreshData(); }
+      } catch (error) { if (!disposed) setPollError(error instanceof Error ? error.message : "Could not load job progress"); }
+      finally { busy = false; }
+    };
+    void poll();
+    const timer = setInterval(poll, 2000);
+    return () => { disposed = true; clearInterval(timer); };
+  }, [jobIds]);
 
-  const runJob = async (jobId: string, isSequential = false, skuId?: string, rerunAll = false): Promise<boolean> => {
-    if (runningJobId && !isSequential) return false;
-    
-    if (!settings.apiKey || !settings.baseUrl || !settings.modelName) {
-      addNotification({
-        type: "error",
-        title: "Missing API Settings",
-        message: "Please configure LLM API settings in the LLM Settings module first."
-      });
-      return false;
-    }
+  useEffect(() => {
+    setViewRun(null);
+    if (!selectedRunId) return;
+    let disposed = false;
+    let busy = false;
+    const poll = async () => {
+      if (busy) return;
+      busy = true;
+      try { const run = await request<Run>(`/api/job-runs/${selectedRunId}`); if (!disposed) setViewRun(run); }
+      catch (error) { if (!disposed) setPollError(error instanceof Error ? error.message : "Could not load run results"); }
+      finally { busy = false; }
+    };
+    void poll();
+    const timer = setInterval(poll, 2000);
+    return () => { disposed = true; clearInterval(timer); };
+  }, [selectedRunId]);
 
-    const job = jobs.find(j => j.id === jobId);
-    if (!job) return false;
-
-    setRunningJobId(jobId);
-    setStopRequested(false);
-    stopRequestedRef.current = false;
-    let configuration: QaConfiguration;
+  const runJob = async (jobId: string, _sequential = false, sku?: string, all = false) => {
+    const key = `${jobId}:${sku || (all ? "all" : "unfinished")}`;
+    const requestId = pendingRequests.current.get(key) || crypto.randomUUID();
+    pendingRequests.current.set(key, requestId);
+    setSubmitting(true);
     try {
-      configuration = await fetchQaConfiguration();
-    } catch (error: any) {
-      setRunningJobId(null);
-      addNotification({ type: "error", title: "Cannot Start QA", message: error.message });
+      const run = await request<Run>(`/api/jobs/${encodeURIComponent(jobId)}/runs`, { requestId, mode: sku ? "single" : all ? "all" : "unfinished", ...(sku ? { sku } : {}) });
+      pendingRequests.current.delete(key);
+      setHistories(previous => ({ ...previous, [jobId]: [run, ...(previous[jobId] || []).filter(item => item.id !== run.id)] }));
+      if (active(run)) setActiveRuns(previous => [...previous.filter(item => item.id !== run.id), run]);
+      if (selectedJobToView?.id === jobId) setSelectedRunId(run.id);
+      addNotification({ type: "success", title: "Job Queued", message: "Execution continues on the server after you close this tab." });
+      await refreshData();
       return true;
-    }
-    if (stopRequestedRef.current) {
-      setRunningJobId(null);
-      return true;
-    }
-    await updateJob(jobId, { status: "running", error: null });
-    
-    const allSkusInJob = job.skus.map((id) => skuDataList.find((sku) => sku.sku === id)).filter(Boolean) as typeof skuDataList;
-    const skusToProcess = selectJobSkus(allSkusInJob, skuId, rerunAll);
-    const processedSkuIds = new Set<string>();
-    
-    if (skusToProcess.length === 0) {
-      await updateJob(jobId, { status: "completed", error: null });
-      addNotification({
-        type: "info",
-        title: "Job Already Completed",
-        message: "All SKUs in this job are already completed."
-      });
-      setRunningJobId(null);
-      setStopRequested(false);
-      stopRequestedRef.current = false;
+    } catch (error) {
+      addNotification({ type: "error", title: "Could Not Start Job", message: error instanceof Error ? error.message : "Request failed. Retry to check the same request." });
       return false;
-    }
-    
-    let currentIndex = 0;
-    let hasError = false;
-    let totalJobTokens = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-    const jobStartTime = Date.now();
-    
-    const maxConcurrency = settings.maxConcurrency || 1;
-    const maxRetries = Math.max(settings.maxRetries || 0, 0);
-
-    const processNext = async (): Promise<void> => {
-      while (true) {
-        if (stopRequestedRef.current) break;
-        
-        let indexToProcess: number;
-        // lock-like index increment
-        indexToProcess = currentIndex++;
-        if (indexToProcess >= skusToProcess.length) break;
-
-        const skuItem = skusToProcess[indexToProcess];
-        const skuStartTime = Date.now();
-        
-        setProgress(prev => ({
-          current: Math.min(currentIndex, skusToProcess.length),
-          total: skusToProcess.length,
-          currentSku: skuItem.sku,
-          action: "Processing..."
-        }));
-        
-        await updateSku(skuItem.sku, { status: "running", error: null });
-        
-        let qaInput: ReturnType<typeof prepareQaInput>;
-        try {
-          let scrapedMarkdown = skuItem.scraped_markdown;
-          if (skuItem.source.url && skuItem.scrape_status !== "success" && skuItem.scrape_status !== "failed") {
-            try {
-              scrapedMarkdown = await scrapeUrl(skuItem.source.url);
-              await updateSku(skuItem.sku, { scraped_markdown: scrapedMarkdown, scrape_status: "success" });
-            } catch (error) {
-              await updateSku(skuItem.sku, { scrape_status: "failed", error: error instanceof Error ? error.message : "Scraping failed" });
-            }
-          }
-          if (stopRequestedRef.current) {
-            await updateSku(skuItem.sku, { status: "ready" });
-            break;
-          }
-          qaInput = prepareQaInput(
-            { ...skuItem, scraped_markdown: scrapedMarkdown }, configuration.attributeSets,
-            configuration.qaAgentMemory, settings.maxPageContentLength,
-          );
-        } catch (err: any) {
-          hasError = true;
-          processedSkuIds.add(skuItem.sku);
-          await updateSku(skuItem.sku, {
-            status: "failed", error: String(err.message || err),
-            timeTaken: (skuItem.timeTaken || 0) + Date.now() - skuStartTime,
-          });
-          continue;
-        }
-
-        // Keep the same memory, rules, and evidence for every attempt for this SKU.
-        const requestBody = JSON.stringify(buildQaRequest(settings, qaInput));
-        let attempts = 0;
-        let success = false;
-
-        while (attempts <= maxRetries && !success && !stopRequestedRef.current) {
-          attempts++;
-          try {
-            const res = await fetch("/api/chat", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: requestBody,
-            });
-            if (!res.ok) {
-              throw new Error(`LLM API returned error (${res.status}): ${parseApiErrorMessage(res.status, await res.text())}`);
-            }
-            const data = await res.json();
-            const tokensUsed = data?.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-            let qaResult: ReturnType<typeof parseQaResponse>;
-            try {
-              qaResult = parseQaResponse(data, qaInput);
-            } catch (error: any) {
-              throw new Error(`LLM returned invalid QA output: ${error.message}`);
-            }
-
-            const skuTimeTaken = Date.now() - skuStartTime;
-            
-            const exportData = {
-              qa_status: qaResult.qa_status || "completed",
-              summary: qaResult.summary || "",
-              confidence: qaResult.confidence || "medium",
-              issue_count: qaResult.issue_count || (qaResult.issues ? qaResult.issues.length : 0),
-              issues: qaResult.issues || [],
-              errors: (qaResult.issues || []).map((issue: any) => `${issue.field || 'general'} : ${issue.uploaded_value || ''} : ${issue.explanation}`),
-              cell_colors: (qaResult.issues || []).reduce((acc: Record<string, string>, issue: any) => {
-                if (issue.field) {
-                  acc[issue.field] = issue.cell_color || "yellow";
-                }
-                return acc;
-              }, {}),
-              last_job_id: job.id,
-              updated_at: new Date().toISOString()
-            };
-
-            await updateSku(skuItem.sku, {
-              status: qaResult.qa_status === "fail" ? "failed" : "completed", 
-              raw_row: { ...skuItem.raw_row, qa_result: qaResult },
-              qa_result: qaResult,
-              export_data: exportData,
-              last_job_id: job.id,
-              tokensUsed,
-              timeTaken: (skuItem.timeTaken || 0) + skuTimeTaken,
-              error: null
-            });
-            processedSkuIds.add(skuItem.sku);
-            
-            totalJobTokens.prompt_tokens += tokensUsed.prompt_tokens || 0;
-            totalJobTokens.completion_tokens += tokensUsed.completion_tokens || 0;
-            totalJobTokens.total_tokens += tokensUsed.total_tokens || 0;
-
-            success = true;
-          } catch (err: any) {
-            console.error(`Attempt ${attempts} failed for SKU:`, skuItem.sku, err);
-            const errMsg = String(err.message || err);
-            
-            const isFatalApiError = 
-              errMsg.includes("402") || 
-              errMsg.toLowerCase().includes("insufficient balance") || 
-              errMsg.toLowerCase().includes("payment required") ||
-              errMsg.toLowerCase().includes("insufficient_quota") ||
-              errMsg.includes("free-models-per-day") || 
-              errMsg.includes("Quota Exceeded") || 
-              errMsg.includes("Authentication error") ||
-              errMsg.includes("401") ||
-              errMsg.includes("403");
-
-            if (isFatalApiError) {
-               setStopRequested(true);
-               stopRequestedRef.current = true;
-               addNotification({
-                 type: "error",
-                 title: "LLM API Fatal Error",
-                 message: `Job stopped due to API error: ${errMsg}. Please update your API key or account balance in LLM Settings.`
-               });
-               attempts = maxRetries + 1; // force break without retrying
-            }
-
-            if (attempts > maxRetries) {
-              const skuTimeTaken = Date.now() - skuStartTime;
-              await updateSku(skuItem.sku, {
-                status: "failed",
-                timeTaken: (skuItem.timeTaken || 0) + skuTimeTaken,
-                error: errMsg
-              });
-              processedSkuIds.add(skuItem.sku);
-              hasError = true;
-            } else {
-              // Wait briefly before retrying, exponential backoff
-              let waitTime = 2000;
-              if (errMsg.includes("500") || errMsg.includes("529") || errMsg.includes("429") || errMsg.includes("Rate limit exceeded") || errMsg.includes("Concurrency")) {
-                 waitTime = attempts * 5000 + Math.random() * 2000;
-              }
-              await new Promise(r => setTimeout(r, waitTime));
-            }
-          }
-        }
-      }
-    };
-    
-    // Launch workers with staggered start delays to prevent API burst limits
-    const workers = Array.from({ length: Math.min(maxConcurrency, skusToProcess.length) }, (_, i) => {
-      return (async () => {
-        if (i > 0) await new Promise(r => setTimeout(r, i * 400));
-        await processNext();
-      })();
-    });
-    await Promise.all(workers);
-    
-    const finalTokens = {
-      prompt_tokens: (job.tokensUsed?.prompt_tokens || 0) + totalJobTokens.prompt_tokens,
-      completion_tokens: (job.tokensUsed?.completion_tokens || 0) + totalJobTokens.completion_tokens,
-      total_tokens: (job.tokensUsed?.total_tokens || 0) + totalJobTokens.total_tokens,
-    };
-    
-    const jobTimeTaken = Date.now() - jobStartTime;
-
-    const wasStopped = stopRequestedRef.current;
-    const finalStatus = getJobRunStatus(allSkusInJob, processedSkuIds, hasError);
-    const finalError = finalStatus === "completed"
-      ? null
-      : finalStatus === "pending"
-        ? wasStopped
-          ? "Job stopped before all SKUs finished."
-          : "Some SKUs are still waiting to run."
-        : hasError
-          ? "Some SKUs failed to process."
-          : "Some SKUs still need attention.";
-
-    await updateJob(jobId, {
-      status: finalStatus,
-      tokensUsed: finalTokens,
-      timeTaken: (job.timeTaken || 0) + jobTimeTaken,
-      error: finalError
-    });
-    setRunningJobId(null);
-    setStopRequested(false);
-    stopRequestedRef.current = false;
-    
-    addNotification({
-      type: finalStatus === "completed" ? "success" : "warning",
-      title: "Job Execution Finished",
-      message: `Job ${job.name} ${finalStatus === "completed" ? "finished successfully" : finalStatus === "pending" ? wasStopped ? "was paused" : "still has SKUs to process" : "finished with some errors"}.`
-    });
-    return wasStopped;
+    } finally { setSubmitting(false); }
+  };
+  const runSelectedJobs = async () => {
+    for (const id of selectedJobs) if (!activeRuns.some(run => run.jobId === id) && !await runJob(id, true)) break;
+  };
+  const stopRun = async (run: Run) => {
+    try {
+      const updated = await request<Run>(`/api/job-runs/${run.id}/cancel`, {});
+      setActiveRuns(previous => previous.map(item => item.id === updated.id ? updated : item));
+    } catch (error) { addNotification({ type: "error", title: "Could Not Stop Job", message: error instanceof Error ? error.message : "Request failed" }); }
+  };
+  const deleteJob = async (job: Job) => {
+    try {
+      if (!await removeJob(job.id)) return;
+      setSelectedJobs(previous => new Set([...previous].filter(id => id !== job.id)));
+      addNotification({ type: "info", title: "Job Removed", message: `Job "${job.name}" has been deleted.` });
+    } catch (error) { addNotification({ type: "error", title: "Could Not Delete Job", message: error instanceof Error ? error.message : "Request failed" }); }
+  };
+  const loadJobSkus = async (job: Job, runId?: string) => {
+    const history = await request<Run[]>(`/api/jobs/${encodeURIComponent(job.id)}/runs`);
+    const id = runId || history[0]?.id;
+    if (id) return runSkus(await request<Run>(`/api/job-runs/${id}`));
+    const skus = job.skus.map(id => skuDataList.find(sku => sku.sku === id));
+    if (skus.some(sku => !sku)) throw new Error("Some legacy job SKUs no longer exist in the catalog.");
+    return skus as SkuData[];
   };
 
   const exportJobExcel = async (jobOrJobs: Job | Job[], issuesOnly: boolean = false) => {
@@ -342,21 +133,9 @@ export function JobsModule() {
         return;
       }
 
-      const skuIds = Array.isArray(jobOrJobs)
-        ? getCompletedJobSkuIds(jobsToExport)
-        : [...new Set(jobOrJobs.skus)];
-      const skuMap = new Map(skuDataList.map((sku) => [sku.sku, sku]));
-      const missingSkuIds = skuIds.filter((sku) => !skuMap.has(sku));
-      if (missingSkuIds.length > 0) {
-        addNotification({
-          type: "error",
-          title: "Export Failed",
-          message: `${missingSkuIds.length} SKU(s) no longer exist in the catalog: ${missingSkuIds.slice(0, 5).join(", ")}.`
-        });
-        return;
-      }
-
-      const allJobSkus = skuIds.map((sku) => skuMap.get(sku)!);
+      const snapshots = await Promise.all(jobsToExport.map(job => loadJobSkus(job,
+        !Array.isArray(jobOrJobs) && selectedJobToView?.id === job.id ? selectedRunId : undefined)));
+      const allJobSkus = [...new Map(snapshots.flat().map(sku => [sku.sku, sku])).values()];
       const attributeSet = getCommonAttributeSet(allJobSkus);
       if (!attributeSet) {
         addNotification({
@@ -416,7 +195,7 @@ export function JobsModule() {
       addNotification({
         type: "error",
         title: "Export Failed",
-        message: "Failed to generate Excel file for job."
+        message: e instanceof Error ? e.message : "Failed to generate Excel file for job."
       });
     }
   };
@@ -435,6 +214,7 @@ export function JobsModule() {
   };
 
   const getJobSkusList = (job: Job) => {
+    if (selectedJobToView?.id === job.id && selectedRunId) return viewRun?.id === selectedRunId ? runSkus(viewRun) : [];
     return job.skus.map(s => skuDataList.find(item => item.sku === s)).filter(Boolean) as typeof skuDataList;
   };
 
@@ -452,42 +232,24 @@ export function JobsModule() {
       <div className="flex-1 overflow-y-auto p-10">
         <div className="max-w-6xl mx-auto space-y-8">
           
-          {runningJobId && (
-            <div className="bg-[#F5F2EF] border border-[#E5E2DE] rounded-sm p-4 flex flex-col gap-3">
+          {pollError && <p role="alert" className="text-sm text-red-700">{pollError}. Progress will retry automatically.</p>}
+          {activeRuns.map(run => {
+            const items = (run.items || []).filter(item => item.status !== "skipped");
+            const completed = items.filter(item => ["completed", "failed", "cancelled"].includes(item.status)).length;
+            const canStop = user?.role === "admin" || user?.id === run.actorId;
+            return <div key={run.id} className="bg-[#F5F2EF] border border-[#E5E2DE] rounded-sm p-4 space-y-3">
               <div className="flex items-center justify-between">
-                <div>
-                  <h4 className="font-serif text-lg text-[#1A1A1A]">Running Job: {jobs.find(j => j.id === runningJobId)?.name}</h4>
-                  <p className="text-[11px] text-[#8C8882] uppercase tracking-widest mt-1">
-                    Processing {progress.current} of {progress.total}
-                  </p>
-                </div>
-                <button
-                  onClick={() => {
-                    setStopRequested(true);
-                    stopRequestedRef.current = true;
-                  }}
-                  disabled={stopRequested}
-                  className="flex items-center gap-2 px-4 py-2 text-[10px] uppercase font-bold text-red-600 border border-red-200 hover:bg-red-50 transition-colors rounded-sm bg-white disabled:opacity-50"
-                >
-                  <StopCircle className="w-3.5 h-3.5" />
-                  {stopRequested ? "Stopping after current..." : "Stop After Current SKU"}
-                </button>
+                <div><h4 className="font-serif text-lg">{jobs.find(job => job.id === run.jobId)?.name} — {run.status}</h4>
+                  <p className="text-xs text-[#8C8882]">{completed} of {items.length} processed · Started by {run.actorName}</p></div>
+                {canStop && <button onClick={() => stopRun(run)} disabled={run.status === "cancelling"}
+                  className="flex items-center gap-2 px-4 py-2 text-xs text-red-700 border border-red-200 rounded-sm disabled:opacity-50">
+                  <StopCircle className="w-4 h-4" />{run.status === "cancelling" ? "Cancelling…" : "Cancel Run"}
+                </button>}
               </div>
-              
-              <div>
-                <div className="flex justify-between text-[11px] text-[#1A1A1A] mb-1.5 font-mono">
-                  <span>{progress.currentSku}</span>
-                  <span className="text-[#8C8882]">{progress.action}</span>
-                </div>
-                <div className="h-1.5 w-full bg-[#E5E2DE] rounded-full overflow-hidden">
-                  <div 
-                    className="h-full bg-[#1A1A1A] transition-all duration-300"
-                    style={{ width: `${(progress.current / progress.total) * 100}%` }}
-                  ></div>
-                </div>
-              </div>
-            </div>
-          )}
+              <p className="text-xs font-mono">{items.find(item => item.status === "running")?.sku || "Waiting for the server worker"}</p>
+              <progress aria-label="Job progress" value={completed} max={Math.max(1, items.length)} className="w-full h-2" />
+            </div>;
+          })}
 
           <div className="flex items-center justify-between border-b border-[#E5E2DE] pb-4">
             <div className="flex items-center gap-4">
@@ -517,7 +279,7 @@ export function JobsModule() {
                 </button>
                 <button
                   onClick={runSelectedJobs}
-                  disabled={!!runningJobId}
+                  disabled={submitting}
                   className="flex items-center gap-2 px-4 py-2 text-[11px] uppercase tracking-widest border border-[#1A1A1A] bg-[#1A1A1A] text-white hover:bg-black transition-colors rounded-sm disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <Play className="w-3.5 h-3.5" />
@@ -547,6 +309,7 @@ export function JobsModule() {
                     setSelectedJobs(newSet);
                   }}>
                     <input 
+                      aria-label={`Select job ${job.name}`}
                       type="checkbox" 
                       checked={selectedJobs.has(job.id)}
                       readOnly
@@ -592,7 +355,7 @@ export function JobsModule() {
 
                   <div className="flex items-center gap-2">
                     <button
-                      onClick={() => setSelectedJobToView(job)}
+                      onClick={() => { setSelectedJobToView(job); setSelectedRunId(histories[job.id]?.[0]?.id || ""); }}
                       className="flex items-center gap-1.5 px-3 py-2 text-[11px] uppercase font-bold text-[#1A1A1A] bg-[#F5F2EF] hover:bg-[#E5E2DE] transition-colors rounded-sm"
                       title="View job details"
                     >
@@ -625,7 +388,7 @@ export function JobsModule() {
                     {unresolvedCount > 0 && (
                       <button
                         onClick={() => runJob(job.id)}
-                        disabled={!!runningJobId}
+                        disabled={submitting || activeRuns.some(run => run.jobId === job.id)}
                         className="flex items-center gap-2 px-4 py-2 text-[11px] uppercase tracking-widest border border-[#1A1A1A] bg-[#1A1A1A] text-white hover:bg-black transition-colors rounded-sm disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <Play className="w-3.5 h-3.5" />
@@ -636,7 +399,7 @@ export function JobsModule() {
                     {completedCount > 0 && (
                       <button
                         onClick={() => runJob(job.id, false, undefined, true)}
-                        disabled={!!runningJobId}
+                        disabled={submitting || activeRuns.some(run => run.jobId === job.id)}
                         className="flex items-center gap-2 px-4 py-2 text-[11px] uppercase tracking-widest border border-[#1A1A1A] text-[#1A1A1A] bg-white hover:bg-[#F5F2EF] transition-colors rounded-sm disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <Play className="w-3.5 h-3.5" />
@@ -644,25 +407,12 @@ export function JobsModule() {
                       </button>
                     )}
 
-                    <button
-                      onClick={() => {
-                        setSelectedJobs((selected) => {
-                          const next = new Set(selected);
-                          next.delete(job.id);
-                          return next;
-                        });
-                        removeJob(job.id);
-                        addNotification({
-                          type: "info",
-                          title: "Job Removed",
-                          message: `Job "${job.name}" has been deleted.`
-                        });
-                      }}
-                      className="p-2 text-[#8C8882] hover:text-red-600 hover:bg-red-50 transition-colors rounded-sm"
-                      title="Delete Job"
-                    >
+                    {user?.role === "admin" && <button
+                      onClick={() => deleteJob(job)} disabled={activeRuns.some(run => run.jobId === job.id)}
+                      className="p-2 text-[#8C8882] hover:text-red-600 hover:bg-red-50 transition-colors rounded-sm disabled:opacity-50"
+                      title="Delete Job" aria-label={`Delete job ${job.name}`}>
                       <Trash2 className="w-4 h-4" />
-                    </button>
+                    </button>}
                   </div>
                 </div>
               );
@@ -721,6 +471,16 @@ export function JobsModule() {
 
             {/* Content Body */}
             <div className="flex-1 overflow-y-auto p-6 space-y-4">
+              {Boolean(histories[selectedJobToView.id]?.length) && <label className="block text-sm">
+                Run history
+                <select className="ml-3 border rounded p-2" value={selectedRunId} onChange={event => setSelectedRunId(event.target.value)}>
+                  {(histories[selectedJobToView.id] || []).map(run => <option key={run.id} value={run.id}>
+                    {new Date(run.createdAt).toLocaleString()} · {run.actorName} · {run.status}
+                  </option>)}
+                </select>
+              </label>}
+              {selectedRunId && !viewRun && <p>Loading saved run results…</p>}
+              {viewRun?.error && <p role="alert" className="text-red-700">{viewRun.error}</p>}
               <div className="text-xs text-[#8C8882] uppercase tracking-widest font-semibold mb-2">
                 QA Results per SKU
               </div>
@@ -770,7 +530,7 @@ export function JobsModule() {
                             event.stopPropagation();
                             runJob(selectedJobToView.id, false, sku.sku);
                           }}
-                          disabled={!!runningJobId}
+                          disabled={submitting || activeRuns.some(run => run.jobId === selectedJobToView.id)}
                           className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold text-[#1A1A1A] bg-[#F5F2EF] hover:bg-[#E5E2DE] transition-colors rounded-sm disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           <Play className="w-3 h-3" />

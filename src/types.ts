@@ -7,6 +7,7 @@ export interface AttributeSet {
 }
 
 export interface User {
+  id: string;
   username: string;
   role: 'admin' | 'user';
   loginTime: string;
@@ -15,10 +16,15 @@ export interface User {
 export interface UserAccount {
   id: string;
   username: string;
-  password?: string;
   role: 'admin' | 'user';
   createdAt: string;
   lastLogin?: string;
+}
+
+export interface UserAccountInput {
+  username: string;
+  password: string;
+  role: 'admin' | 'user';
 }
 
 export interface SiteSelectorRule {

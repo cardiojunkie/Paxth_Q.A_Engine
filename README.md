@@ -25,7 +25,7 @@ Back up the database and retain the previous source and image before deployment 
 3. **Attribute Sets:** save category names and Markdown mapping rules in PostgreSQL.
 4. **LLM Settings:** configure a provider, model, API key, execution settings, and shared QA agent memory.
 5. **Jobs:** run selected jobs, inspect results, rerun SKUs, and export detailed Excel feedback.
-6. **Users:** manage browser-local accounts. These accounts are not server-enforced authorization.
+6. **Users:** administrators manage shared server-authenticated accounts and roles.
 
 SAP text is supplied through uploads or the editor; there is no direct SAP/ERP integration. SAP is the primary factual source. Web evidence supports details absent from SAP, and conflicts must be reported. The model is instructed to avoid invented facts and supply complete replacement cell values when supported. Human review remains necessary: structural validation cannot prove every model conclusion correct.
 
@@ -33,9 +33,8 @@ SAP text is supplied through uploads or the editor; there is no direct SAP/ERP i
 
 ```mermaid
 flowchart LR
-    B[Browser: React UI and job runner] -->|JSON API| E[Express]
+    B[Browser: React UI and progress polling] -->|JSON API| E[Express API and durable worker]
     B -->|Import and export| X[Spreadsheet files]
-    B --> L[Browser localStorage]
     E --> D[(PostgreSQL via Drizzle)]
     E --> C[Python Crawl4AI agent → product page]
     E --> M[Configured LLM endpoint]
@@ -46,14 +45,14 @@ Express mounts Vite middleware in development. With `NODE_ENV=production`, it se
 | Data | Where it lives | Consequence |
 | --- | --- | --- |
 | Catalog rows, source text, scraped Markdown, latest QA results | PostgreSQL `sku_data` | Shared by clients using the same database |
-| Job membership, status, token/time totals | PostgreSQL `jobs` | Saved records persist, but execution is browser-driven |
+| Job membership, status, token/time totals | PostgreSQL `jobs` | Runs and per-SKU results persist in `job_runs`/`job_run_items`; execution survives tab closure |
 | Category rules and QA agent memory | `attribute_sets`, `qa_agent_settings` | Shared; a configuration snapshot is loaded at each run |
 | Domain selectors | PostgreSQL `site_selectors`, with a browser cache | Scraping uses server-loaded rules; a failed UI load can show stale cached rules |
-| Provider URL, API key, model, execution settings | Browser `localStorage` | Specific to the browser and origin, including port; the key is sent to the Express proxy for requests |
-| Login session and user accounts/passwords | Browser `localStorage` | Not synchronized accounts or an API security boundary; passwords are stored as plaintext |
-| Notifications and active run controls | React memory | Lost on reload; run controls also reset when the Jobs component unmounts |
+| Provider URL/API key; model/settings | Server environment; PostgreSQL `provider_settings` | Shared, admin-configured; secrets never reach browsers |
+| Accounts and sessions | PostgreSQL `users`/`sessions` | Scrypt password hashes, hashed session tokens, eight-hour HttpOnly cookies, server role enforcement |
+| Notifications; run controls | React memory; server run state | Notifications reset on reload; job controls reconnect by polling |
 
-The schema defines a `users` table, but the current login does not use it. The API has no application authentication middleware. For the documented public deployment, the Caddy authentication gateway is the access barrier; keep the backend bound to loopback through Compose.
+Every protected API checks the server session and permissions. Keep the Caddy authentication gateway and Compose loopback binding as additional barriers. Run `npm run admin:bootstrap` to create the first administrator (defaults: `Aswath` / `potusdown@2230`). Existing accounts are not overwritten. See [security setup and recovery](docs/security-and-jobs.md).
 
 ## Local setup
 
@@ -67,13 +66,7 @@ test -e .env || cp .env.example .env
 
 Edit `.env` and set `DATABASE_URL` to the intended database. Create that database with your PostgreSQL service first; Compose does not provision PostgreSQL. For Supabase, use the exact TLS-enabled connection URI from the project's Connect dialog. In an IPv4-only environment, use its Session pooler connection details rather than guessing the hostname or region.
 
-For a **new, empty application database**, review and apply the declared schema:
-
-```bash
-npm run db:push
-```
-
-Do not blindly run `db:push` on an existing/shared production database: inspect the proposed changes and take a backup. Startup initializes shared QA configuration, jobs, and selectors and attempts some schema alterations, but **does not create the base `sku_data` table**. There is no checked-in versioned migration history.
+Startup creates the application schema and verifies required constraints before serving requests or starting the worker. It stops on migration errors, including conflicting normalized selector domains. Before upgrading existing data, back up and test against a restored copy; do not run `db:push` blindly. Configure `APP_ORIGIN`, `LLM_BASE_URL`, and `LLM_API_KEY`, then create the first administrator with `npm run admin:bootstrap` using the environment variables described in [security setup](docs/security-and-jobs.md). Use a direct PostgreSQL connection or session pooler; the worker requires a session-scoped advisory lock.
 
 Install the pinned Crawl4AI dependencies and its browser before scraping:
 
@@ -122,31 +115,29 @@ The first worksheet and its first header row are used. There is no interactive c
 | Case-insensitive `attribute_set` or `attribute set` | Category name used to group a job and find its mapping rules |
 | Other columns, such as `name`, `base_code`, `note` | Retained in the original row and included in QA unless they are source/QA metadata |
 
-Keep identifiers such as SKUs and barcodes as text in spreadsheets to avoid numeric conversion. Rows without a usable SKU are skipped. Within a file, the first occurrence of a trimmed SKU is kept. The UI skips SKUs already in the loaded catalog; uploading a duplicate is not an edit operation. Category grouping currently requires identical, nonblank names, including case and spacing, even though rule lookup trims names and ignores case.
+Keep identifiers such as SKUs and barcodes as text in spreadsheets to avoid numeric conversion. Rows without a usable SKU are skipped. Within a file, the first occurrence of a trimmed SKU is kept. The server atomically skips SKUs already in the catalog; uploading a duplicate is not an edit operation. Category grouping currently requires identical, nonblank names, including case and spacing, even though rule lookup trims names and ignores case.
 
 ### Prepare evidence and create a job
 
-1. Configure and save **LLM Settings**. Scraping and QA both require a nonempty API key, base URL, and model, including when using a compatible local endpoint. The endpoint must be reachable from the application server.
+1. Configure the server provider URL/key, then sign in as an admin and save the model and instructions in **LLM Settings**. Users can operate QA; admins control shared settings and deletions.
 2. Add mapping rules in **Attribute Sets**, matching the spreadsheet category. Seeded category names initially have blank rules.
 3. Upload the spreadsheet and select SKUs. A URL makes a row initially `ready`, but job creation still requires SAP text or actual scraped/pasted content.
 4. Use **Scrape Selected** for URL evidence. Failed scrapes can enter the manual-content queue. **Edit SAP** is available when a SKU has no nonblank scraped content; saving it preserves the uploaded row and previous QA result.
 5. Create one job from SKUs sharing one nonblank attribute set. Open **Jobs** and run it.
 
-Every **Scrape URL**, **Scrape Selected**, and automatic job scrape uses a Crawl4AI browser agent with the saved QA endpoint, API key, and model. The agent inspects the supplied product page, loads lazy content, and opens product tabs/accordions for the current variant. It does not crawl the whole site, change variants, log in, submit forms, or solve CAPTCHAs. Blocked pages, unusable content, and failed runs keep the existing SAP/manual-content fallback; no scraper can guarantee success on every URL.
+Every **Scrape URL**, **Scrape Selected**, and automatic job scrape uses a Crawl4AI browser agent with the server provider credentials and saved model. The agent inspects the supplied product page, loads lazy content, and opens product tabs/accordions for the current variant. It does not crawl the whole site, change variants, log in, submit forms, or solve CAPTCHAs. Blocked pages, unusable content, and failed runs keep the existing SAP/manual-content fallback; no scraper can guarantee success on every URL.
 
 The most specific enabled matching domain rule still controls CSS extraction. Dynamic tabs need both control and panel selectors; their wait defaults to 300 ms and supports 0–10,000 ms. Configured tabs are captured separately from the agent's eight-decision limit. Selectors that match nothing fail visibly. Product evidence is converted from captured HTML into Markdown, preserving specification labels and tables; the LLM chooses browser actions instead of rewriting source facts. Saved content and subsequent QA/export behavior remain the same, including the existing 40,000-character default QA evidence limit and truncation warning.
 
 Express starts the Python SDK worker as a subprocess; its JSON stdin/stdout protocol is internal and exposes no additional service or port. Scrapes run one at a time, with a FIFO queue of up to eight waiting requests. A queued request waits at most 120 seconds; execution has a separate 120-second limit and at most eight agent decisions. Requests fail visibly when limits are reached, and worker/browser cleanup runs on completion, failure, or client disconnect. Each scrape makes LLM calls and incurs provider cost; those calls are separate from existing QA token totals.
 
-Keep the browser open and stay in the Jobs view until the run finishes. Selected jobs run sequentially, but **SKUs within a job use configurable concurrency**, defaulting to 2. “Stop After Current SKU” is cooperative; it does not abort an outstanding server request. Reloading/closing the page interrupts browser orchestration, and navigating between modules can lose run controls while work continues. There is no durable backend worker or cross-client job lock.
+Jobs execute on one PostgreSQL-owned server worker, one SKU at a time. Closing the tab or switching modules does not stop execution. Reopen Jobs to view progress, cancel your runs, and choose historical results. Cancellation aborts active requests and keeps committed results. After a restart, unfinished items resume within their original deadline and attempt budget; committed results are skipped. A provider call interrupted before its result was saved can be billed again. Editing evidence increments its revision, preventing older runs from overwriting the new catalog evidence.
 
 ### QA settings and results
 
-The current defaults are 3 client retries, 4,096 output tokens, temperature 0.1, and 40,000 characters of web evidence. The chat proxy has its own retry logic, so provider attempts can exceed the client retry setting. Set a model/base URL your provider supports; the shipped default is not an availability guarantee.
+Defaults are 4,096 output tokens, temperature 0.1, and 40,000 evidence characters. QA allows at most three server-owned attempts for transient failures within a five-minute per-SKU deadline; permanent errors fail immediately. Provider admission is shared across QA, scraping and admin tests: two active calls, eight waiting. Response bodies remain subject to deadlines and a 4 MiB limit. Scrape-agent decisions have their existing separate limit of eight calls.
 
-AICredits uses `https://api.aicredits.in/v1`; saved website-host URLs are migrated to this API hostname without changing the selected model or execution settings. **Test API** runs a small sample QA task with the editor's model, temperature, output-token limit, and QA memory. It reports success only after validating the QA response. Empty answers and exhausted output budgets fail visibly, including reasoning-token usage when the provider supplies it. Save Changes applies the tested settings to jobs.
-
-All requests use the OpenAI-compatible chat-completions format. The Provider Format dropdown currently also lists Anthropic and Gemini, but selecting them does not implement their native API protocols. Use a compatible endpoint; the dropdown does not change the request format.
+**Test saved settings** performs and validates a sample QA task on the server. Save first; this action uses the shared provider key and incurs provider cost. Only OpenAI-compatible chat completions are supported.
 
 Each run fetches shared memory and category rules before processing. Unavailable shared configuration prevents the run from starting. Missing, blank, or ambiguous rules produce a general review with a warning; truncated web content also produces a warning. A SKU with no usable SAP or web evidence fails. The same prepared evidence is retained through that SKU's retries.
 
@@ -185,25 +176,25 @@ values only where evidence or a formatting rule supports the correction;
 otherwise explain what must be verified and leave the correction blank.
 ```
 
-**QA Agent Memory** supplies shared standing instructions. Category rules take precedence for category-specific checks; the application's output/evidence requirements take precedence over both. “Restore Default Memory” changes the editor until saved. Blank saved memory uses the default. Changes affect new runs/reruns, not an already running configuration snapshot or existing results. “Import browser rules” imports only missing/blank shared rules without overwriting nonblank ones. Previous browser memory can be loaded into the editor for review before saving.
+**QA Agent Memory** supplies shared standing instructions. Category rules take precedence for category-specific checks; the application's output/evidence requirements take precedence over both. Blank saved memory uses the default. Changes affect new runs/reruns, not an already running configuration snapshot or existing results. “Import browser rules” imports only missing/blank shared rules without overwriting nonblank ones. Legacy browser account/session/provider-key caches are discarded; reconfigure the server explicitly.
 
 ## API and developer checks
 
-All routes below are registered in [server.ts](server.ts) or [shared QA configuration routes](src/db/qaConfiguration.ts). They have no application authentication; public deployment requires the gateway.
+Routes are registered in [server.ts](server.ts) and its server modules. APIs require an eight-hour server session; mutations additionally require the configured same origin. Admin-only operations include users, configuration, chat testing, and deletions. `GET /healthz` exposes only readiness without authentication.
 
 | Routes | Methods | Purpose |
 | --- | --- | --- |
-| `/api/db-status` | GET | Database connectivity (`SELECT 1`), not complete schema readiness |
-| `/api/catalog`, `/api/catalog/:sku` | GET/POST/DELETE collection; PUT item | Load/upsert/delete catalog data; update one SKU |
-| `/api/jobs`, `/api/jobs/:id` | GET/POST/DELETE collection; PUT/DELETE item | Persist job records; does not run a server-side queue |
+| `/api/db-status` | GET | Authenticated database schema readiness |
+| `/api/catalog`, `/api/catalog/:sku` | GET/POST/DELETE collection; PUT item | Load/import/delete catalog data; edit one SKU |
+| `/api/jobs`, `/api/jobs/:id` | GET/POST/DELETE collection; PUT/DELETE item | Persist job definitions; runs use `/api/jobs/:id/runs` |
 | `/api/qa-configuration` | GET | Shared memory and attribute sets in one snapshot |
 | `/api/qa-agent-memory` | PUT | Save shared memory |
 | `/api/attribute-sets`, `/api/attribute-sets/:id`, `/api/attribute-sets/import` | POST collection/import; PUT/DELETE item | Maintain shared category rules |
 | `/api/site-selectors`, `/api/site-selectors/:id` | GET/POST collection; PUT/DELETE item | Maintain extraction rules |
-| `/api/scrape` | POST | `{ url, llm: { baseUrl, apiKey, modelName } }` → `{ markdown }`; failures use `{ error, details }` |
-| `/api/chat` | POST | Proxy `{ baseUrl, apiKey, payload }` to chat completions |
+| `/api/scrape` | POST | `{ url }` → `{ markdown }`; failures use `{ error, details }` |
+| `/api/chat` | POST | Admin test of saved settings; accepts `{}` |
 
-Run the checks that do not require a browser or database:
+Run `npm test` for the complete fast suite, including provider limits. Run `TEST_DATABASE_URL=... npm run test:security-db` against a disposable PostgreSQL instance for auth, transactions, recovery, cancellation, and failure injection. Other focused checks:
 
 ```bash
 npm run lint
@@ -231,7 +222,7 @@ CRAWL4AI_PYTHON="$PWD/.venv/bin/python" npm run test:crawl-worker
 npm run test:qa-config-db
 ```
 
-The Crawl4AI checks passed locally with Python 3.11, Crawl4AI 0.9.3, and Playwright 1.58 (the workspace runs Debian 11). Checks covered real browser fixtures, all three UI entry points, process cleanup, and a production API scrape of a public page using a mocked LLM response. Deployment additionally requires the Docker browser and worker smoke checks below. A live LLM-provider run requires the user's saved provider settings.
+The Crawl4AI checks passed locally with Python 3.11, Crawl4AI 0.9.3, and Playwright 1.58 (the workspace runs Debian 11). Checks covered real browser fixtures, all three UI entry points, process cleanup, and a production API scrape of a public page using a mocked LLM response. Deployment additionally requires the Docker browser and worker smoke checks below. A live LLM-provider run uses the server credentials and shared model settings.
 
 The database test creates and drops an isolated schema. Never point it at the shared production database. The SAP editor browser test mocks API traffic; it does not prove real database persistence. Check the [analysis validation record](docs/codebase-analysis.md#validation-record) for what was actually run.
 
@@ -261,7 +252,7 @@ Inspect Project 22's existing listener using its dedicated socket:
 tailscale --socket=/run/tailscale-project22/tailscaled.sock funnel status
 ```
 
-Do not rerun gateway setup for an ordinary code update. Before deploying, wait for active browser-driven jobs to finish, confirm the tested source commit, retain the previous source and image, and make a database backup using the database provider or PostgreSQL tools. Store it outside the source directory and verify it can be restored. Startup executes DDL, so a successful code build is not a database migration check. Build and smoke-test the release image before changing the running container.
+Do not rerun gateway setup for an ordinary code update. Before deploying, wait for active jobs to finish or cancel them, confirm the tested source commit, retain the previous source and image, and make a database backup using the database provider or PostgreSQL tools. Store it outside the source directory and verify it can be restored. Startup executes DDL, so a successful code build is not a database migration check. Build and smoke-test the release image before changing the running container.
 
 For an existing deployment, retain the current image before the update commands near the top of this document:
 
@@ -274,11 +265,11 @@ After rebuilding, verify:
 ```bash
 docker compose ps
 docker compose logs --tail=50 app
-curl -fsS http://127.0.0.1:3200/api/db-status
+curl -fsS http://127.0.0.1:3200/healthz
 tailscale --socket=/run/tailscale-project22/tailscaled.sock funnel status
 ```
 
-Also load the catalog and shared configuration, since database connectivity alone does not prove schema readiness. From outside the tailnet, check that missing/wrong gateway credentials return `401` for the page, an asset, and an API route. With valid credentials, run `scripts/verify-public-access.mjs` against the Project 22 URL and verify login, SAP editing, a sample scrape, and persistence after a controlled app restart. Confirm Rakazo's container IDs and start times are unchanged and ports 3200/8082 remain loopback-only.
+Also load the catalog and shared configuration, since application behavior must also be checked. From outside the tailnet, check that missing/wrong gateway credentials return `401` for the page, an asset, and an API route. With valid gateway and application credentials, run `scripts/verify-public-access.mjs` against the Project 22 URL and verify login, SAP editing, a sample scrape, and persistence after a controlled app restart. Confirm Rakazo's container IDs and start times are unchanged and ports 3200/8082 remain loopback-only.
 
 ### Rollback and private access
 
@@ -314,13 +305,13 @@ The earlier deployment notes name `/opt/paxth-qa/backups/Caddyfile.before` as a 
 | Symptom | Check |
 | --- | --- |
 | GitHub has new code but the public URL looks unchanged | Update/rebuild on the VPS; restarting the old container is insufficient. Refresh the browser after deployment. |
-| “Database connected” but the catalog fails | `/api/db-status` only runs `SELECT 1`; inspect schema initialization logs and verify the base schema exists. |
-| Settings/rules will not save | Shared configuration requires PostgreSQL. Settings save also persists shared memory before local provider settings. |
+| Startup fails or readiness is unavailable | Inspect migration errors; resolve conflicting data on a restored copy before production. |
+| Settings/rules will not save | Sign in as an administrator and check PostgreSQL availability. Model settings and memory save atomically. |
 | Scrape fails or shows a challenge | Test the URL/selectors in Scraper; use SAP or manually supplied product content when needed. Check browser installation and container logs. |
-| Reload loses a running job's controls | Execution lives in the browser. Inspect saved SKU results before resuming; avoid running the same job in multiple tabs. |
-| An upload appears to do nothing | Empty/malformed/no-SKU upload errors are not currently rendered; inspect the browser console and input headers. |
+| Job remains queued | Check server worker logs, provider configuration, and database availability. Reloading the browser does not interrupt execution. |
+| An upload fails | Read the visible error. No rows from a failed batch are committed; retry after correcting the problem. |
 | A save/delete looks successful but returns after reload | Several mutation paths ignore failed HTTP responses. Reload to verify persistence; see findings F03/F04 in the analysis. |
 | Combined export is rejected | Use one identical category name and compatible original header order across all included SKUs. |
-| LLM settings disappear at a different URL | Provider settings and keys belong to that browser origin, including its port. |
+| Login fails after upgrade | Browser-local accounts are retired. Bootstrap a server administrator and recreate accounts. |
 
 The analysis also identifies vulnerable dependencies, unbounded server work, and missing URL restrictions. Treat these as concrete follow-up work before expanding access. This documentation change does not fix them or certify the live deployment.
