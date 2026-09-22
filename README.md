@@ -144,6 +144,8 @@ Keep the browser open and stay in the Jobs view until the run finishes. Selected
 
 The current defaults are 3 client retries, 4,096 output tokens, temperature 0.1, and 40,000 characters of web evidence. The chat proxy has its own retry logic, so provider attempts can exceed the client retry setting. Set a model/base URL your provider supports; the shipped default is not an availability guarantee.
 
+AICredits uses `https://api.aicredits.in/v1`; saved website-host URLs are migrated to this API hostname without changing the selected model or execution settings. **Test API** runs a small sample QA task with the editor's model, temperature, output-token limit, and QA memory. It reports success only after validating the QA response. Empty answers and exhausted output budgets fail visibly, including reasoning-token usage when the provider supplies it. Save Changes applies the tested settings to jobs.
+
 All requests use the OpenAI-compatible chat-completions format. The Provider Format dropdown currently also lists Anthropic and Gemini, but selecting them does not implement their native API protocols. Use a compatible endpoint; the dropdown does not change the request format.
 
 Each run fetches shared memory and category rules before processing. Unavailable shared configuration prevents the run from starting. Missing, blank, or ambiguous rules produce a general review with a warning; truncated web content also produces a warning. A SKU with no usable SAP or web evidence fails. The same prepared evidence is retained through that SKU's retries.

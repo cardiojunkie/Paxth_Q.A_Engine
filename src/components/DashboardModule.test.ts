@@ -35,6 +35,8 @@ let holdScrape = false;
 let releaseScrape!: () => void;
 const scrapeGate = new Promise<void>(resolve => { releaseScrape = resolve; });
 let scrapeRequests = 0;
+const chatRequests: any[] = [];
+let sampleResponse: any;
 const jobs = [{ id: "scrape-check", name: "Scrape integration", status: "pending", skus: ["present-pending"], created_at: new Date().toISOString(), attribute_set: "TV" }];
 
 process.env.CLOAKBROWSER_AUTO_UPDATE = "false";
@@ -51,7 +53,8 @@ try {
       username: "SAP browser check", role: "user", loginTime: new Date().toISOString(),
     }));
     localStorage.setItem("qa-analyzer-settings", JSON.stringify({
-      baseUrl: "https://llm.example/v1", apiKey: "test-only", modelName: "test-model",
+      baseUrl: "https://aicredits.in/v1", apiKey: "test-only", modelName: "test-model",
+      temperature: 0.3, maxTokens: 10000, maxConcurrency: 3, maxRetries: 2,
     }));
   });
   await page.route("**/api/**", async route => {
@@ -61,7 +64,7 @@ try {
       scrapeRequests++;
       assert.ok(holdScrape, "Editing source data must not trigger a scrape");
       assert.deepEqual(request.postDataJSON().llm, {
-        baseUrl: "https://llm.example/v1", apiKey: "test-only", modelName: "test-model",
+        baseUrl: "https://api.aicredits.in/v1", apiKey: "test-only", modelName: "test-model",
       });
       await scrapeGate;
       return route.fulfill({ json: { markdown: "Automatically scraped content" } });
@@ -84,6 +87,10 @@ try {
     if (path === "/api/site-selectors") return route.fulfill({ json: [] });
     if (path === "/api/qa-configuration") return route.fulfill({ json: { qaAgentMemory: "Use supplied evidence.", attributeSets: [] } });
     if (path === "/api/chat") {
+      chatRequests.push(request.postDataJSON());
+      if (JSON.parse(request.postDataJSON().payload.messages[1].content).sku === "qa-connection-test") {
+        return route.fulfill({ json: sampleResponse });
+      }
       assert.equal(JSON.parse(request.postDataJSON().payload.messages[1].content).scraped_markdown, "Automatically scraped content");
       return route.fulfill({ json: { choices: [{ message: { content: JSON.stringify({
         qa_status: "pass", confidence: "high", summary: "Evidence checked", issue_count: 0, issues: [],
@@ -328,7 +335,39 @@ try {
   await qaSaved;
   assert.equal(scrapeRequests, 3, "Dashboard, Scraper, and Jobs all send the saved LLM configuration");
   assert.equal(catalog[7].scrape_status, "success");
+  await page.getByRole("button", { name: "LLM Settings", exact: true }).click();
+  assert.equal(await page.getByPlaceholder("https://api.aicredits.in/v1").inputValue(), "https://api.aicredits.in/v1");
+  const sampleQa = {
+    qa_status: "pass", confidence: "high", summary: "Brand matches SAP", issue_count: 0, issues: [],
+    source_notes: { sap_used: true, url_used: false, source_conflicts: [] },
+  };
+  for (const [content, finish_reason, expected] of [
+    [null, "stop", "LLM returned no answer"],
+    [null, "length", "output token budget"],
+    ['{"message":"hello"}', "stop", "invalid QA result structure"],
+    [JSON.stringify(sampleQa), "stop", "The model returned a valid sample QA report"],
+  ]) {
+    sampleResponse = { choices: [{ message: { content, reasoning_content: "Reasoning is not an answer" }, finish_reason }] };
+    await page.getByRole("button", { name: "Test API", exact: true }).click();
+    await page.locator("button").filter({ has: page.locator("svg.lucide-bell") }).click();
+    await page.getByText(expected, { exact: false }).waitFor();
+    const success = finish_reason === "stop" && content === JSON.stringify(sampleQa);
+    assert.equal(await page.getByText("API Connection Successful", { exact: true }).count(), success ? 1 : 0);
+    await page.getByTitle("Clear all", { exact: true }).click();
+    await page.locator("button").filter({ has: page.locator("svg.lucide-bell") }).click();
+  }
+  const { messages: jobMessages, ...jobParameters } = chatRequests[0].payload;
+  for (const sample of chatRequests.slice(1)) {
+    const { messages, ...parameters } = sample.payload;
+    assert.deepEqual(parameters, jobParameters, "API tests and jobs use the same configured generation parameters");
+    assert.equal(sample.baseUrl, chatRequests[0].baseUrl);
+    assert.equal(sample.apiKey, chatRequests[0].apiKey);
+    assert.match(messages[0].content, /APPLICATION REQUIREMENTS/);
+    assert.equal(JSON.parse(messages[1].content).source_sap, "Brand: TestBrand");
+  }
+  assert.equal(chatRequests.length, 5);
   console.log("SAP editor and all three scrape entry points passed browser assertions.");
+  console.log("Settings and Jobs request parity and API-test response validation passed browser assertions.");
 } finally {
   releaseSave();
   releaseScrape();

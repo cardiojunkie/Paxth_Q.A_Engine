@@ -4,7 +4,7 @@ import { scrapeUrl } from "./scrapeRequest";
 const originalFetch = globalThis.fetch;
 const originalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 let saved: string | null = JSON.stringify({
-  baseUrl: "https://api.aicredits.in/v1",
+  baseUrl: "https://aicredits.in/v1",
   apiKey: "test-only-secret",
   modelName: "test-model",
 });
@@ -26,7 +26,7 @@ try {
   assert.deepEqual(requests[0], {
     path: "/api/scrape",
     body: { url: "https://example.com/product", llm: {
-      baseUrl: "https://aicredits.in/v1", apiKey: "test-only-secret", modelName: "test-model",
+      baseUrl: "https://api.aicredits.in/v1", apiKey: "test-only-secret", modelName: "test-model",
     } },
   });
   saved = JSON.stringify({ baseUrl: "https://other.example/v1", apiKey: "changed-key", modelName: "changed-model" });

@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from "react";
-import { useSettings, AppSettings } from "../hooks/useSettings";
+import { normalizeSettings, useSettings, AppSettings } from "../hooks/useSettings";
 import { AlertCircle, Save, RotateCcw, CheckCircle, Play } from "lucide-react";
 import { cn } from "../lib/utils";
 import { useAppContext } from "../context/AppContext";
+import { prepareQaInput } from "../lib/qaAgent";
+import { buildQaRequest, parseQaResponse } from "../lib/qaRequest";
 
 export function LLMSettingsModule() {
   const { settings, saveSettings, defaultSettings, legacyMemory, isMemoryLoading, memoryError } = useSettings();
@@ -60,23 +62,21 @@ export function LLMSettingsModule() {
 
     setIsTesting(true);
     try {
+      const testSettings = normalizeSettings(localSettings);
+      const input = prepareQaInput({
+        sku: "qa-connection-test", status: "ready", attribute_set: "API Test",
+        upload_attributes: { brand: "TestBrand" }, raw_row: {},
+        source: { sap: "Brand: TestBrand" },
+      }, [{
+        id: "api-test", name: "API Test", createdAt: 0, updatedAt: 0,
+        rulesMarkdown: "Check that attributes__brand matches the brand in SAP.",
+      }], testSettings.qaAgentMemory, testSettings.maxPageContentLength);
       const res = await fetch(`/api/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
-          baseUrl: localSettings.baseUrl,
-          apiKey: localSettings.apiKey,
-          payload: {
-            model: localSettings.modelName,
-            temperature: 0.1,
-            max_tokens: 10,
-            messages: [
-              { role: "user", content: "Say hello!" }
-            ]
-          }
-        })
+        body: JSON.stringify(buildQaRequest(testSettings, input))
       });
 
       if (!res.ok) {
@@ -99,10 +99,11 @@ export function LLMSettingsModule() {
         throw new Error(`API returned ${res.status}: ${errorText}`);
       }
 
+      parseQaResponse(await res.json(), input);
       addNotification({
         type: "success",
         title: "API Connection Successful",
-        message: "Successfully connected to the LLM API endpoint."
+        message: "The model returned a valid sample QA report. Save Changes to apply the tested settings to jobs."
       });
     } catch (err: any) {
       console.error("API Test Error:", err);
@@ -128,7 +129,7 @@ export function LLMSettingsModule() {
         <div className="flex gap-4">
           <button
             onClick={handleTestAPI}
-            disabled={isTesting}
+            disabled={isTesting || isSaving || isMemoryLoading || Boolean(memoryError)}
             className="flex items-center gap-2 px-4 py-2 text-[11px] uppercase font-bold text-[#8C8882] hover:text-[#1A1A1A] hover:bg-[#F5F2EF] transition-colors rounded-sm disabled:opacity-50 border border-[#E5E2DE]"
           >
             {isTesting ? (
@@ -202,7 +203,7 @@ export function LLMSettingsModule() {
                   value={localSettings.baseUrl}
                   onChange={(e) => handleChange("baseUrl", e.target.value)}
                   className="w-full bg-[#F5F2EF] border border-transparent hover:border-[#E5E2DE] focus:border-[#1A1A1A] outline-none rounded-sm px-4 py-2.5 text-sm transition-colors"
-                  placeholder="https://aicredits.in/v1"
+                  placeholder="https://api.aicredits.in/v1"
                 />
               </div>
 

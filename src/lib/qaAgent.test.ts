@@ -3,6 +3,8 @@ import ExcelJS from "exceljs";
 import type { SkuData } from "../hooks/useCatalogData";
 import { DEFAULT_QA_AGENT_MEMORY, prepareQaInput, finalizeQaResult } from "./qaAgent";
 import { populateQaWorksheet } from "./qaExcelExport";
+import { normalizeSettings } from "../hooks/useSettings";
+import { buildQaRequest } from "./qaRequest";
 
 const set = { id: "tv", name: " TV ", rulesMarkdown: "Check the model suffix.", createdAt: 0, updatedAt: 0 };
 const sku: SkuData = {
@@ -19,6 +21,17 @@ const sku: SkuData = {
 };
 const originalSku = JSON.stringify(sku);
 const input = prepareQaInput(sku, [set], "Custom instructions", 40000);
+const requestSettings = normalizeSettings({
+  apiKey: "test-only", modelName: "deepseek/deepseek-v4.1-flash", temperature: 0.3,
+  maxTokens: 10000, maxConcurrency: 3, maxRetries: 2,
+});
+const request = buildQaRequest({ ...requestSettings, baseUrl: "https://aicredits.in/v1/chat/completions" }, input);
+assert.deepEqual(request, {
+  baseUrl: "https://api.aicredits.in/v1/chat/completions", apiKey: "test-only",
+  payload: { model: "deepseek/deepseek-v4.1-flash", temperature: 0.3, max_tokens: 10000,
+    response_format: { type: "json_object" }, messages: input.messages },
+});
+assert.equal(buildQaRequest({ ...requestSettings, maxTokens: 0 }, input).payload.max_tokens, 4096);
 const data = JSON.parse(input.messages[1].content);
 assert.deepEqual(data.uploaded_template, {
   SKU: "00123", name: "Original product", base_code: "0001", note: "Keep the plug suffix",

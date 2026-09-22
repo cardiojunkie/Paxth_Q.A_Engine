@@ -4,9 +4,8 @@ import { fetchQaConfiguration, saveQaAgentMemory } from '../lib/qaConfiguration'
 
 const STORAGE_KEY = "qa-analyzer-settings";
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
-const LEGACY_AICREDITS_BASE_URL = "https://api.aicredits.in/v1";
-// ponytail: use AICredits' reachable main-domain route until the API subdomain accepts HTTPS again.
-const AICREDITS_BASE_URL = "https://aicredits.in/v1";
+const LEGACY_AICREDITS_BASE_URL = "https://aicredits.in/v1";
+const AICREDITS_BASE_URL = "https://api.aicredits.in/v1";
 
 export interface AppSettings {
   llmProvider: string;
@@ -42,8 +41,9 @@ export function normalizeMaxTokens(value: unknown): number {
 }
 
 export function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
-  const baseUrl = settings.baseUrl?.trim().replace(/\/+$/, "") === LEGACY_AICREDITS_BASE_URL
-    ? AICREDITS_BASE_URL
+  const trimmedUrl = settings.baseUrl?.trim().replace(/\/+$/, "");
+  const baseUrl = trimmedUrl === LEGACY_AICREDITS_BASE_URL || trimmedUrl === `${LEGACY_AICREDITS_BASE_URL}/chat/completions`
+    ? trimmedUrl.replace(LEGACY_AICREDITS_BASE_URL, AICREDITS_BASE_URL)
     : settings.baseUrl;
 
   return {

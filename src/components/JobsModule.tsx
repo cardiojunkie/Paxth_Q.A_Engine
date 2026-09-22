@@ -1,7 +1,7 @@
 import React, { useState, useRef } from "react";
 import { Play, StopCircle, CheckCircle, AlertCircle, Clock, Download, Eye, Trash2, X, AlertTriangle, FileSpreadsheet, ChevronDown, ChevronUp } from "lucide-react";
 import { useAppContext, Job } from "../context/AppContext";
-import { normalizeMaxTokens, useSettings } from "../hooks/useSettings";
+import { useSettings } from "../hooks/useSettings";
 import { fetchQaConfiguration, type QaConfiguration } from "../lib/qaConfiguration";
 import {
   getCommonAttributeSet,
@@ -11,9 +11,9 @@ import {
   hasCompletedQa,
   selectJobSkus,
 } from "../lib/jobRunState";
-import { extractLLMResponseContent, parseLLMJsonResponse } from "../lib/llmResponse";
+import { buildQaRequest, parseQaResponse } from "../lib/qaRequest";
 import { populateQaWorksheet } from "../lib/qaExcelExport";
-import { prepareQaInput, finalizeQaResult } from "../lib/qaAgent";
+import { prepareQaInput } from "../lib/qaAgent";
 import { scrapeUrl } from "../lib/scrapeRequest";
 import { cn } from "../lib/utils";
 import ExcelJS from "exceljs";
@@ -174,17 +174,7 @@ export function JobsModule() {
         }
 
         // Keep the same memory, rules, and evidence for every attempt for this SKU.
-        const requestBody = JSON.stringify({
-          baseUrl: settings.baseUrl,
-          apiKey: settings.apiKey,
-          payload: {
-            model: settings.modelName,
-            temperature: Number(settings.temperature),
-            max_tokens: normalizeMaxTokens(settings.maxTokens),
-            response_format: { type: "json_object" },
-            messages: qaInput.messages,
-          },
-        });
+        const requestBody = JSON.stringify(buildQaRequest(settings, qaInput));
         let attempts = 0;
         let success = false;
 
@@ -200,11 +190,10 @@ export function JobsModule() {
               throw new Error(`LLM API returned error (${res.status}): ${parseApiErrorMessage(res.status, await res.text())}`);
             }
             const data = await res.json();
-            const tokensUsed = data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-            const content = extractLLMResponseContent(data);
-            let qaResult: ReturnType<typeof finalizeQaResult>;
+            const tokensUsed = data?.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+            let qaResult: ReturnType<typeof parseQaResponse>;
             try {
-              qaResult = finalizeQaResult(parseLLMJsonResponse(content), qaInput);
+              qaResult = parseQaResponse(data, qaInput);
             } catch (error: any) {
               throw new Error(`LLM returned invalid QA output: ${error.message}`);
             }
