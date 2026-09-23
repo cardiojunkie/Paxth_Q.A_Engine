@@ -102,6 +102,8 @@ NODE_ENV=production npm start
 
 ## Importing and reviewing a catalog
 
+The separate vps-38no installation is documented in [its deployment runbook](docs/vps-38no.md).
+
 ### Input columns
 
 The first worksheet and its first header row are used. There is no interactive column-mapping step.

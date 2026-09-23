@@ -206,7 +206,7 @@ async function startServer() {
     });
   }
 
-  const listener = app.listen(PORT, "0.0.0.0", () => {
+  const listener = app.listen(PORT, process.env.HOST || "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
   const stopWorker = startJobWorker(pool);
