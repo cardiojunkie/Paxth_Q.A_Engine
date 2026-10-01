@@ -136,7 +136,9 @@ Jobs execute on one PostgreSQL-owned server worker, one SKU at a time. Closing t
 
 ### QA settings and results
 
-Defaults are 4,096 output tokens, temperature 0.1, and 40,000 evidence characters. QA allows at most three server-owned attempts for transient failures within a five-minute per-SKU deadline; permanent errors fail immediately. Provider admission is shared across QA, scraping and admin tests: two active calls, eight waiting. Response bodies remain subject to deadlines and a 4 MiB limit. Each URL retrieval makes one provider call without automatic retries.
+The default QA model is `deepseek/deepseek-v4.1-flash`, requested with low reasoning effort. Defaults are 4,096 output tokens, temperature 0.1, and 40,000 evidence characters; saved settings retain their configured limits. QA allows at most three server-owned attempts for transient failures within a five-minute per-SKU deadline; permanent errors fail immediately. Each QA request has a 120-second response deadline beginning after queue admission and its saved attempt checkpoint. Provider admission is shared across QA, scraping and admin tests: two active calls, eight waiting, with a 60-second queue wait limit. Response bodies remain subject to deadlines and a 4 MiB limit. Each URL retrieval makes one provider call without automatic retries.
+
+Provider failures are saved before retrying. If an interrupted item resumes after consuming all three attempts, its error reports the last recorded provider failure, or explains that a fresh rerun is needed when no cause was saved. Successful completion clears transient errors.
 
 **Test API** independently checks both displayed model IDs, including unsaved edits, without saving settings. Both models receive a short connectivity prompt independent of shared QA instructions, output limits and URL retrieval. Results appear inline and in Notifications; provider errors, empty/refused/truncated responses and timeouts fail visibly. Both checks use the shared server key and incur provider cost.
 

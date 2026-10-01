@@ -31,6 +31,10 @@ const provider=createServer(async(req,res)=>{
   calls++;
   if(providerMode==='wait') await delay(1200);
   if(providerMode==='permanent'){res.writeHead(400);res.end('{}');return;}
+  if(providerMode==='retryable') {
+    res.writeHead(503,{'Content-Type':'application/json','Retry-After':'3'});
+    res.end(JSON.stringify({error:{message:'Temporary provider outage: test-secret-only sk-private-test Bearer private-header\nRetry later.'}}));return;
+  }
   res.setHeader('Content-Type','application/json');
   if(payload.search_domain_filter) {
     res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify({status:'ok',markdown:'# Retrieved product\nBrand: TestBrand'})}}],citations:providerMode==='no-citations'?[]:payload.search_domain_filter}));return;
@@ -82,7 +86,8 @@ try {
   assert.equal(settings.status,200);assert.doesNotMatch(JSON.stringify(settings.body),/test-secret-only|apiKey/);
   assert.equal(settings.body.scrapperModelName,'perplexity/sonar');
   assert.equal(settings.body.baseUrl,'','The gateway destination remains server-only');
-  const configured={...editableSettings(DEFAULT_SETTINGS),modelName:'test/qa',scrapperModelName:'test/sonar'};
+  assert.equal(settings.body.modelName,'deepseek/deepseek-v4.1-flash');
+  const configured={...editableSettings(DEFAULT_SETTINGS),modelName:'deepseek/deepseek-v4.1-flash',scrapperModelName:'test/sonar',maxTokens:10000};
   assert.equal((await request('/api/provider-settings','PUT',configured,admin)).status,200);
   assert.equal((await request('/api/provider-settings','GET',undefined,user)).body.scrapperModelName,'test/sonar');
   assert.equal((await request('/api/chat','POST',{modelName:'unsaved/qa'},admin)).status,200);
@@ -107,7 +112,10 @@ try {
   assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product'},user)).status,502);
   providerMode='success';calls=0;
   assert.equal((await request('/api/chat','POST',{baseUrl:'http://evil',apiKey:'x'},admin)).status,400);
-  const sku=(id:string)=>({sku:id,source:{sap:'Brand: TestBrand'},raw_row:{sku:id},upload_attributes:{brand:'TestBrand'},attribute_set:'TestSet',status:'ready'});
+  const mappingRules='Brand must match SAP. Review every uploaded bullet point and preserve optional blank fields.';
+  const testSet=(await request('/api/qa-configuration','GET',undefined,user)).body.attributeSets.find((set:any)=>set.name==='TestSet');
+  assert.equal((await request(`/api/attribute-sets/${testSet.id}`,'PUT',{name:'TestSet',rulesMarkdown:mappingRules},admin)).status,200);
+  const sku=(id:string)=>({sku:id,source:{sap:'Brand: TestBrand'},raw_row:{sku:id,attributes__brand:'TestBrand',attributes__bullet_point_7:'Extra supplied bullet',custom_optional:'',source__sap:'private template source'},upload_attributes:{brand:'TestBrand'},attribute_set:'TestSet',status:'ready'});
   assert.equal((await request('/api/catalog','POST',[sku('a'),{sku:'invalid'}],user)).status,400);
   assert.equal((await request('/api/catalog','GET',undefined,user)).body.length,0);
   await pool.query("CREATE FUNCTION fail_import() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.sku='rollback' THEN RAISE EXCEPTION 'injected'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_import BEFORE INSERT ON sku_data FOR EACH ROW EXECUTE FUNCTION fail_import()");
@@ -179,11 +187,12 @@ try {
   const restart=restarts.find(response=>response.status===202)!;
   await pool.query("UPDATE job_runs SET status='running',owner_token='old-owner',started_at=now() WHERE id=$1",[restart.body.id]);
   await pool.query("UPDATE job_run_items SET status='completed',result=$2 WHERE run_id=$1 AND sku='b'",[restart.body.id,JSON.stringify(history.items[1].result)]);
-  await pool.query("UPDATE job_run_items SET status='running',attempts=1,started_at=now() WHERE run_id=$1 AND sku='a'",[restart.body.id]);
+  await pool.query("UPDATE job_run_items SET status='running',attempts=1,started_at=now(),error='QA attempt 1: The model request timed out.' WHERE run_id=$1 AND sku='a'",[restart.body.id]);
   providerMode='success';const before=calls;stopWorker=startJobWorker(pool);
   await waitFor(async()=>(await request(`/api/job-runs/${restart.body.id}`,'GET',undefined,user)).body.status==='completed','restart recovery');
   assert.equal(calls,before+1);
-  assert.equal((await pool.query("SELECT attempts FROM job_run_items WHERE run_id=$1 AND sku='a'",[restart.body.id])).rows[0].attempts,2);
+  const recoveredItem=(await pool.query("SELECT attempts,error,result FROM job_run_items WHERE run_id=$1 AND sku='a'",[restart.body.id])).rows[0];
+  assert.equal(recoveredItem.attempts,2);assert.equal(recoveredItem.error,null);assert.equal(recoveredItem.result.error,null,'Successful recovery clears the previous transient failure');
   // Saving a paid result retries only the DB commit.
   await pool.query("CREATE SEQUENCE fail_save_seq; CREATE FUNCTION fail_save() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.result IS NOT NULL AND nextval('fail_save_seq')=1 THEN RAISE EXCEPTION 'injected save failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_save BEFORE UPDATE ON job_run_items FOR EACH ROW EXECUTE FUNCTION fail_save()");
   const beforeSave=calls;const saveRun=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'a'},user);
@@ -194,6 +203,27 @@ try {
   const failed=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'a'},user);
   await waitFor(async()=>(await request(`/api/job-runs/${failed.body.id}`,'GET',undefined,user)).body.status==='failed','permanent provider error');
   assert.equal(calls,beforeError+1);
+  // The retry cause is committed before backoff and survives worker interruption.
+  providerMode='retryable';const beforeInterruption=calls;
+  const interrupted=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'a'},user);
+  let recordedFailure='';
+  await waitFor(async()=>{
+    const item=(await pool.query("SELECT attempts,error FROM job_run_items WHERE run_id=$1 AND sku='a'",[interrupted.body.id])).rows[0];
+    if(item.attempts===1&&item.error?.includes('HTTP 503')){recordedFailure=item.error;return true;}return false;
+  },'durable transient provider failure');
+  await stopWorker();stopWorker=undefined;
+  assert.equal(calls,beforeInterruption+1,'Stopping during retry backoff prevents another dispatch');
+  assert.match(recordedFailure,/QA attempt 1:.*HTTP 503.*Temporary provider outage/);
+  assert.match(recordedFailure,/\[redacted\]/);assert.doesNotMatch(recordedFailure,/test-secret-only|sk-private-test|private-header|\n/);
+  const interruptedHistory=(await request(`/api/job-runs/${interrupted.body.id}`,'GET',undefined,user)).body;
+  assert.equal(interruptedHistory.items[0].error,recordedFailure);
+  await pool.query("UPDATE job_run_items SET attempts=3 WHERE run_id=$1 AND sku='a'",[interrupted.body.id]);
+  providerMode='success';stopWorker=startJobWorker(pool);
+  await waitFor(async()=>(await request(`/api/job-runs/${interrupted.body.id}`,'GET',undefined,user)).body.status==='failed','exhausted recovery retains the provider failure');
+  assert.equal(calls,beforeInterruption+1,'An exhausted resumed item never dispatches another paid request');
+  const retainedFailure=(await request(`/api/job-runs/${interrupted.body.id}`,'GET',undefined,user)).body.items[0].error;
+  assert.ok(retainedFailure.includes(recordedFailure));assert.match(retainedFailure,/fresh run/i);
+  assert.doesNotMatch(retainedFailure,/test-secret-only|sk-private-test|private-header/);
   providerMode='wait';const beforeCancel=calls;
   const cancelled=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'all'},user);
   await waitFor(async()=>calls>beforeCancel,'inflight cancel');
@@ -207,6 +237,8 @@ try {
   const beforeExhaustion=calls;stopWorker=startJobWorker(pool);
   await waitFor(async()=>(await request(`/api/job-runs/${exhausted.body.id}`,'GET',undefined,user)).body.status==='failed','exhausted attempts');
   assert.equal(calls,beforeExhaustion);
+  const exhaustionError=(await request(`/api/job-runs/${exhausted.body.id}`,'GET',undefined,user)).body.items[0].error;
+  assert.match(exhaustionError,/interrupted.*fresh run/i,'Without a saved cause, exhausted recovery explains interruption and a fresh rerun');
   await stopWorker();stopWorker=undefined;
   const expired=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'a'},user);
   await pool.query("UPDATE job_run_items SET started_at=now()-interval '6 minutes' WHERE run_id=$1 AND sku='a'",[expired.body.id]);
@@ -225,10 +257,20 @@ try {
   providerMode='success';let offset=providerRequests.length;stopWorker=startJobWorker(pool);
   await waitFor(async()=>(await request(`/api/job-runs/${webRun.body.id}`,'GET',undefined,user)).body.status==='completed','snapshotted retrieval');
   await stopWorker();stopWorker=undefined;
-  assert.deepEqual(providerRequests.slice(offset).map(payload=>payload.model),['test/sonar','test/qa']);
+  assert.deepEqual(providerRequests.slice(offset).map(payload=>payload.model),['test/sonar','deepseek/deepseek-v4.1-flash']);
   assert.deepEqual(providerRequests[offset].search_domain_filter,[productUrl]);
+  const qaRequest=providerRequests[offset+1];
+  assert.equal(qaRequest.reasoning_effort,'low');assert.equal(qaRequest.max_tokens,10000);
+  assert.deepEqual(qaRequest.response_format,{type:'json_object'});assert.ok(qaRequest.messages[0].content.includes(mappingRules));
+  assert.match(qaRequest.messages[0].content,/SAP takes precedence/);
+  const qaData=JSON.parse(qaRequest.messages[1].content);
+  assert.equal(qaData.attribute_set,'TestSet');assert.equal(qaData.source_sap,'Brand: TestBrand');assert.equal(qaData.source_url,productUrl);
+  assert.match(qaData.scraped_markdown,/Retrieved product/);
+  assert.deepEqual(qaData.uploaded_template,{sku:'b',attributes__brand:'TestBrand',attributes__bullet_point_7:'Extra supplied bullet',custom_optional:''},'QA receives every original upload field without source-only columns');
   const webHistory=(await request(`/api/job-runs/${webRun.body.id}`,'GET',undefined,user)).body;
   assert.match(webHistory.items[1].result.scraped_markdown,/Retrieved product/);
+  assert.equal(webHistory.items[1].error,null);assert.equal(webHistory.items[1].result.qa_result.qa_status,'pass');
+  assert.deepEqual(webHistory.items[1].result.qa_result.source_notes,{sap_used:true,url_used:true,source_conflicts:[]});
   assert.match((await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='b').scraped_markdown,/variant=42/);
   // Old job snapshots get the Sonar default without rewriting stored configuration.
   await pool.query("UPDATE sku_data SET scraped_markdown=NULL,scrape_status=NULL WHERE sku='b'");

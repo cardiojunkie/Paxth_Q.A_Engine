@@ -11,6 +11,7 @@ export function buildQaRequest(settings: AppSettings, input: QaInput) {
       model: normalized.modelName,
       temperature: Number(normalized.temperature),
       max_tokens: normalized.maxTokens,
+      ...(normalized.modelName === "deepseek/deepseek-v4.1-flash" && { reasoning_effort: "low" }),
       response_format: { type: "json_object" },
       messages: input.messages,
     },

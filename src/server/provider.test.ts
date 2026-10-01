@@ -3,7 +3,7 @@ import {setTimeout as delay} from 'node:timers/promises';
 import express from 'express';
 import type { Pool } from 'pg';
 import {completeQa,validateSettings,registerProviderRoutes,getProviderCredentials} from './provider';
-import {fetchChatCompletion,providerResponseError} from '../lib/chatCompletion';
+import {fetchChatCompletion,providerResponseError,ProviderError} from '../lib/chatCompletion';
 import {editableSettings,DEFAULT_SETTINGS} from '../lib/providerSettings';
 const keepAlive=setInterval(()=>{},1000);
 const original=globalThis.fetch;
@@ -23,17 +23,58 @@ try {
   let calls=0;
   globalThis.fetch=async()=>{calls++;return Response.json({error:'invalid'},{status:400});};
   await assert.rejects(completeQa({},new AbortController().signal),/HTTP 400/);assert.equal(calls,1);
-  calls=0;const attempts:number[]=[];
+  calls=0;const attempts:number[]=[],failedAttempts:number[]=[];
   globalThis.fetch=async()=>{calls++;return calls<2?Response.json({}, {status:503}):Response.json({ok:true});};
-  assert.deepEqual(await completeQa({},new AbortController().signal,{attempts:1,beforeAttempt:async n=>{attempts.push(n);}}),{ok:true});
+  assert.deepEqual(await completeQa({},new AbortController().signal,{attempts:1,beforeAttempt:async n=>{attempts.push(n);},onAttemptError:async n=>{failedAttempts.push(n);}}),{ok:true});
   assert.deepEqual(attempts,[2,3]);
+  assert.deepEqual(failedAttempts,[2]);
   assert.equal(calls,2);
-  await assert.rejects(completeQa({},new AbortController().signal,{attempts:3}),/exhausted/);assert.equal(calls,2);
+  await assert.rejects(completeQa({},new AbortController().signal,{attempts:3}),/interrupted.*fresh run/);assert.equal(calls,2);
   globalThis.fetch=async()=>{calls++;return Response.json({});};
   await assert.rejects(completeQa({},new AbortController().signal,{beforeAttempt:async()=>{throw new Error('save attempt failed');}}),/save attempt failed/);assert.equal(calls,2);
+  calls=0;const savedFailures:Array<{attempt:number;error:ProviderError}>=[];
+  globalThis.fetch=async()=>{calls++;return Response.json({error:{message:'Busy test-only Bearer upstream-secret sk-other-secret'}},{status:503});};
+  await assert.rejects(completeQa({},new AbortController().signal,{attempts:2,onAttemptError:async(attempt,error)=>{savedFailures.push({attempt,error});}}),/HTTP 503/);
+  assert.equal(calls,1);assert.equal(savedFailures[0].attempt,3);
+  assert.doesNotMatch(savedFailures[0].error.message,/test-only|upstream-secret|sk-other-secret/);
+  await assert.rejects(completeQa({},new AbortController().signal,{attempts:3,lastError:savedFailures[0].error.message}),/Last recorded failure:.*HTTP 503.*fresh run/);
+  assert.equal(calls,1,'An exhausted recovery never dispatches another model request');
+  delete process.env.LLM_API_KEY;
+  try {
+    await assert.rejects(completeQa({},new AbortController().signal,{attempts:3,lastError:savedFailures[0].error.message}),/Last recorded failure:.*HTTP 503/);
+  } finally {process.env.LLM_API_KEY='test-only';}
+  await assert.rejects(completeQa({},new AbortController().signal,{onAttemptError:async()=>{throw new Error('failure checkpoint unavailable');}}),/failure checkpoint unavailable/);
+  assert.equal(calls,2,'A failed error checkpoint must not trigger another provider attempt');
+  const nativeTimeout=AbortSignal.timeout,windows:number[]=[];
+  AbortSignal.timeout=(ms:number)=>{windows.push(ms);return nativeTimeout(ms);};
+  try {
+    globalThis.fetch=async()=>Response.json({});
+    await fetchChatCompletion(process.env.LLM_BASE_URL!,process.env.LLM_API_KEY!,{},new AbortController().signal);
+    await completeQa({},new AbortController().signal);
+    assert.deepEqual(windows,[90_000,120_000],'QA has a longer request window than retrieval and connectivity');
+  } finally {AbortSignal.timeout=nativeTimeout;}
+  // Queueing and durable dispatch saves must not shorten the actual provider window.
+  let admit!:()=>void;const admissionHold=new Promise<void>(resolve=>{admit=resolve;});
+  globalThis.fetch=async(_url,init)=>{
+    if(JSON.parse(init!.body as string).hold)await admissionHold;
+    return Response.json({});
+  };
+  const held=Array.from({length:2},()=>fetchChatCompletion(process.env.LLM_BASE_URL!,process.env.LLM_API_KEY!,{hold:true},AbortSignal.timeout(2000)));
+  await delay(1);
+  const queued=fetchChatCompletion(process.env.LLM_BASE_URL!,process.env.LLM_API_KEY!,{},AbortSignal.timeout(2000),async()=>{await delay(40);},20);
+  await delay(40);admit();await Promise.all([...held,queued]);
+  calls=0;globalThis.fetch=async()=>{calls++;return Response.json({});};
+  await assert.rejects(fetchChatCompletion(process.env.LLM_BASE_URL!,process.env.LLM_API_KEY!,{},AbortSignal.timeout(20),async()=>{await delay(40);},1000),{name:'TimeoutError'});
+  assert.equal(calls,0,'Caller cancellation during the dispatch save prevents a provider request');
   // Headers arrive immediately but body stalls. Abort must release the admission slot.
   globalThis.fetch=async()=>new Response(new ReadableStream({start(){}}));
   await assert.rejects(fetchChatCompletion(process.env.LLM_BASE_URL!,process.env.LLM_API_KEY!,{},AbortSignal.timeout(30)));
+  await assert.rejects(fetchChatCompletion(process.env.LLM_BASE_URL!,process.env.LLM_API_KEY!,{},AbortSignal.timeout(2000),undefined,30),error=>error instanceof ProviderError && error.status===504 && error.retryable && /request timed out/.test(error.message));
+  const ownership=new AbortController(),lost=new Error('Worker ownership lost');
+  const abortOwnership=setTimeout(()=>ownership.abort(lost),20);
+  try {
+    await assert.rejects(fetchChatCompletion(process.env.LLM_BASE_URL!,process.env.LLM_API_KEY!,{},ownership.signal,undefined,1000),error=>error===lost);
+  } finally {clearTimeout(abortOwnership);}
   let active=0,maximum=0;
   globalThis.fetch=async()=>{
     active++;maximum=Math.max(maximum,active);

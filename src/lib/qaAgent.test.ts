@@ -4,7 +4,7 @@ import type { SkuData } from "../hooks/useCatalogData";
 import { DEFAULT_QA_AGENT_MEMORY, prepareQaInput, finalizeQaResult } from "./qaAgent";
 import { populateQaWorksheet } from "./qaExcelExport";
 import { normalizeSettings } from "../hooks/useSettings";
-import { buildQaRequest } from "./qaRequest";
+import { buildQaRequest, parseQaResponse } from "./qaRequest";
 
 const set = { id: "tv", name: " TV ", rulesMarkdown: "Check the model suffix.", createdAt: 0, updatedAt: 0 };
 const sku: SkuData = {
@@ -27,8 +27,16 @@ const requestSettings = normalizeSettings({
 const request = buildQaRequest({ ...requestSettings, baseUrl: "https://aicredits.in/v1/chat/completions" }, input);
 assert.deepEqual(request, {
   payload: { model: "deepseek/deepseek-v4.1-flash", temperature: 0.3, max_tokens: 10000,
+    reasoning_effort: "low",
     response_format: { type: "json_object" }, messages: input.messages },
 });
+assert.equal(normalizeSettings().modelName, "deepseek/deepseek-v4.1-flash");
+const { reasoning_effort, ...payloadWithoutReasoning } = request.payload;
+for (const model of ["z-ai/glm-5.3-flash", "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4.1-flash-extra"]) {
+  assert.deepEqual(buildQaRequest({ ...requestSettings, modelName: model }, input), {
+    payload: { ...payloadWithoutReasoning, model },
+  }, "Only the exact supported QA model receives a reasoning control");
+}
 assert.equal(buildQaRequest({ ...requestSettings, maxTokens: 0 }, input).payload.max_tokens, 4096);
 const data = JSON.parse(input.messages[1].content);
 assert.deepEqual(data.uploaded_template, {
@@ -63,6 +71,12 @@ const pass = {
   qa_status: "pass", confidence: "high", summary: "No discrepancies.", issue_count: 0, issues: [],
   source_notes: { sap_used: true, url_used: true, source_conflicts: [] },
 };
+assert.deepEqual(parseQaResponse({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(pass) } }] }, input), pass);
+assert.throws(() => parseQaResponse({ choices: [{ finish_reason: "stop", message: { reasoning_content: JSON.stringify(pass) } }] }, input), /LLM returned no answer/);
+assert.throws(() => parseQaResponse({
+  choices: [{ finish_reason: "length", message: { content: JSON.stringify(pass) } }],
+  usage: { completion_tokens_details: { reasoning_tokens: 10000 } },
+}, input), /output token budget.*10000 reasoning tokens/);
 assert.equal(finalizeQaResult(pass, input).qa_status, "pass");
 assert.equal(finalizeQaResult(pass, truncated).qa_status, "warning");
 let general = finalizeQaResult(pass, input);

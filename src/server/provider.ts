@@ -42,22 +42,33 @@ export function validateSettings(value: any) {
     typeof value.qaAgentMemory !== 'string' || value.qaAgentMemory.length > 200000) throw new ProviderError('Invalid model settings or unsupported fields', 400);
   return editableSettings(normalizeSettings(value));
 }
-export async function completeQa(payload: unknown, signal: AbortSignal, options: { attempts?: number; beforeAttempt?: (attempt: number) => Promise<void> } = {}) {
+export async function completeQa(payload: unknown, signal: AbortSignal, options: {
+  attempts?: number; beforeAttempt?: (attempt: number) => Promise<void>;
+  lastError?: string | null; onAttemptError?: (attempt: number, error: ProviderError) => Promise<void>;
+} = {}) {
+  const exhaustedMessage = options.lastError?.trim()
+    ? `QA exhausted its three-attempt budget. Last recorded failure: ${options.lastError} Start a fresh run to retry this SKU.`
+    : 'QA used all three attempts before a result was saved; execution was interrupted. Start a fresh run to retry this SKU.';
+  signal.throwIfAborted();
+  if ((options.attempts ?? 0) >= 3) throw new ProviderError(exhaustedMessage);
   const { baseUrl, apiKey } = getProviderCredentials();
   for (let attempt = (options.attempts ?? 0) + 1; attempt <= 3; attempt++) {
     signal.throwIfAborted();
     try {
-      const response = await fetchChatCompletion(baseUrl, apiKey, payload, signal, () => options.beforeAttempt?.(attempt) ?? Promise.resolve());
+      const response = await fetchChatCompletion(baseUrl, apiKey, payload, signal, () => options.beforeAttempt?.(attempt) ?? Promise.resolve(), 120_000);
       if (!response.ok) throw await providerResponseError(response, apiKey);
       try { return await response.json(); } catch { throw new ProviderError('Model returned invalid JSON'); }
     } catch (error) {
+      signal.throwIfAborted();
+      if (error instanceof ProviderError) await options.onAttemptError?.(attempt, error);
       signal.throwIfAborted();
       if (!(error instanceof ProviderError) || !error.retryable || attempt === 3) throw error;
       if (error.retryAfterMs > 300000) throw new ProviderError('Provider requested a retry beyond the job deadline', 429);
       await delay(Math.max(attempt * 1000, Number.isFinite(error.retryAfterMs) ? error.retryAfterMs : 0), undefined, { signal });
     }
   }
-  throw new ProviderError('The three-attempt budget has been exhausted');
+  signal.throwIfAborted();
+  throw new ProviderError(exhaustedMessage);
 }
 export function registerProviderRoutes(app: Express, pool: Pool) {
   app.get('/api/provider-settings', async (_req, res) => { res.json(await getProviderSettings(pool)); });

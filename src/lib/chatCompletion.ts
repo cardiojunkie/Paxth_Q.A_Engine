@@ -83,19 +83,20 @@ async function bufferResponse(response: Response, signal: AbortSignal) {
 /** Shared by QA, URL retrieval, and admin tests; no retries at this layer. */
 export async function fetchChatCompletion(
   baseUrl: string, apiKey: string, payload: unknown, signal: AbortSignal,
-  beforeFetch?: () => Promise<void>,
+  beforeFetch?: () => Promise<void>, requestTimeoutMs = 90_000,
 ): Promise<Response> {
   const base = baseUrl.trim().replace(/\/+$/, "");
   const endpoint = new URL(base.endsWith("/chat/completions") ? base : `${base}/chat/completions`);
   if (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
     throw new ProviderError("The LLM endpoint must be an HTTP(S) URL without embedded credentials or query parameters.", 503);
   }
-  const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(90_000)]);
-  const release = await acquire(boundedSignal);
+  const release = await acquire(signal);
   try {
-    boundedSignal.throwIfAborted();
+    signal.throwIfAborted();
     await beforeFetch?.();
-    boundedSignal.throwIfAborted();
+    signal.throwIfAborted();
+    // Admission and the durable dispatch checkpoint have their own caller deadline.
+    const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMs)]);
     try {
       const response = await fetch(endpoint, {
         method: "POST", redirect: "error",

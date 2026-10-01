@@ -278,11 +278,20 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
       const input = prepareQaInput(snapshot, run.configuration.attributeSets, run.configuration.qaAgentMemory, settings.maxPageContentLength);
       const response = await completeQa(buildQaRequest(settings, input).payload, execution, {
         attempts: item.attempts,
+        lastError: item.error,
         beforeAttempt: async attempt => {
           execution.throwIfAborted();
           await transaction(client, async () => {
             await assertOwner(client, run.id, owner);
             await client.query('UPDATE job_run_items SET attempts=$3 WHERE run_id=$1 AND sku=$2', [run.id, item.sku, attempt]);
+          });
+        },
+        onAttemptError: async (attempt, error) => {
+          execution.throwIfAborted();
+          await transaction(client, async () => {
+            await assertOwner(client, run.id, owner);
+            await client.query('UPDATE job_run_items SET error=$3 WHERE run_id=$1 AND sku=$2',
+              [run.id, item.sku, `QA attempt ${attempt}: ${error.message}`]);
           });
         },
       });
