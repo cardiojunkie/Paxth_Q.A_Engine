@@ -62,6 +62,7 @@ export const skuData = pgTable('sku_data', {
   revision: integer('revision').default(0).notNull(),
 });
 
+// Legacy data only; retained in Drizzle so schema tools do not propose dropping saved rules.
 export const siteSelectors = pgTable('site_selectors', {
   id: text('id').primaryKey(),
   website: text('website').notNull(),

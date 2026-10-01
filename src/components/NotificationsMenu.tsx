@@ -32,6 +32,8 @@ export function NotificationsMenu() {
   return (
     <div className="relative" ref={menuRef}>
       <button
+        aria-label="Notifications"
+        aria-expanded={isOpen}
         onClick={() => setIsOpen(!isOpen)}
         className="relative p-2 text-[#8C8882] hover:text-[#1A1A1A] hover:bg-[#F5F2EF] rounded-sm transition-colors"
       >

@@ -6,8 +6,9 @@ import type { SkuData } from '../hooks/useCatalogData';
 import { prepareQaInput } from '../lib/qaAgent';
 import { buildQaRequest, parseQaResponse } from '../lib/qaRequest';
 import { hasCompletedQa } from '../lib/jobRunState';
-import { normalizeWebsite } from '../lib/siteSelectorWebsite';
-import { scrapeWithAgent, type ScrapeRule } from '../lib/scrapeAgent';
+import { normalizeSettings } from '../lib/providerSettings';
+import { scrapeWithAgent } from '../lib/scrapeAgent';
+import { ProviderError } from '../lib/chatCompletion';
 import { completeQa, getProviderCredentials, getProviderSettings } from './provider';
 import { mapCatalogRow } from './catalog';
 
@@ -19,14 +20,21 @@ const SKU_BUDGET_MS = 300_000;
 const errorText = (error: unknown) => error instanceof Error ? error.message : 'Job execution failed';
 class JobError extends Error { constructor(message: string, public status = 400) { super(message); } }
 
-async function transaction<T>(client: PoolClient, action: () => Promise<T>): Promise<T> {
-  await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
-  try {
-    await client.query('SELECT pg_advisory_xact_lock($1)', [JOB_MUTATION_LOCK]);
-    const result = await action();
-    await client.query('COMMIT');
-    return result;
-  } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; }
+export async function transaction<T>(client: PoolClient, action: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    try {
+      await client.query('SELECT pg_advisory_xact_lock($1)', [JOB_MUTATION_LOCK]);
+      const result = await action();
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      // Retry only an explicitly aborted transaction; a lost COMMIT response may have committed.
+      try { await client.query('ROLLBACK'); } catch { throw error; }
+      const code = (error as { code?: string })?.code;
+      if (attempt >= 3 || !['40001', '40P01'].includes(code ?? '')) throw error;
+    }
+  }
 }
 
 export async function initializeJobRuns(pool: Pool) {
@@ -62,7 +70,7 @@ const publicRun = (row: any) => ({
   finishedAt: row.finished_at, error: row.error,
 });
 
-async function readRun(pool: Pool, id: string) {
+async function readRun(pool: Pool | PoolClient, id: string) {
   const { rows: [run] } = await pool.query('SELECT * FROM job_runs WHERE id=$1', [id]);
   if (!run) throw new JobError('Run does not exist', 404);
   const { rows } = await pool.query('SELECT * FROM job_run_items WHERE run_id=$1 ORDER BY position', [id]);
@@ -111,9 +119,8 @@ export function registerJobRunRoutes(app: Express, pool: Pool) {
         const settings = await getProviderSettings(client!);
         const { rows: [memory] } = await client!.query("SELECT memory FROM qa_agent_settings WHERE id='default'");
         const { rows: sets } = await client!.query('SELECT id,name,rules_markdown AS "rulesMarkdown" FROM attribute_sets');
-        const { rows: selectors } = await client!.query('SELECT website,selectors,tab_selector AS "tabSelector",tab_content_selector AS "tabContentSelector",tab_wait_ms AS "tabWaitMs" FROM site_selectors WHERE enabled=true');
         if (!memory?.memory) throw new JobError('QA memory is unavailable', 503);
-        const configuration = { settings, qaAgentMemory: memory.memory, attributeSets: sets, selectors };
+        const configuration = { settings, qaAgentMemory: memory.memory, attributeSets: sets };
         const runId = randomUUID();
         await client!.query('INSERT INTO job_runs(id,job_id,request_id,actor_id,actor_name,mode,selected_sku,configuration) VALUES($1,$2,$3,$4,$5,$6,$7,$8)',
           [runId, job.id, input.requestId, res.locals.user.id, res.locals.user.username, input.mode, input.sku ?? null, JSON.stringify(configuration)]);
@@ -127,8 +134,15 @@ export function registerJobRunRoutes(app: Express, pool: Pool) {
         await client!.query("UPDATE jobs SET status='running', error=NULL WHERE id=$1", [job.id]);
         return runId;
       });
-      res.status(202).json(await readRun(pool, id));
-    } catch (error) { res.status(error instanceof JobError ? error.status : 503).json({ error: error instanceof JobError ? error.message : 'Could not start the run. Check server provider/database configuration.' }); }
+      res.status(202).json(await readRun(client, id));
+    } catch (error) {
+      const known = error instanceof JobError || error instanceof ProviderError;
+      if (!known) {
+        const code = (error as { code?: string })?.code;
+        console.error('Job start database operation failed.', typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : 'unavailable');
+      }
+      res.status(known ? error.status : 503).json({ error: known ? error.message : 'Could not start the run. The database is unavailable; retry using the same request.' });
+    }
     finally { client?.release(); }
   });
   app.get('/api/jobs/:id/runs', async (req, res) => {
@@ -151,7 +165,7 @@ export function registerJobRunRoutes(app: Express, pool: Pool) {
         if (run.actor_id !== res.locals.user.id && res.locals.user.role !== 'admin') throw new JobError('You can only stop your own runs', 403);
         if (ACTIVE.includes(run.status)) await client!.query("UPDATE job_runs SET status='cancelling' WHERE id=$1", [run.id]);
       });
-      res.json(await readRun(pool, String(req.params.id)));
+      res.json(await readRun(client, String(req.params.id)));
     } catch (error) { res.status(error instanceof JobError ? error.status : 503).json({ error: error instanceof JobError ? error.message : 'Could not cancel the run' }); }
     finally { client?.release(); }
   });
@@ -212,6 +226,7 @@ async function finishRun(client: PoolClient, run: any, owner: string) {
 }
 
 async function executeRun(client: PoolClient, pool: Pool, run: any, owner: string, ownership: AbortSignal) {
+  const settings = normalizeSettings(run.configuration.settings);
   while (!ownership.aborted) {
     const item = await transaction(client, async () => {
       const current = await assertOwner(client, run.id, owner, true);
@@ -241,17 +256,14 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
     try {
       if (Date.now() >= start + SKU_BUDGET_MS) throw new Error('SKU exceeded its five-minute execution budget');
       if (snapshot.source.url && !snapshot.scraped_markdown?.trim() && !['success', 'failed'].includes(snapshot.scrape_status)) {
-        // One scrape per durable item: a crash during scraping requires manual rerun rather than resetting eight model decisions.
+        // One retrieval per durable item; a crash requires an explicit rerun.
         if (!item.scrape_started) {
           await transaction(client, async () => {
             await assertOwner(client, run.id, owner);
             await client.query('UPDATE job_run_items SET scrape_started=true WHERE run_id=$1 AND sku=$2', [run.id, item.sku]);
           });
           try {
-            const hostname = normalizeWebsite(snapshot.source.url);
-            const rule = (run.configuration.selectors as ScrapeRule[]).filter(rule => hostname === rule.website || hostname.endsWith(`.${rule.website}`))
-              .sort((a, b) => b.website.length - a.website.length)[0];
-            const markdown = await scrapeWithAgent(snapshot.source.url, { ...getProviderCredentials(), modelName: run.configuration.settings.modelName }, rule, execution);
+            const markdown = await scrapeWithAgent(snapshot.source.url, { ...getProviderCredentials(), modelName: settings.scrapperModelName, maxTokens: settings.maxTokens, maxPageContentLength: settings.maxPageContentLength }, execution);
             snapshot = { ...snapshot, scraped_markdown: markdown, scrape_status: 'success' };
           } catch (error) {
             execution.throwIfAborted();
@@ -263,8 +275,8 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
           });
         } else if (!snapshot.source.sap?.trim()) throw new Error('Scraping was interrupted. Rerun this SKU to collect evidence.');
       }
-      const input = prepareQaInput(snapshot, run.configuration.attributeSets, run.configuration.qaAgentMemory, run.configuration.settings.maxPageContentLength);
-      const response = await completeQa(buildQaRequest(run.configuration.settings, input).payload, execution, {
+      const input = prepareQaInput(snapshot, run.configuration.attributeSets, run.configuration.qaAgentMemory, settings.maxPageContentLength);
+      const response = await completeQa(buildQaRequest(settings, input).payload, execution, {
         attempts: item.attempts,
         beforeAttempt: async attempt => {
           execution.throwIfAborted();

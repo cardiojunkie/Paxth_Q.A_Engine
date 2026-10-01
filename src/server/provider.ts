@@ -1,17 +1,23 @@
 import type { Express } from 'express';
 import type { Pool, PoolClient } from 'pg';
 import { setTimeout as delay } from 'node:timers/promises';
-import { fetchChatCompletion, ProviderError } from '../lib/chatCompletion';
+import { fetchChatCompletion, ProviderError, providerResponseError } from '../lib/chatCompletion';
 import { DEFAULT_SETTINGS, editableSettings, normalizeSettings, type AppSettings } from '../lib/providerSettings';
-import { prepareQaInput } from '../lib/qaAgent';
-import { buildQaRequest, parseQaResponse } from '../lib/qaRequest';
+import { extractLLMResponseContent } from '../lib/llmResponse';
+import { scrapeWithAgent, ScrapeError } from '../lib/scrapeAgent';
 import { transaction } from './database';
 
 export function getProviderCredentials() {
-  const baseUrl = process.env.LLM_BASE_URL?.trim();
-  const apiKey = process.env.LLM_API_KEY?.trim();
-  if (!baseUrl || !apiKey) throw new ProviderError('Configure LLM_BASE_URL and LLM_API_KEY on the server.', 503);
-  const url = new URL(baseUrl);
+  let baseUrl = process.env.LLM_BASE_URL?.trim();
+  let apiKey = process.env.LLM_API_KEY?.trim();
+  // Use the existing AI Credits key only with its own gateway; never mix a legacy key with an override.
+  if (!baseUrl && !apiKey && process.env.AICREDITS_API_KEY?.trim()) {
+    baseUrl = 'https://api.aicredits.in/v1';
+    apiKey = process.env.AICREDITS_API_KEY.trim();
+  }
+  if (!baseUrl || !apiKey) throw new ProviderError('Configure both LLM_BASE_URL and LLM_API_KEY on the server, or use AICREDITS_API_KEY without LLM overrides.', 503);
+  let url: URL;
+  try { url = new URL(baseUrl); } catch { throw new ProviderError('Invalid server LLM_BASE_URL.', 503); }
   if (!['https:', ...(process.env.NODE_ENV !== 'production' ? ['http:'] : [])].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new ProviderError('Invalid server LLM_BASE_URL.', 503);
   return { baseUrl, apiKey };
 }
@@ -20,66 +26,106 @@ export async function initializeProvider(pool: Pool) {
     INSERT INTO provider_settings VALUES ('default','{}') ON CONFLICT DO NOTHING`);
 }
 export async function getProviderSettings(pool: Pool | PoolClient): Promise<AppSettings> {
-  const {rows:[row]} = await pool.query("SELECT p.settings, q.memory FROM provider_settings p JOIN qa_agent_settings q ON q.id=p.id WHERE p.id='default'");
+  const { rows: [row] } = await pool.query("SELECT p.settings, q.memory FROM provider_settings p JOIN qa_agent_settings q ON q.id=p.id WHERE p.id='default'");
   if (!row) throw new ProviderError('Provider settings unavailable', 503);
   let providerConfigured = false;
   try { getProviderCredentials(); providerConfigured = true; } catch { /* Report configuration state without exposing secrets. */ }
-  return normalizeSettings({...row.settings, qaAgentMemory:row.memory, providerConfigured, baseUrl:process.env.LLM_BASE_URL || ''});
+  return normalizeSettings({ ...row.settings, qaAgentMemory: row.memory, providerConfigured });
 }
 export function validateSettings(value: any) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !Object.keys(editableSettings(DEFAULT_SETTINGS)).includes(key)) ||
     typeof value.modelName !== 'string' || !value.modelName.trim() || value.modelName.length > 256 ||
+    (value.scrapperModelName !== undefined && (typeof value.scrapperModelName !== 'string' || !value.scrapperModelName.trim() || value.scrapperModelName.length > 256)) ||
     typeof value.temperature !== 'number' || !Number.isFinite(value.temperature) || value.temperature < 0 || value.temperature > 1 ||
     !Number.isSafeInteger(value.maxTokens) || value.maxTokens < 1 || value.maxTokens > 65536 ||
     !Number.isSafeInteger(value.maxPageContentLength) || value.maxPageContentLength < 1 || value.maxPageContentLength > 200000 ||
-    typeof value.qaAgentMemory !== 'string' || value.qaAgentMemory.length > 200000) throw new ProviderError('Invalid model settings or unsupported fields',400);
+    typeof value.qaAgentMemory !== 'string' || value.qaAgentMemory.length > 200000) throw new ProviderError('Invalid model settings or unsupported fields', 400);
   return editableSettings(normalizeSettings(value));
 }
-export async function completeQa(payload: unknown, signal: AbortSignal, options: {attempts?:number; beforeAttempt?:(attempt:number)=>Promise<void>} = {}) {
-  const {baseUrl,apiKey} = getProviderCredentials();
-  for (let attempt=(options.attempts ?? 0)+1; attempt<=3; attempt++) {
+export async function completeQa(payload: unknown, signal: AbortSignal, options: { attempts?: number; beforeAttempt?: (attempt: number) => Promise<void> } = {}) {
+  const { baseUrl, apiKey } = getProviderCredentials();
+  for (let attempt = (options.attempts ?? 0) + 1; attempt <= 3; attempt++) {
     signal.throwIfAborted();
     try {
-      const response = await fetchChatCompletion(baseUrl,apiKey,payload,signal, () => options.beforeAttempt?.(attempt) ?? Promise.resolve());
-      if (!response.ok) {
-        const retryable = [408,429,500,502,503,504,529].includes(response.status);
-        const retry = response.headers.get('retry-after');
-        const retryAfterMs = retry ? /^\d+(\.\d+)?$/.test(retry) ? Number(retry)*1000 : Math.max(0,Date.parse(retry)-Date.now()) : 0;
-        throw new ProviderError(`Model request failed (HTTP ${response.status}).`,response.status,retryable,retryAfterMs);
-      }
+      const response = await fetchChatCompletion(baseUrl, apiKey, payload, signal, () => options.beforeAttempt?.(attempt) ?? Promise.resolve());
+      if (!response.ok) throw await providerResponseError(response, apiKey);
       try { return await response.json(); } catch { throw new ProviderError('Model returned invalid JSON'); }
     } catch (error) {
       signal.throwIfAborted();
       if (!(error instanceof ProviderError) || !error.retryable || attempt === 3) throw error;
-      if (error.retryAfterMs > 300000) throw new ProviderError('Provider requested a retry beyond the job deadline',429);
-      await delay(Math.max(attempt*1000,Number.isFinite(error.retryAfterMs)?error.retryAfterMs:0),undefined,{signal});
+      if (error.retryAfterMs > 300000) throw new ProviderError('Provider requested a retry beyond the job deadline', 429);
+      await delay(Math.max(attempt * 1000, Number.isFinite(error.retryAfterMs) ? error.retryAfterMs : 0), undefined, { signal });
     }
   }
   throw new ProviderError('The three-attempt budget has been exhausted');
 }
-export function registerProviderRoutes(app: Express,pool: Pool) {
-  app.get('/api/provider-settings',async (_req,res) => { res.json(await getProviderSettings(pool)); });
-  app.put('/api/provider-settings',async (req,res) => {
-    if (res.locals.user?.role !== 'admin') { res.status(403).json({error:'Administrator access required'}); return; }
+export function registerProviderRoutes(app: Express, pool: Pool) {
+  app.get('/api/provider-settings', async (_req, res) => { res.json(await getProviderSettings(pool)); });
+  app.put('/api/provider-settings', async (req, res) => {
+    if (res.locals.user?.role !== 'admin') { res.status(403).json({ error: 'Administrator access required' }); return; }
     const settings = validateSettings(req.body);
-    await transaction(pool,async client => {
-      await client.query("UPDATE provider_settings SET settings=$1 WHERE id='default'",[JSON.stringify(settings)]);
-      await client.query("UPDATE qa_agent_settings SET memory=$1,updated_at=now() WHERE id='default'",[settings.qaAgentMemory]);
+    await transaction(pool, async client => {
+      await client.query("UPDATE provider_settings SET settings=$1 WHERE id='default'", [JSON.stringify(settings)]);
+      await client.query("UPDATE qa_agent_settings SET memory=$1,updated_at=now() WHERE id='default'", [settings.qaAgentMemory]);
     });
     res.json(await getProviderSettings(pool));
   });
-  app.post('/api/chat',async (req,res) => {
-    if (res.locals.user?.role !== 'admin') { res.status(403).json({error:'Administrator access required'}); return; }
-    if (!req.body || Object.keys(req.body).length) { res.status(400).json({error:'This endpoint tests saved server settings only'}); return; }
+  // Every scrape entry point shares the same agent and evidence contract.
+  app.post("/api/scrape", async (req, res) => {
     const controller = new AbortController();
-    const disconnect=()=>{if(!res.writableEnded) controller.abort();};
-    res.on('close',disconnect);
+    const disconnect = () => { if (!res.writableEnded) controller.abort(); };
+    res.on("close", disconnect);
     try {
-      const settings=await getProviderSettings(pool);
-      const input=prepareQaInput({sku:'qa-connection-test',status:'ready',attribute_set:'API Test',upload_attributes:{brand:'TestBrand'},raw_row:{},source:{sap:'Brand: TestBrand'}},[],settings.qaAgentMemory,settings.maxPageContentLength);
-      const data=await completeQa(buildQaRequest(settings,input).payload,AbortSignal.any([controller.signal,AbortSignal.timeout(300000)]));
-      parseQaResponse(data,input);
-      if (!res.destroyed) res.json({success:true,usage:data.usage});
-    } finally {res.removeListener('close',disconnect);}
+      if (!req.body || typeof req.body !== "object" || Array.isArray(req.body) || Object.keys(req.body).some(key => key !== "url")) throw new ScrapeError("Only a URL is accepted", 400);
+      const settings = await getProviderSettings(pool);
+      const markdown = await scrapeWithAgent(req.body.url, { ...getProviderCredentials(), modelName: settings.scrapperModelName, maxTokens: settings.maxTokens, maxPageContentLength: settings.maxPageContentLength }, controller.signal);
+      if (!res.destroyed) res.json({ markdown });
+    } catch (error) {
+      if (!res.destroyed) res.status(error instanceof ScrapeError || error instanceof ProviderError ? error.status : 500).json({
+        error: error instanceof ScrapeError || error instanceof ProviderError ? error.message : "Failed to retrieve URL",
+        details: "Use SAP or manually supplied source content if this page cannot be retrieved.",
+      });
+    } finally {
+      res.removeListener("close", disconnect);
+    }
+  });
+
+  app.post('/api/chat', async (req, res) => {
+    if (res.locals.user?.role !== 'admin') { res.status(403).json({ error: 'Administrator access required' }); return; }
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) ||
+      Object.keys(req.body).some(key => !['modelName', 'purpose'].includes(key)) ||
+      (req.body.purpose !== undefined && !['qa', 'scrapper'].includes(req.body.purpose)) ||
+      (req.body.modelName !== undefined && (typeof req.body.modelName !== 'string' || !req.body.modelName.trim() || req.body.modelName.length > 256))) {
+      res.status(400).json({ error: 'Test API accepts optional modelName and purpose (qa or scrapper) only' }); return;
+    }
+    const controller = new AbortController();
+    const disconnect = () => { if (!res.writableEnded) controller.abort(); };
+    res.on('close', disconnect);
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(120000)]);
+    try {
+      const credentials = getProviderCredentials();
+      const purpose = req.body.purpose ?? 'qa';
+      let modelName = req.body.modelName?.trim();
+      if (modelName === undefined) {
+        const settings = await getProviderSettings(pool);
+        modelName = purpose === 'scrapper' ? settings.scrapperModelName : settings.modelName;
+      }
+      signal.throwIfAborted();
+      const response = await fetchChatCompletion(credentials.baseUrl, credentials.apiKey, {
+        model: modelName, max_tokens: DEFAULT_SETTINGS.maxTokens,
+        messages: [{ role: 'user', content: 'Reply with OK to confirm API connectivity.' }],
+      }, signal);
+      if (!response.ok) throw await providerResponseError(response, credentials.apiKey);
+      let data: any;
+      try { data = await response.json(); } catch { throw new ProviderError('Model returned invalid JSON'); }
+      if (data?.choices?.[0]?.message?.refusal || ['length', 'content_filter'].includes(data?.choices?.[0]?.finish_reason)) throw new ProviderError('Model test was refused or truncated');
+      if (!extractLLMResponseContent(data).trim()) throw new ProviderError('Model returned an empty response');
+      signal.throwIfAborted();
+      if (!res.destroyed) res.json({ success: true, purpose, modelName });
+    } catch (error) {
+      const known = error instanceof ProviderError || error instanceof ScrapeError;
+      if (!res.destroyed) res.status(known ? error.status : controller.signal.aborted || (error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name)) ? 504 : 502)
+        .json({ error: known ? error.message : 'Model test failed or timed out. Check the server provider configuration.' });
+    } finally { res.removeListener('close', disconnect); }
   });
 }

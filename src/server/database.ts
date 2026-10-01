@@ -1,5 +1,4 @@
 import type { Pool, PoolClient } from 'pg';
-import { isCompleteWebsiteDomain, normalizeWebsite } from '../lib/siteSelectorWebsite';
 
 export const DATA_LOCK = 73462190;
 export async function transaction<T>(pool: Pool, work: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -46,51 +45,29 @@ export async function initializeDatabase(pool: Pool) {
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tokens_used JSONB;
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS time_taken INTEGER;
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS error TEXT;
-      CREATE TABLE IF NOT EXISTS site_selectors (
-        id TEXT PRIMARY KEY, website TEXT NOT NULL, selectors TEXT NOT NULL, tab_selector TEXT,
-        tab_content_selector TEXT, tab_wait_ms INTEGER, enabled BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW(), updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-      );
-      ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_selector TEXT;
-      ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_content_selector TEXT;
-      ALTER TABLE site_selectors ADD COLUMN IF NOT EXISTS tab_wait_ms INTEGER;
     `);
-    const selectors = (await client.query('SELECT id, website FROM site_selectors')).rows;
-    const domains = new Set<string>();
-    for (const row of selectors) {
-      const website = normalizeWebsite(row.website);
-      if (!isCompleteWebsiteDomain(website) || domains.has(website)) {
-        throw new Error('Site selector migration needs manual resolution of invalid or duplicate domains; no rules were changed.');
-      }
-      domains.add(website);
-    }
-    for (const row of selectors) await client.query('UPDATE site_selectors SET website=$1 WHERE id=$2', [normalizeWebsite(row.website), row.id]);
     await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS site_selectors_website_idx ON site_selectors (website);
       DO $$ BEGIN
         ALTER TABLE jobs ADD CONSTRAINT jobs_skus_array CHECK (skus IS NOT NULL AND jsonb_typeof(skus)='array' AND NOT jsonb_path_exists(skus, '$[*] ? (@.type() != "string" || @ == "")'));
       EXCEPTION WHEN duplicate_object THEN NULL; END $$;
       DO $$ BEGIN
         ALTER TABLE jobs ADD CONSTRAINT jobs_valid_status CHECK (status IS NOT NULL AND status IN ('pending','running','completed','failed'));
       EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-      DO $$ BEGIN
-        ALTER TABLE site_selectors ADD CONSTRAINT site_selectors_canonical CHECK (website = lower(btrim(website)) AND website NOT LIKE 'www.%' AND website NOT LIKE '%/' AND website NOT LIKE '%.');
-      EXCEPTION WHEN duplicate_object THEN NULL; END $$;
     `);
   });
 }
 
 export async function verifySchema(pool: Pool) {
-  const indexes = ['attribute_sets_normalized_name_idx', 'site_selectors_website_idx', 'users_normalized_username_idx', 'job_runs_one_active', 'sku_data_sku_unique'];
+  const indexes = ['attribute_sets_normalized_name_idx', 'users_normalized_username_idx', 'job_runs_one_active', 'sku_data_sku_unique'];
   for (const index of indexes) {
     const result = await pool.query(`SELECT i.indisvalid, i.indisunique FROM pg_index i WHERE i.indexrelid=to_regclass($1)`, [index]);
     if (!result.rows[0]?.indisvalid || !result.rows[0]?.indisunique) throw new Error(`Required unique index is unavailable: ${index}`);
   }
-  for (const table of ['users','sessions','sku_data','jobs','site_selectors','qa_agent_settings','provider_settings','job_runs','job_run_items']) {
+  for (const table of ['users','sessions','sku_data','jobs','qa_agent_settings','provider_settings','job_runs','job_run_items']) {
     await pool.query(`SELECT 1 FROM ${table} LIMIT 0`);
   }
   await pool.query('SELECT sku,source,raw_row,upload_attributes,status,attribute_set,attribute_set_id,revision,qa_result,export_data,last_job_id,scraped_markdown,scrape_status,tokens_used,time_taken,error FROM sku_data LIMIT 0');
   await pool.query('SELECT id,name,created_at,attribute_set,skus,status,tokens_used,time_taken,error FROM jobs LIMIT 0');
-  const checks = await pool.query(`SELECT conname, convalidated FROM pg_constraint WHERE conrelid IN ('jobs'::regclass,'site_selectors'::regclass) AND conname IN ('jobs_skus_array','jobs_valid_status','site_selectors_canonical')`);
-  if (checks.rows.length !== 3 || checks.rows.some(row => !row.convalidated)) throw new Error('Required database constraints are unavailable');
+  const checks = await pool.query(`SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'jobs'::regclass AND conname IN ('jobs_skus_array','jobs_valid_status')`);
+  if (checks.rows.length !== 2 || checks.rows.some(row => !row.convalidated)) throw new Error('Required database constraints are unavailable');
 }

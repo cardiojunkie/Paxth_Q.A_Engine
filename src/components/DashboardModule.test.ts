@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "vite";
 import type { SkuData } from "../hooks/useCatalogData";
-import {DEFAULT_SETTINGS} from "../lib/providerSettings";
+import { DEFAULT_SETTINGS } from "../lib/providerSettings";
 import { prepareQaInput } from "../lib/qaAgent";
 
 const sku = (id: string, updates: Partial<SkuData> = {}): SkuData => ({
@@ -37,17 +37,26 @@ let releaseScrape!: () => void;
 const scrapeGate = new Promise<void>(resolve => { releaseScrape = resolve; });
 let scrapeRequests = 0;
 const chatRequests: any[] = [];
+const settingsWrites: any[] = [];
+let savedSettings = { ...DEFAULT_SETTINGS, providerConfigured: true };
+let releaseChat!: () => void;
+const chatGate = new Promise<void>(resolve => { releaseChat = resolve; });
+let chatMode: 'mixed' | 'success' | 'malformed' | 'missing' = 'mixed';
+let queuedRun: any;
+let failNextCatalogRefresh = false;
+let startRunRequests = 0;
+let catalogRefreshFailures = 0;
 let sampleResponse: any;
 const jobs = [{ id: "scrape-check", name: "Scrape integration", status: "pending", skus: ["present-pending"], created_at: new Date().toISOString(), attribute_set: "TV" }];
 
 process.env.CLOAKBROWSER_AUTO_UPDATE = "false";
 const { launch } = await import("cloakbrowser");
 const { chromium } = await import("playwright-core");
-const server = await createServer({ cacheDir:"/tmp/paxth-vite-browser-cache", server: { host: "127.0.0.1", port: 0, hmr: false }, logLevel: "error" });
+const server = await createServer({ cacheDir: "/tmp/paxth-vite-browser-cache", server: { host: "127.0.0.1", port: 0, hmr: false }, logLevel: "error" });
 let browser: Awaited<ReturnType<typeof launch>> | undefined;
 try {
   await server.listen();
-  browser = process.env.CHROMIUM_EXECUTABLE ? await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_EXECUTABLE,args:["--no-sandbox"]}) : await launch({ headless: true });
+  browser = process.env.CHROMIUM_EXECUTABLE ? await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_EXECUTABLE, args: ["--no-sandbox"] }) : await launch({ headless: true });
   const page = await browser.newPage();
   page.setDefaultTimeout(15000);
   await page.addInitScript(() => {
@@ -59,16 +68,30 @@ try {
       temperature: 0.3, maxTokens: 10000, maxConcurrency: 3, maxRetries: 2,
     }));
   });
-  let authenticated=false;
+  let authenticated = false;
   await page.route("**/api/**", async route => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
-    const account={id:'browser-admin',username:'Browser test admin',role:'admin',loginTime:new Date().toISOString()};
-    if(path==='/api/auth/me')return route.fulfill({status:authenticated?200:401,json:authenticated?account:{error:'Sign in'}});
-    if(path==='/api/auth/login'){authenticated=true;return route.fulfill({json:account});}
-    if(path==='/api/users')return route.fulfill({json:[]});
-    if(path==='/api/provider-settings')return route.fulfill({json:{...DEFAULT_SETTINGS,providerConfigured:true}});
-    if(path==='/api/jobs/scrape-check/runs')return route.fulfill({json:[]});
+    const account = { id: 'browser-admin', username: 'Browser test admin', role: 'admin', loginTime: new Date().toISOString() };
+    if (path === '/api/auth/me') return route.fulfill({ status: authenticated ? 200 : 401, json: authenticated ? account : { error: 'Sign in' } });
+    if (path === '/api/auth/login') { authenticated = true; return route.fulfill({ json: account }); }
+    if (path === '/api/users') return route.fulfill({ json: [] });
+    if (path === '/api/provider-settings') {
+      if (request.method() === 'PUT') { settingsWrites.push(request.postDataJSON()); savedSettings = { ...savedSettings, ...request.postDataJSON() }; }
+      return route.fulfill({ json: savedSettings });
+    }
+    if (path === '/api/jobs/scrape-check/runs') {
+      if (request.method() === 'POST') {
+        startRunRequests++;
+        assert.equal(request.postDataJSON().mode, 'unfinished');
+        assert.ok(request.postDataJSON().requestId);
+        queuedRun = { id: 'accepted-browser-run', jobId: 'scrape-check', actorId: account.id, actorName: account.username, mode: 'unfinished', status: 'queued', createdAt: new Date().toISOString(), items: [{ sku: 'present-pending', status: 'queued', attempts: 0, snapshot: catalog[7] }] };
+        failNextCatalogRefresh = true;
+        return route.fulfill({ status: 202, json: queuedRun });
+      }
+      return route.fulfill({ json: queuedRun ? [queuedRun] : [] });
+    }
+    if (path === '/api/job-runs/accepted-browser-run') return route.fulfill({ json: queuedRun });
     if (path === "/api/scrape") {
       scrapeRequests++;
       assert.ok(holdScrape, "Editing source data must not trigger a scrape");
@@ -88,25 +111,31 @@ try {
       Object.assign(item, updates);
       return route.fulfill({ json: item });
     }
-    if (path === "/api/catalog") return route.fulfill({ json: catalog });
+    if (path === "/api/catalog") {
+      if (failNextCatalogRefresh) { failNextCatalogRefresh = false; catalogRefreshFailures++; return route.fulfill({ status: 503, json: { error: 'Catalog refresh temporarily unavailable' } }); }
+      return route.fulfill({ json: catalog });
+    }
     if (path === "/api/jobs") return route.fulfill({ json: jobs });
     if (path === "/api/jobs/scrape-check") return route.fulfill({ json: { success: true } });
-    if (path === "/api/site-selectors") return route.fulfill({ json: [] });
     if (path === "/api/qa-configuration") return route.fulfill({ json: { qaAgentMemory: "Use supplied evidence.", attributeSets: [] } });
     if (path === "/api/chat") {
       chatRequests.push(request.postDataJSON());
-      return route.fulfill({json:{success:true}});
+      await chatGate;
+      if (chatMode === 'missing') return route.fulfill({ status: 503, json: { error: 'Configure LLM_BASE_URL and LLM_API_KEY on the server.' } });
+      if (request.postDataJSON().purpose === 'qa' && chatMode === 'malformed') return route.fulfill({ json: { success: false } });
+      if (request.postDataJSON().purpose === 'scrapper' && chatMode === 'mixed') return route.fulfill({ status: 502, json: { error: 'Model request failed (HTTP 400). The model is unavailable.' } });
+      return route.fulfill({ json: { success: true } });
     }
     if (path === "/api/db-status") return route.fulfill({ json: { status: "connected" } });
     throw new Error(`Unexpected API request: ${request.method()} ${path}`);
   });
 
   await page.goto(server.resolvedUrls!.local[0]);
-  await page.getByRole('button',{name:'Sign In to Engine',exact:true}).waitFor();
-  assert.equal(authenticated,false,'Forged localStorage account cannot authenticate');
-  await page.getByLabel('Username',{exact:true}).fill('browser-admin');
-  await page.getByLabel('Password',{exact:true}).fill('browser-test-password');
-  await page.getByRole('button',{name:'Sign In to Engine',exact:true}).click();
+  await page.getByRole('button', { name: 'Sign In to Engine', exact: true }).waitFor();
+  assert.equal(authenticated, false, 'Forged localStorage account cannot authenticate');
+  await page.getByLabel('Username', { exact: true }).fill('browser-admin');
+  await page.getByLabel('Password', { exact: true }).fill('browser-test-password');
+  await page.getByRole('button', { name: 'Sign In to Engine', exact: true }).click();
   const row = (id: string) => page.getByRole("row", { includeHidden: true }).filter({ has: page.getByRole("cell", { name: id, exact: true, includeHidden: true }) });
   await row("pending").waitFor();
   assert.equal(await page.getByRole("columnheader").nth(4).textContent(), "SAP Available");
@@ -330,20 +359,102 @@ try {
   await editData("empty");
   assert.equal(await content.inputValue(), "Automatically scraped content");
   await page.keyboard.press("Escape");
-  await page.getByRole("button", { name: "Scraper", exact: true }).click();
-  await page.getByPlaceholder("https://example.com/product/...").fill("https://example.com/product");
-  await page.getByRole("button", { name: "Scrape URL", exact: true }).click();
+  await page.getByRole("button", { name: "Scrapper agent", exact: true }).click();
+  assert.equal(await page.getByRole('heading', { name: 'Scrapper agent', exact: true }).count(), 1);
+  await page.getByLabel('URL', { exact: true }).fill("https://example.com/product");
+  await page.getByRole("button", { name: "Retrieve URL", exact: true }).click();
   await page.getByText("Automatically scraped content", { exact: true }).waitFor();
-  assert.equal(scrapeRequests,2,'Browser scrape callers send only URLs');
-  await page.getByRole('button',{name:'LLM Settings',exact:true}).click();
-  await page.getByRole('button',{name:'Test saved settings',exact:true}).click();
-  await page.getByText('Saved settings passed the QA response check.',{exact:true}).waitFor();
-  assert.deepEqual(chatRequests,[{}],'Admin test uses server settings without client credentials');
-  assert.equal(await page.getByLabel('API Key',{exact:true}).count(),0);
+  assert.equal(scrapeRequests, 2, 'Browser scrape callers send only URLs');
+  await page.getByRole('button', { name: 'LLM Settings', exact: true }).click();
+  await page.getByLabel('Q&A model', { exact: true }).fill('draft/qa');
+  await page.getByLabel('Scrapper model', { exact: true }).fill('draft/sonar');
+  const testing = page.getByRole('button', { name: 'Test API', exact: true });
+  await testing.click();
+  await page.getByText('Q&A (draft/qa): Testing…', { exact: true }).waitFor();
+  assert.equal(await testing.isDisabled(), true);
+  assert.equal(await page.getByLabel('Scrapper model', { exact: true }).isDisabled(), true);
+  releaseChat();
+  await page.getByText('Q&A (draft/qa): Passed.', { exact: true }).waitFor();
+  await page.getByText('Scrapper (draft/sonar): Failed: Model request failed (HTTP 400). The model is unavailable.', { exact: true }).waitFor();
+  assert.deepEqual(chatRequests, [{ purpose: 'qa', modelName: 'draft/qa' }, { purpose: 'scrapper', modelName: 'draft/sonar' }], 'Both tests use unsaved model IDs without client credentials');
+  assert.equal(settingsWrites.length, 0, 'Testing leaves settings unsaved');
+  const notifications = page.getByRole('button', { name: 'Notifications', exact: true });
+  await notifications.click();
+  await page.getByText('Q&A API Connected', { exact: true }).waitFor();
+  await page.getByText('Scrapper API Test Failed', { exact: true }).waitFor();
+  assert.equal(await page.getByText('draft/qa: API connection confirmed.', { exact: true }).count(), 1);
+  assert.equal(await page.getByText('draft/sonar: Model request failed (HTTP 400). The model is unavailable.', { exact: true }).count(), 1);
+  await notifications.click();
+  chatMode = 'success';
+  await testing.click();
+  await page.getByText('Scrapper (draft/sonar): Passed.', { exact: true }).waitFor();
+  await page.getByText('Q&A (draft/qa): Passed.', { exact: true }).waitFor();
+  assert.equal(chatRequests.length, 4);
+  await notifications.click();
+  assert.equal(await page.getByText('Q&A API Connected', { exact: true }).count(), 2, 'Each completed model check emits one notification');
+  assert.equal(await page.getByText('Scrapper API Connected', { exact: true }).count(), 1);
+  await notifications.click();
+  chatMode = 'malformed';
+  await testing.click();
+  await page.getByText('Q&A (draft/qa): Failed: The server returned an invalid connectivity test response.', { exact: true }).waitFor();
+  await page.getByText('Scrapper (draft/sonar): Passed.', { exact: true }).waitFor();
+  await notifications.click();
+  await page.getByText('Q&A API Test Failed', { exact: true }).waitFor();
+  assert.equal(await page.getByText('draft/qa: The server returned an invalid connectivity test response.', { exact: true }).count(), 1);
+  await notifications.click();
+  assert.equal(settingsWrites.length, 0, 'Connection failures do not save settings');
+  assert.equal(await page.getByLabel('Q&A model', { exact: true }).inputValue(), 'draft/qa', 'Testing preserves the unsaved Q&A model');
+  assert.equal(await page.getByLabel('Scrapper model', { exact: true }).inputValue(), 'draft/sonar', 'Testing preserves the unsaved Scrapper model');
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+  await page.getByText('Settings saved for everyone.', { exact: true }).waitFor();
+  assert.equal(settingsWrites.length, 1);
+  assert.equal(settingsWrites[0].scrapperModelName, 'draft/sonar');
+  assert.equal(settingsWrites[0].modelName, 'draft/qa');
+  assert.doesNotMatch(JSON.stringify(settingsWrites), /apiKey|test-only/);
+  await page.reload();
+  await page.getByRole('button', { name: 'LLM Settings', exact: true }).click();
+  await page.waitForFunction(input => (input as HTMLInputElement).value === 'draft/sonar', await page.getByLabel('Scrapper model', { exact: true }).elementHandle());
+  assert.equal(await page.getByLabel('Scrapper model', { exact: true }).inputValue(), 'draft/sonar');
+  assert.equal(await page.getByLabel('Q&A model', { exact: true }).inputValue(), 'draft/qa');
+  assert.equal(await page.getByLabel('API Key', { exact: true }).count(), 0);
+  savedSettings.providerConfigured = false;
+  chatMode = 'missing';
+  await page.reload();
+  await page.getByRole('button', { name: 'LLM Settings', exact: true }).click();
+  await page.getByText('Provider credentials are configured on the server. Server provider credentials are missing.', { exact: true }).waitFor();
+  assert.equal(await testing.isEnabled(), true, 'Missing server credentials can still be diagnosed with Test API');
+  await testing.click();
+  for (const name of ['Q&A (draft/qa)', 'Scrapper (draft/sonar)']) {
+    await page.getByText(`${name}: Failed: Configure LLM_BASE_URL and LLM_API_KEY on the server.`, { exact: true }).waitFor();
+  }
+  await notifications.click();
+  await page.getByText('Q&A API Test Failed', { exact: true }).waitFor();
+  await page.getByText('Scrapper API Test Failed', { exact: true }).waitFor();
+  assert.equal(await page.getByText('draft/qa: Configure LLM_BASE_URL and LLM_API_KEY on the server.', { exact: true }).count(), 1);
+  assert.equal(settingsWrites.length, 1, 'Testing missing credentials leaves settings unsaved');
+  await notifications.click();
+
+  const initialJobRefresh = page.waitForResponse(response => new URL(response.url()).pathname === '/api/catalog');
+  await page.getByRole('button', { name: 'Jobs', exact: true }).click();
+  await initialJobRefresh;
+  const runQa = page.getByRole('button', { name: 'Run Q.A', exact: true });
+  const recoveredCatalog = page.waitForResponse(response => new URL(response.url()).pathname === '/api/catalog' && response.status() === 200);
+  await runQa.click();
+  await notifications.click();
+  await page.getByText('Job Queued', { exact: true }).waitFor();
+  await page.getByText('Job Queued; Refresh Delayed', { exact: true }).waitFor();
+  assert.equal(await page.getByText('Could Not Start Job', { exact: true }).count(), 0, 'An accepted run is not reported as a failed start when catalog refresh fails');
+  assert.equal(await runQa.isDisabled(), true, 'Accepted queued run remains active while progress refresh retries');
+  assert.equal(startRunRequests, 1);
+  assert.equal(catalogRefreshFailures, 1);
+  await recoveredCatalog;
+  assert.equal(await runQa.isDisabled(), true, 'Polling recovers without starting a duplicate run');
+  assert.equal(startRunRequests, 1);
   console.log('Browser checks passed: forged-session rejection, confirmed saves, preserved drafts, and credential-free requests.');
 } finally {
   releaseSave();
   releaseScrape();
+  releaseChat();
   await browser?.close();
   await server.close();
 }

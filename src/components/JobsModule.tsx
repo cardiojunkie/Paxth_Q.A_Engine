@@ -88,7 +88,10 @@ export function JobsModule() {
       if (active(run)) setActiveRuns(previous => [...previous.filter(item => item.id !== run.id), run]);
       if (selectedJobToView?.id === jobId) setSelectedRunId(run.id);
       addNotification({ type: "success", title: "Job Queued", message: "Execution continues on the server after you close this tab." });
-      await refreshData();
+      try { await refreshData(); }
+      catch {
+        addNotification({ type: "warning", title: "Job Queued; Refresh Delayed", message: "Your job is queued and will continue on the server. Progress could not refresh; it will retry automatically." });
+      }
       return true;
     } catch (error) {
       addNotification({ type: "error", title: "Could Not Start Job", message: error instanceof Error ? error.message : "Request failed. Retry to check the same request." });

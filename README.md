@@ -2,7 +2,7 @@
 
 An internal ecommerce catalog review application, displayed in the UI as **Project 22**. Import product spreadsheets, collect SAP and product-page evidence, run an OpenAI-compatible language model against category rules, and download Excel files for human review.
 
-The application uses React, TypeScript, Express, PostgreSQL/Drizzle, and a Python Crawl4AI agent. It has working QA and export checks, but several reliability and access-control limitations remain. Read the [codebase analysis](docs/codebase-analysis.md) for evidence and priorities, and the [two Codex task briefs](docs/codex-tasks.md) for follow-up work.
+The application uses React, TypeScript, Express, PostgreSQL/Drizzle, and provider-side URL retrieval. See [security and durable jobs](docs/security-and-jobs.md) for the current authentication, execution limits, and validation record.
 
 ## Does pushing to GitHub update the live app?
 
@@ -16,14 +16,14 @@ docker compose up -d --no-build --no-deps app
 docker compose logs --tail=50 app
 ```
 
-Back up the database and retain the previous source and image before deployment as described in [deployment and updates](#deployment-and-updates). Record the deployed commit on the VPS. A container restart alone does not rebuild changed source. Leave the existing Funnel listener in place. Automatic deployment is proposed in [Task 2](docs/codex-tasks.md#task-2--prioritized-improvements-roadmap); it is not implemented.
+Back up the database and retain the previous source and image before deployment as described in [deployment and updates](#deployment-and-updates). Record the deployed commit on the VPS. A container restart alone does not rebuild changed source. Leave the existing Funnel listener in place. Automatic deployment is not implemented.
 
 ## What the application does
 
 1. **Dashboard:** import the first sheet of an `.xlsx`, `.xls`, or `.csv` file, inspect/filter SKUs, scrape selected URLs, supply source content, and create jobs.
-2. **Scraper:** test a URL and maintain shared domain-specific CSS selectors, including optional dynamic-tab capture.
+2. **Scrapper agent:** retrieve a public URL through the configured browsing model and preview its Markdown.
 3. **Attribute Sets:** save category names and Markdown mapping rules in PostgreSQL.
-4. **LLM Settings:** configure a provider, model, API key, execution settings, and shared QA agent memory.
+4. **LLM Settings:** administrators edit separate Q&A and Scrapper models, output limits, and shared QA instructions; both models use the server provider credentials.
 5. **Jobs:** run selected jobs, inspect results, rerun SKUs, and export detailed Excel feedback.
 6. **Users:** administrators manage shared server-authenticated accounts and roles.
 
@@ -36,8 +36,7 @@ flowchart LR
     B[Browser: React UI and progress polling] -->|JSON API| E[Express API and durable worker]
     B -->|Import and export| X[Spreadsheet files]
     E --> D[(PostgreSQL via Drizzle)]
-    E --> C[Python Crawl4AI agent → product page]
-    E --> M[Configured LLM endpoint]
+    E --> M[Shared LLM gateway: Q&A and native URL retrieval]
 ```
 
 Express mounts Vite middleware in development. With `NODE_ENV=production`, it serves `dist/public` and the same API routes. The server entrypoint is `dist/server.mjs`; it is outside the public asset directory.
@@ -47,7 +46,7 @@ Express mounts Vite middleware in development. With `NODE_ENV=production`, it se
 | Catalog rows, source text, scraped Markdown, latest QA results | PostgreSQL `sku_data` | Shared by clients using the same database |
 | Job membership, status, token/time totals | PostgreSQL `jobs` | Runs and per-SKU results persist in `job_runs`/`job_run_items`; execution survives tab closure |
 | Category rules and QA agent memory | `attribute_sets`, `qa_agent_settings` | Shared; a configuration snapshot is loaded at each run |
-| Domain selectors | PostgreSQL `site_selectors`, with a browser cache | Scraping uses server-loaded rules; a failed UI load can show stale cached rules |
+| Legacy domain selectors | Existing PostgreSQL `site_selectors` data | Retained untouched; no runtime routes or dependencies |
 | Provider URL/API key; model/settings | Server environment; PostgreSQL `provider_settings` | Shared, admin-configured; secrets never reach browsers |
 | Accounts and sessions | PostgreSQL `users`/`sessions` | Scrypt password hashes, hashed session tokens, eight-hour HttpOnly cookies, server role enforcement |
 | Notifications; run controls | React memory; server run state | Notifications reset on reload; job controls reconnect by polling |
@@ -56,7 +55,7 @@ Every protected API checks the server session and permissions. Keep the Caddy au
 
 ## Local setup
 
-Use **Node.js 22**, **Python 3.11+**, npm, and an accessible PostgreSQL database. The Dockerfile and devcontainer use Node 22 with Debian's Python 3.11. Linux scraping also needs Chromium system libraries; the Dockerfile lists the installed packages.
+Use **Node.js 22**, npm, and an accessible PostgreSQL database. Retrieval runs at the provider; Python and a local browser are not required by the application.
 
 ```bash
 npm ci
@@ -66,30 +65,24 @@ test -e .env || cp .env.example .env
 
 Edit `.env` and set `DATABASE_URL` to the intended database. Create that database with your PostgreSQL service first; Compose does not provision PostgreSQL. For Supabase, use the exact TLS-enabled connection URI from the project's Connect dialog. In an IPv4-only environment, use its Session pooler connection details rather than guessing the hostname or region.
 
-Startup creates the application schema and verifies required constraints before serving requests or starting the worker. It stops on migration errors, including conflicting normalized selector domains. Before upgrading existing data, back up and test against a restored copy; do not run `db:push` blindly. Configure `APP_ORIGIN`, `LLM_BASE_URL`, and `LLM_API_KEY`, then create the first administrator with `npm run admin:bootstrap` using the environment variables described in [security setup](docs/security-and-jobs.md). Use a direct PostgreSQL connection or session pooler; the worker requires a session-scoped advisory lock.
+Startup creates the application schema and verifies required constraints before serving requests or starting the worker. It stops on migration errors. Existing selector rows are neither inspected nor modified. Before upgrading existing data, back up and test against a restored copy; do not run `db:push` blindly. Configure `APP_ORIGIN`, `LLM_BASE_URL`, and `LLM_API_KEY`, then create the first administrator with `npm run admin:bootstrap` using the environment variables described in [security setup](docs/security-and-jobs.md). Use a direct PostgreSQL connection or session pooler; the worker requires a session-scoped advisory lock.
 
-Install the pinned Crawl4AI dependencies and its browser before scraping:
+Start the application:
 
 ```bash
-python3.11 -m venv .venv
-.venv/bin/python -m pip install -r scraper/requirements.txt
-.venv/bin/python -m playwright install chromium
-npm run dev
+./start.sh
 ```
 
-The app detects `.venv/bin/python` automatically. Set `CRAWL4AI_PYTHON` in `.env` only to use a different interpreter. In the devcontainer, you can instead install into its existing `/opt/crawl4ai` virtualenv using `$CRAWL4AI_PYTHON -m pip install -r scraper/requirements.txt` and `$CRAWL4AI_PYTHON -m playwright install chromium`. On a Linux host missing browser libraries, run `.venv/bin/python -m playwright install-deps chromium` with the required system privileges.
-
-Open [localhost:3000](http://localhost:3000). The production image installs Crawl4AI and Chromium and verifies the browser launches as `node`. The devcontainer uses the Dockerfile's `system` stage and requires the Python dependency/browser installation above. Keep a Codespaces port private because the application's login does not protect its API. The existing UI browser tests still use CloakBrowser; install it separately with `npx --no-install cloakbrowser install` before running them.
+Open [localhost:3000](http://localhost:3000). Codespaces forwards port 3000 and opens its frontend URL automatically when the port is forwarded; the launcher also prints the URL. The frontend, API, and Vite live reload share this port. The production image runs the Node application as `node`. UI tests use the existing development-only CloakBrowser/Playwright dependencies: install their browser with `npx --no-install cloakbrowser install`, or set `CHROMIUM_EXECUTABLE` to an installed Chromium binary. Install browser OS libraries only on the test host when needed.
 
 | Configuration | Current use |
 | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection; loaded from `.env` or the process environment |
+| `LLM_BASE_URL`, `LLM_API_KEY` | Complete server-only provider override; configure both together. With neither set, existing `AICREDITS_API_KEY` uses `https://api.aicredits.in/v1`. Retrieval requires native search, URL filters and citations |
 | `PORT` | Express port, default `3000` |
 | `NODE_ENV=production` | Serve built frontend assets instead of Vite middleware |
 | `DISABLE_HMR=true` | Disable development HMR/file watching through Vite configuration |
-| `CRAWL4AI_PYTHON` | Python 3.11+ interpreter; defaults to `.venv/bin/python` when present, then `python3`. Docker sets `/opt/crawl4ai/bin/python`. |
 | `CLOAKBROWSER_AUTO_UPDATE=false` | Used by the existing UI browser tests to disable automatic browser updates |
-| `GEMINI_API_KEY` | Present in the example file but unused by the current application; configure the LLM through the UI |
 
 For a production build outside Docker:
 
@@ -98,7 +91,13 @@ npm run build
 NODE_ENV=production npm start
 ```
 
-`npm start` alone does not set production mode. `npm run preview` serves the Vite frontend preview, not the Express API. The optional Linux helper `./start.sh` stops this checkout's existing listeners on ports 3000 and 24678, then starts development.
+`npm start` alone does not set production mode. `npm run preview` serves the Vite frontend preview, not the Express API. The Linux launcher `./start.sh` requires Node, npm, and `lsof`; the development container includes Git and `lsof`. Rebuild the container to apply development-tool or forwarding changes. The launcher stops only this checkout's existing listener on port 3000 (or the exported `PORT`), allows ten seconds for graceful shutdown, and refuses to stop another project's process. Run it again after changing `.env` to reload server credentials. `npm run dev` starts the same application without the restart checks.
+
+With the development server running, verify its frontend, database readiness, and live-reload websocket without additional dependencies:
+
+```bash
+node scripts/verify-dev-server.mjs
+```
 
 ## Importing and reviewing a catalog
 
@@ -127,19 +126,19 @@ Keep identifiers such as SKUs and barcodes as text in spreadsheets to avoid nume
 4. Use **Scrape Selected** for URL evidence. Failed scrapes can enter the manual-content queue. **Edit SAP** is available when a SKU has no nonblank scraped content; saving it preserves the uploaded row and previous QA result.
 5. Create one job from SKUs sharing one nonblank attribute set. Open **Jobs** and run it.
 
-Every **Scrape URL**, **Scrape Selected**, and automatic job scrape uses a Crawl4AI browser agent with the server provider credentials and saved model. The agent inspects the supplied product page, loads lazy content, and opens product tabs/accordions for the current variant. It does not crawl the whole site, change variants, log in, submit forms, or solve CAPTCHAs. Blocked pages, unusable content, and failed runs keep the existing SAP/manual-content fallback; no scraper can guarantee success on every URL.
+The **Scrapper agent**, Dashboard URL retrieval, and automatic job retrieval share one bounded Chat Completions request using the saved **Scrapper model**, defaulting to `perplexity/sonar`. Jobs use their snapshotted model. The server supplies the shared `LLM_BASE_URL` and `LLM_API_KEY`; browsers send only `{url}`. No additional key, local browser, or agent runtime is needed.
 
-The most specific enabled matching domain rule still controls CSS extraction. Dynamic tabs need both control and panel selectors; their wait defaults to 300 ms and supports 0–10,000 ms. Configured tabs are captured separately from the agent's eight-decision limit. Selectors that match nothing fail visibly. Product evidence is converted from captured HTML into Markdown, preserving specification labels and tables; the LLM chooses browser actions instead of rewriting source facts. Saved content and subsequent QA/export behavior remain the same, including the existing 40,000-character default QA evidence limit and truncation warning.
+The request restricts native search with `search_domain_filter: [url]`. The gateway must forward this filter and return provider source metadata (`citations` or URL citation annotations). Content must be complete and nonempty, and all used citations must match the supplied URL, including its query parameters. Unavailable pages, refusals, truncation, missing citations, or outside sources fail visibly and preserve SAP/manual-content fallback. Public address validation, cancellation, a 120-second retrieval deadline, and shared provider admission still apply. Retrieved Markdown is stored in `scraped_markdown`; retrieval usage is separate from QA token totals.
 
-Express starts the Python SDK worker as a subprocess; its JSON stdin/stdout protocol is internal and exposes no additional service or port. Scrapes run one at a time, with a FIFO queue of up to eight waiting requests. A queued request waits at most 120 seconds; execution has a separate 120-second limit and at most eight agent decisions. Requests fail visibly when limits are reached, and worker/browser cleanup runs on completion, failure, or client disconnect. Each scrape makes LLM calls and incurs provider cost; those calls are separate from existing QA token totals.
+CSS selectors and dynamic-tab configuration have been retired. Existing selector data remains untouched. Provider-generated factual content still requires human review; source matching cannot prove that every returned statement is accurate.
 
 Jobs execute on one PostgreSQL-owned server worker, one SKU at a time. Closing the tab or switching modules does not stop execution. Reopen Jobs to view progress, cancel your runs, and choose historical results. Cancellation aborts active requests and keeps committed results. After a restart, unfinished items resume within their original deadline and attempt budget; committed results are skipped. A provider call interrupted before its result was saved can be billed again. Editing evidence increments its revision, preventing older runs from overwriting the new catalog evidence.
 
 ### QA settings and results
 
-Defaults are 4,096 output tokens, temperature 0.1, and 40,000 evidence characters. QA allows at most three server-owned attempts for transient failures within a five-minute per-SKU deadline; permanent errors fail immediately. Provider admission is shared across QA, scraping and admin tests: two active calls, eight waiting. Response bodies remain subject to deadlines and a 4 MiB limit. Scrape-agent decisions have their existing separate limit of eight calls.
+Defaults are 4,096 output tokens, temperature 0.1, and 40,000 evidence characters. QA allows at most three server-owned attempts for transient failures within a five-minute per-SKU deadline; permanent errors fail immediately. Provider admission is shared across QA, scraping and admin tests: two active calls, eight waiting. Response bodies remain subject to deadlines and a 4 MiB limit. Each URL retrieval makes one provider call without automatic retries.
 
-**Test saved settings** performs and validates a sample QA task on the server. Save first; this action uses the shared provider key and incurs provider cost. Only OpenAI-compatible chat completions are supported.
+**Test API** independently checks both displayed model IDs, including unsaved edits, without saving settings. Both models receive a short connectivity prompt independent of shared QA instructions, output limits and URL retrieval. Results appear inline and in Notifications; provider errors, empty/refused/truncated responses and timeouts fail visibly. Both checks use the shared server key and incur provider cost.
 
 Each run fetches shared memory and category rules before processing. Unavailable shared configuration prevents the run from starting. Missing, blank, or ambiguous rules produce a general review with a warning; truncated web content also produces a warning. A SKU with no usable SAP or web evidence fails. The same prepared evidence is retained through that SKU's retries.
 
@@ -192,19 +191,14 @@ Routes are registered in [server.ts](server.ts) and its server modules. APIs req
 | `/api/qa-configuration` | GET | Shared memory and attribute sets in one snapshot |
 | `/api/qa-agent-memory` | PUT | Save shared memory |
 | `/api/attribute-sets`, `/api/attribute-sets/:id`, `/api/attribute-sets/import` | POST collection/import; PUT/DELETE item | Maintain shared category rules |
-| `/api/site-selectors`, `/api/site-selectors/:id` | GET/POST collection; PUT/DELETE item | Maintain extraction rules |
 | `/api/scrape` | POST | `{ url }` → `{ markdown }`; failures use `{ error, details }` |
-| `/api/chat` | POST | Admin test of saved settings; accepts `{}` |
+| `/api/chat` | POST | Admin test; accepts optional `modelName` and `purpose: "qa" \| "scrapper"` (defaults to QA) |
 
 Run `npm test` for the complete fast suite, including provider limits. Run `TEST_DATABASE_URL=... npm run test:security-db` against a disposable PostgreSQL instance for auth, transactions, recovery, cancellation, and failure injection. Other focused checks:
 
 ```bash
 npm run lint
 npm run test:job-state
-npm run test:site-selector
-npm run test:blocked-page
-npm run test:db-error
-npm run test:lazy-content
 npm run test:llm-response
 npm run test:qa-agent
 npm run test:scrape-agent
@@ -214,19 +208,15 @@ npm run test:scrape-agent
 
 ```bash
 # Requires an installed CloakBrowser binary and its OS libraries.
-npm run test:tab-capture
 npm run test:sap-editor
-
-# Requires the Crawl4AI virtualenv and Chromium installed above.
-CRAWL4AI_PYTHON="$PWD/.venv/bin/python" npm run test:crawl-worker
 
 # Set TEST_DATABASE_URL to a disposable test database before running.
 npm run test:qa-config-db
 ```
 
-The Crawl4AI checks passed locally with Python 3.11, Crawl4AI 0.9.3, and Playwright 1.58 (the workspace runs Debian 11). Checks covered real browser fixtures, all three UI entry points, process cleanup, and a production API scrape of a public page using a mocked LLM response. Deployment additionally requires the Docker browser and worker smoke checks below. A live LLM-provider run uses the server credentials and shared model settings.
+The retrieval checks exercise one-call dispatch, public URL validation, exact source matching (including query variants), refusals/unavailable content, response limits, credential isolation and cancellation. Browser checks cover the renamed screen, Dashboard context saving, model persistence, unsaved draft testing, independent mixed results and duplicate-click prevention. Test API checks model connectivity. Use Scrapper agent’s Retrieve URL action separately to validate browsing and source metadata.
 
-The database test creates and drops an isolated schema. Never point it at the shared production database. The SAP editor browser test mocks API traffic; it does not prove real database persistence. Check the [analysis validation record](docs/codebase-analysis.md#validation-record) for what was actually run.
+The database test creates and drops an isolated schema. Never point it at the shared production database. The SAP editor browser test mocks API traffic; it does not prove real database persistence. Check the [implementation validation record](docs/security-and-jobs.md#implementation-validation) for what was actually run.
 
 ## Deployment and updates
 
@@ -244,7 +234,7 @@ https://project22.tail608e42.ts.net/
 
 The deployment directory is `/opt/paxth-qa`. Its gateway requires separately supplied credentials; a Tailscale client is not required. The separate Rakazo application uses `https://rakazo.tail608e42.ts.net/`, its own containers, and the default Tailscale service. Do not change those resources. A legacy Rakazo-hostname listener on port 8443 also points to the QA gateway; leave that existing route unchanged.
 
-[compose.yaml](compose.yaml) defines the separate `paxth-qa` project, image `paxth-qa:local`, restart policy, loopback port binding, 1 CPU, 1,536 MiB memory, 256 MiB shared memory, and rotating container logs. The image runs as `node`, installs pinned Crawl4AI and Chromium, checks the browser launch, and serves the production build. Secrets, virtualenvs, Python caches, and backups are excluded from the image build. On the Docker-capable deployment host, also run `/opt/crawl4ai/bin/python scraper/worker_test.py` inside the candidate image before promotion, with no production environment file attached.
+[compose.yaml](compose.yaml) defines the separate `paxth-qa` project, image `paxth-qa:local`, restart policy, loopback port binding, 1 CPU, 1,536 MiB memory, 256 MiB shared memory, and rotating container logs. The image runs the Node production build as `node`, without Python or a retrieval browser. UI browser dependencies remain development-only. Secrets and backups are excluded from the image build.
 
 Keep `/opt/paxth-qa/.env` readable only by its owner (`chmod 600 .env`). Its `DATABASE_URL` must reach PostgreSQL from inside the container: container `localhost` is not the VPS host. Caddy should authenticate every page, asset, and API request, strip inbound `Authorization` before proxying, store only the password hash, and accept the Funnel hostname. This repository does not contain its Caddyfile.
 
@@ -309,11 +299,11 @@ The earlier deployment notes name `/opt/paxth-qa/backups/Caddyfile.before` as a 
 | GitHub has new code but the public URL looks unchanged | Update/rebuild on the VPS; restarting the old container is insufficient. Refresh the browser after deployment. |
 | Startup fails or readiness is unavailable | Inspect migration errors; resolve conflicting data on a restored copy before production. |
 | Settings/rules will not save | Sign in as an administrator and check PostgreSQL availability. Model settings and memory save atomically. |
-| Scrape fails or shows a challenge | Test the URL/selectors in Scraper; use SAP or manually supplied product content when needed. Check browser installation and container logs. |
+| Scrape fails or shows a challenge | Test both models in LLM Settings, then the URL in Scrapper agent; check gateway search/filter/citation support. Use SAP or manually supplied content when needed. |
 | Job remains queued | Check server worker logs, provider configuration, and database availability. Reloading the browser does not interrupt execution. |
 | An upload fails | Read the visible error. No rows from a failed batch are committed; retry after correcting the problem. |
-| A save/delete looks successful but returns after reload | Several mutation paths ignore failed HTTP responses. Reload to verify persistence; see findings F03/F04 in the analysis. |
+| A save/delete looks successful but returns after reload | Check the visible error and database availability, then reload to verify persistence. |
 | Combined export is rejected | Use one identical category name and compatible original header order across all included SKUs. |
 | Login fails after upgrade | Browser-local accounts are retired. Bootstrap a server administrator and recreate accounts. |
 
-The analysis also identifies vulnerable dependencies, unbounded server work, and missing URL restrictions. Treat these as concrete follow-up work before expanding access. This documentation change does not fix them or certify the live deployment.
+See [security and durable jobs](docs/security-and-jobs.md) for server work limits, public URL restrictions, release checks, and the remaining validation limits.

@@ -2,6 +2,22 @@ export class ProviderError extends Error {
   constructor(message: string, public status = 502, public retryable = false, public retryAfterMs = 0) { super(message); }
 }
 
+export async function providerResponseError(response: Response, apiKey: string) {
+  const data = await response.json().catch(() => null);
+  let detail = typeof data?.error?.message === "string" ? data.error.message
+    : typeof data?.error === "string" ? data.error : "";
+  if (apiKey) detail = detail.split(apiKey).join("[redacted]");
+  detail = detail.replace(/sk-[\w-]+/gi, "[redacted]")
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/[\r\n\x00-\x1f]+/g, " ").slice(0, 500);
+  const retry = response.headers.get("retry-after");
+  const retryAfterMs = retry ? /^\d+(\.\d+)?$/.test(retry) ? Number(retry) * 1000 : Math.max(0, Date.parse(retry) - Date.now()) : 0;
+  // HTTP 401 belongs to the app session; an upstream key failure must not sign the user out.
+  return new ProviderError(`Model request failed (HTTP ${response.status}).${detail ? ` ${detail}` : ""}`,
+    [401, 403].includes(response.status) ? 502 : response.status,
+    [408, 429, 500, 502, 503, 504, 529].includes(response.status), retryAfterMs);
+}
+
 let active = 0;
 const waiting: Array<{ start: () => void }> = [];
 
@@ -64,7 +80,7 @@ async function bufferResponse(response: Response, signal: AbortSignal) {
   }
 }
 
-/** Shared by QA, scraper decisions, and admin tests; no retries at this layer. */
+/** Shared by QA, URL retrieval, and admin tests; no retries at this layer. */
 export async function fetchChatCompletion(
   baseUrl: string, apiKey: string, payload: unknown, signal: AbortSignal,
   beforeFetch?: () => Promise<void>,

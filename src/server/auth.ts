@@ -77,7 +77,7 @@ function role(value: unknown) {
 export function requiresAdmin(method: string, path: string) {
   const normalized = path.toLowerCase();
   return method === 'DELETE' || /^\/(users|chat)(\/|$)/.test(normalized) ||
-    (!['GET', 'HEAD', 'OPTIONS'].includes(method) && /^\/(attribute-sets|site-selectors|qa-agent-memory|provider-settings)(\/|$)/.test(normalized));
+    (!['GET', 'HEAD', 'OPTIONS'].includes(method) && /^\/(attribute-sets|qa-agent-memory|provider-settings)(\/|$)/.test(normalized));
 }
 
 function sessionToken(req: Request) {

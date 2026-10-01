@@ -8,7 +8,7 @@ import { AttributeSetsModule } from './components/AttributeSetsModule';
 import { DashboardModule } from './components/DashboardModule';
 import { JobsModule } from './components/JobsModule';
 import { LLMSettingsModule } from './components/LLMSettingsModule';
-import { ScraperModule } from './components/ScraperModule';
+import { ScrapperAgentModule } from './components/ScrapperAgentModule';
 import { UsersModule } from './components/UsersModule';
 import { NotificationsMenu } from './components/NotificationsMenu';
 import { UserNav } from './components/UserNav';
@@ -59,7 +59,7 @@ function MainLayout() {
 
   const navItems = [
     { id: 'dashboard', label: 'Dashboard' },
-    { id: 'scraper', label: 'Scraper' },
+    { id: 'scraper', label: 'Scrapper agent' },
     { id: 'attribute-sets', label: 'Attribute Sets' },
     { id: 'jobs', label: 'Jobs' },
     ...(isSystemAdmin ? [{ id: 'llm-settings', label: 'LLM Settings', adminOnly: true }] : []),
@@ -113,7 +113,7 @@ function MainLayout() {
       </nav>
       <main className="flex-1 flex overflow-hidden">
         {activeModule === 'dashboard' && <DashboardModule />}
-        {activeModule === 'scraper' && <ScraperModule />}
+        {activeModule === 'scraper' && <ScrapperAgentModule />}
         {activeModule === 'attribute-sets' && <AttributeSetsModule />}
         {activeModule === 'jobs' && <JobsModule />}
         {activeModule === 'llm-settings' && isSystemAdmin && <LLMSettingsModule />}

@@ -13,6 +13,7 @@ import {initializeProvider,registerProviderRoutes} from './provider';
 import {initializeJobRuns,registerJobRunRoutes,startJobWorker} from './jobRunner';
 import {ApiError,registerCatalogRoutes} from './catalog';
 import {ProviderError} from '../lib/chatCompletion';
+import {DEFAULT_SETTINGS,editableSettings} from '../lib/providerSettings';
 
 assert.ok(process.env.TEST_DATABASE_URL,'Set TEST_DATABASE_URL to a disposable PostgreSQL instance. Production DATABASE_URL is never used.');
 const namespace=`security_${randomUUID().replaceAll('-','')}`;
@@ -23,13 +24,19 @@ const server=createServer();
 let stopWorker:(()=>Promise<void>)|undefined;
 let stopSecond:(()=>Promise<void>)|undefined;
 let calls=0, providerMode='success';
+const providerRequests:any[]=[];
 const provider=createServer(async(req,res)=>{
-  for await(const _ of req) {/* consume local fake request */}
+  let raw='';for await(const chunk of req) raw+=chunk;
+  const payload=JSON.parse(raw);providerRequests.push(payload);
   calls++;
   if(providerMode==='wait') await delay(1200);
   if(providerMode==='permanent'){res.writeHead(400);res.end('{}');return;}
   res.setHeader('Content-Type','application/json');
-  res.end(JSON.stringify({choices:[{message:{content:JSON.stringify({qa_status:'pass',confidence:'high',summary:'Matches source',issue_count:0,issues:[],source_notes:{sap_used:true,url_used:false,source_conflicts:[]}})}}],usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}}));
+  if(payload.search_domain_filter) {
+    res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify({status:'ok',markdown:'# Retrieved product\nBrand: TestBrand'})}}],citations:providerMode==='no-citations'?[]:payload.search_domain_filter}));return;
+  }
+  const webUsed=payload.messages.some((message:any)=>message.content.includes('Retrieved product'));
+  res.end(JSON.stringify({choices:[{message:{content:JSON.stringify({qa_status:'pass',confidence:'high',summary:'Matches source',issue_count:0,issues:[],source_notes:{sap_used:true,url_used:webUsed,source_conflicts:[]}})}}],usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}}));
 });
 const listen=(s:ReturnType<typeof createServer>)=>new Promise<void>(resolve=>s.listen(0,'127.0.0.1',resolve));
 try {
@@ -73,6 +80,32 @@ try {
   assert.equal((await request('/api/users/admin','PUT',{role:'user'},admin)).status,409);
   const settings=await request('/api/provider-settings','GET',undefined,user);
   assert.equal(settings.status,200);assert.doesNotMatch(JSON.stringify(settings.body),/test-secret-only|apiKey/);
+  assert.equal(settings.body.scrapperModelName,'perplexity/sonar');
+  assert.equal(settings.body.baseUrl,'','The gateway destination remains server-only');
+  const configured={...editableSettings(DEFAULT_SETTINGS),modelName:'test/qa',scrapperModelName:'test/sonar'};
+  assert.equal((await request('/api/provider-settings','PUT',configured,admin)).status,200);
+  assert.equal((await request('/api/provider-settings','GET',undefined,user)).body.scrapperModelName,'test/sonar');
+  assert.equal((await request('/api/chat','POST',{modelName:'unsaved/qa'},admin)).status,200);
+  assert.equal(providerRequests.at(-1).model,'unsaved/qa');
+  assert.equal(providerRequests.at(-1).messages.length,1);
+  assert.equal((await request('/api/chat','POST',{purpose:'scrapper',modelName:'unsaved/sonar'},admin)).status,200);
+  assert.equal(providerRequests.at(-1).model,'unsaved/sonar');
+  assert.equal(providerRequests.at(-1).messages.length,1);
+  assert.equal(providerRequests.at(-1).search_domain_filter,undefined,'Both API tests send only connectivity prompts');
+  assert.equal((await request('/api/provider-settings','GET',undefined,user)).body.scrapperModelName,'test/sonar','Tests never save draft models');
+  providerMode='no-citations';
+  assert.equal((await request('/api/chat','POST',{purpose:'scrapper'},admin)).status,200,'Connectivity tests do not require retrieval citations');
+  assert.equal((await request('/api/chat','POST',{purpose:'qa'},admin)).status,200,'QA connectivity remains independent of retrieval failures');
+  providerMode='success';calls=0;
+  assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product?variant=42',modelName:'injected'},user)).status,400);
+  assert.equal((await request('/api/scrape','POST',{url:'http://127.0.0.1/page'},user)).status,400);
+  const retrieved=await request('/api/scrape','POST',{url:'https://8.8.8.8/product?variant=42'},user);
+  assert.equal(retrieved.status,200);assert.deepEqual(Object.keys(retrieved.body),['markdown']);
+  assert.match(retrieved.body.markdown,/variant=42/);assert.equal(providerRequests.at(-1).model,'test/sonar');
+  assert.doesNotMatch(JSON.stringify(providerRequests),/test-secret-only/);
+  providerMode='no-citations';
+  assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product'},user)).status,502);
+  providerMode='success';calls=0;
   assert.equal((await request('/api/chat','POST',{baseUrl:'http://evil',apiKey:'x'},admin)).status,400);
   const sku=(id:string)=>({sku:id,source:{sap:'Brand: TestBrand'},raw_row:{sku:id},upload_attributes:{brand:'TestBrand'},attribute_set:'TestSet',status:'ready'});
   assert.equal((await request('/api/catalog','POST',[sku('a'),{sku:'invalid'}],user)).status,400);
@@ -86,11 +119,43 @@ try {
   assert.equal((await request('/api/catalog/nope','PUT',{source:{sap:'x'}},user)).status,404);
   assert.equal((await request('/api/jobs','POST',{id:'bad',name:'Bad',skus:{a:true}},user)).status,400);
   const job=await request('/api/jobs','POST',{id:'job',name:'Job',skus:['a','b'],attribute_set:'TestSet'},user);assert.equal(job.status,201);
+  const credentials={baseUrl:process.env.LLM_BASE_URL,key:process.env.LLM_API_KEY,legacyKey:process.env.AICREDITS_API_KEY};
+  delete process.env.LLM_BASE_URL;delete process.env.LLM_API_KEY;delete process.env.AICREDITS_API_KEY;
+  const missingProvider=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'all'},user);
+  assert.equal(missingProvider.status,503);
+  assert.match(missingProvider.body.error,/LLM_BASE_URL.*LLM_API_KEY/,'Missing credentials return actionable configuration errors');
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM job_runs')).rows[0].count,0,'A failed preflight saves no run');
+  process.env.LLM_API_KEY=credentials.key;
+  const partialProvider=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'all'},user);
+  assert.equal(partialProvider.status,503);
+  assert.match(partialProvider.body.error,/LLM_BASE_URL.*LLM_API_KEY/);
+  process.env.LLM_BASE_URL=credentials.baseUrl;process.env.LLM_API_KEY=credentials.key;
+  if(credentials.legacyKey===undefined)delete process.env.AICREDITS_API_KEY;else process.env.AICREDITS_API_KEY=credentials.legacyKey;
+  // Start and cancel must read their committed result without checking out a second connection.
+  assert.equal((await request('/api/jobs','POST',{id:'pool-check',name:'Pool check',skus:['a']},user)).status,201);
+  const singlePool=new Pool({connectionString:process.env.TEST_DATABASE_URL,options:`-c search_path=${namespace}`,max:1,connectionTimeoutMillis:1000,query_timeout:1000});
+  const singleApp=express();singleApp.use(express.json());
+  singleApp.use((_req,res,next)=>{res.locals.user={id:'user',username:'Operator',role:'user'};next();});
+  registerJobRunRoutes(singleApp,singlePool);
+  const singleServer=createServer(singleApp);await listen(singleServer);
+  try {
+    const singleOrigin=`http://127.0.0.1:${(singleServer.address() as any).port}`;
+    const accepted=await fetch(singleOrigin+'/api/jobs/pool-check/runs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({requestId:randomUUID(),mode:'all'})});
+    assert.equal(accepted.status,202,'Starting a run works with a one-connection pool');
+    const acceptedRun=await accepted.json() as any;
+    const cancelled=await fetch(singleOrigin+`/api/job-runs/${acceptedRun.id}/cancel`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    assert.equal(cancelled.status,200,'Cancellation reads its committed result using the same connection');
+    assert.equal((await cancelled.json() as any).status,'cancelling');
+  } finally {
+    await new Promise<void>(resolve=>singleServer.close(()=>resolve()));
+    await singlePool.end();
+    await pool.query("DELETE FROM jobs WHERE id='pool-check'");
+  }
   const runBody={requestId:randomUUID(),mode:'all'};
   const [first,repeated]=await Promise.all([request('/api/jobs/job/runs','POST',runBody,user),request('/api/jobs/job/runs','POST',runBody,user)]);
-  // Concurrent repeatable-read start may serialize-retry as 503, so repeat the same idempotency key.
-  const run=first.status===202?first:repeated;
-  assert.equal(run.status,202);
+  assert.equal(first.status,202);assert.equal(repeated.status,202);
+  assert.equal(first.body.id,repeated.body.id,'Concurrent identical starts return the same accepted run');
+  const run=first;
   assert.equal((await request('/api/jobs/job/runs','POST',runBody,user)).body.id,run.body.id);
   assert.equal((await request('/api/jobs/job/runs','POST',{...runBody,requestId:randomUUID()},user)).status,409);
   assert.equal((await request('/api/data','DELETE',undefined,admin)).status,409);
@@ -109,7 +174,9 @@ try {
   assert.equal(current.find((row:any)=>row.sku==='a').source.sap,'New evidence');assert.ok(!current.find((row:any)=>row.sku==='a').qa_result,'New evidence must not acquire stale result');
   await stopWorker();stopWorker=undefined;await stopSecond();stopSecond=undefined;
   // Simulate an interrupted run with one saved item and a consumed attempt on the other.
-  const restart=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'all'},user);
+  const restarts=await Promise.all([request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'all'},user),request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'all'},user)]);
+  assert.deepEqual(restarts.map(response=>response.status).sort(),[202,409],'Concurrent distinct starts accept one run and report an active-run conflict');
+  const restart=restarts.find(response=>response.status===202)!;
   await pool.query("UPDATE job_runs SET status='running',owner_token='old-owner',started_at=now() WHERE id=$1",[restart.body.id]);
   await pool.query("UPDATE job_run_items SET status='completed',result=$2 WHERE run_id=$1 AND sku='b'",[restart.body.id,JSON.stringify(history.items[1].result)]);
   await pool.query("UPDATE job_run_items SET status='running',attempts=1,started_at=now() WHERE run_id=$1 AND sku='a'",[restart.body.id]);
@@ -147,6 +214,31 @@ try {
   await waitFor(async()=>(await request(`/api/job-runs/${expired.body.id}`,'GET',undefined,user)).body.status==='failed','expired item deadline');
   assert.equal(calls,beforeExhaustion);
   await stopWorker();stopWorker=undefined;
+  // Retrieval and QA use their respective run snapshots, even after settings change.
+  const productUrl='https://8.8.8.8/product?variant=42';
+  assert.equal((await request('/api/catalog/b','PUT',{source:{sap:'Brand: TestBrand',url:productUrl},scraped_markdown:''},user)).status,200);
+  const webRun=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'b'},user);
+  const snapshotConfig=(await pool.query('SELECT configuration FROM job_runs WHERE id=$1',[webRun.body.id])).rows[0].configuration;
+  assert.equal(snapshotConfig.settings.scrapperModelName,'test/sonar');assert.ok(!('selectors' in snapshotConfig));
+  assert.doesNotMatch(JSON.stringify(snapshotConfig),/test-secret-only|apiKey/);
+  await request('/api/provider-settings','PUT',{...configured,modelName:'next/qa',scrapperModelName:'next/sonar'},admin);
+  providerMode='success';let offset=providerRequests.length;stopWorker=startJobWorker(pool);
+  await waitFor(async()=>(await request(`/api/job-runs/${webRun.body.id}`,'GET',undefined,user)).body.status==='completed','snapshotted retrieval');
+  await stopWorker();stopWorker=undefined;
+  assert.deepEqual(providerRequests.slice(offset).map(payload=>payload.model),['test/sonar','test/qa']);
+  assert.deepEqual(providerRequests[offset].search_domain_filter,[productUrl]);
+  const webHistory=(await request(`/api/job-runs/${webRun.body.id}`,'GET',undefined,user)).body;
+  assert.match(webHistory.items[1].result.scraped_markdown,/Retrieved product/);
+  assert.match((await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='b').scraped_markdown,/variant=42/);
+  // Old job snapshots get the Sonar default without rewriting stored configuration.
+  await pool.query("UPDATE sku_data SET scraped_markdown=NULL,scrape_status=NULL WHERE sku='b'");
+  const legacyRun=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'b'},user);
+  await pool.query("UPDATE job_runs SET configuration=jsonb_set(configuration,'{settings}',(configuration->'settings')-'scrapperModelName') WHERE id=$1",[legacyRun.body.id]);
+  offset=providerRequests.length;stopWorker=startJobWorker(pool);
+  await waitFor(async()=>(await request(`/api/job-runs/${legacyRun.body.id}`,'GET',undefined,user)).body.status==='completed','legacy retrieval defaults');
+  await stopWorker();stopWorker=undefined;
+  assert.equal(providerRequests[offset].model,'perplexity/sonar');
+  assert.equal(providerRequests[offset+1].model,'next/qa');
   await initializeDatabase(pool); // Existing populated records remain readable after restart migrations.
   // Clear remains all-or-nothing even if catalog deletion fails after deleting jobs.
   await pool.query("CREATE FUNCTION fail_clear() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected clear failure'; END $$; CREATE TRIGGER fail_clear BEFORE DELETE ON sku_data FOR EACH ROW EXECUTE FUNCTION fail_clear()");
@@ -161,11 +253,12 @@ try {
   assert.equal((await request('/api/catalog','GET',undefined,other)).status,401);
   await request('/api/auth/logout','POST',undefined,admin);
   assert.equal((await request('/api/catalog','GET',undefined,admin)).status,401);
-  // Existing conflicting selector domains stop migrations without removing data.
-  await pool.query("DROP INDEX site_selectors_website_idx; ALTER TABLE site_selectors DROP CONSTRAINT site_selectors_canonical; INSERT INTO site_selectors(id,website,selectors) VALUES('one','example.com','main'),('two','www.example.com','article')");
-  await assert.rejects(initializeDatabase(pool),/manual resolution/);
+  // Retired selector data never blocks startup and is left untouched.
+  await pool.query("CREATE TABLE site_selectors(id text PRIMARY KEY,website text,selectors text); INSERT INTO site_selectors VALUES('one','Example.com','main'),('two','www.example.com','article')");
+  await initializeDatabase(pool);await verifySchema(pool);
   assert.equal((await pool.query('SELECT * FROM site_selectors')).rowCount,2);
-  console.log('Security/database checks passed: sessions, roles, atomic saves, recovery, ownership, cancellation, budgets, history, and migration conflicts.');
+  assert.equal((await pool.query("SELECT website FROM site_selectors WHERE id='one'")).rows[0].website,'Example.com');
+  console.log('Security/database checks passed: sessions, roles, atomic saves, recovery, ownership, cancellation, budgets, model snapshots, retrieval, and preserved legacy data.');
 } finally {
   await stopWorker?.();await stopSecond?.();server.closeAllConnections();provider.closeAllConnections();
   await Promise.all([new Promise<void>(resolve=>server.close(()=>resolve())),new Promise<void>(resolve=>provider.close(()=>resolve()))]);

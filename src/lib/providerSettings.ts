@@ -5,6 +5,7 @@ export interface AppSettings {
   baseUrl: string;
   providerConfigured: boolean;
   modelName: string;
+  scrapperModelName: string;
   temperature: number;
   maxTokens: number;
   maxConcurrency: number;
@@ -16,7 +17,7 @@ export interface AppSettings {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   llmProvider: "openai-compatible", baseUrl: "", providerConfigured: false,
-  modelName: "deepseek/deepseek-v4-flash", temperature: 0.1, maxTokens: 4096,
+  modelName: "deepseek/deepseek-v4-flash", scrapperModelName: "perplexity/sonar", temperature: 0.1, maxTokens: 4096,
   maxConcurrency: 1, maxRetries: 2, scraperTimeout: 120_000,
   maxPageContentLength: 40_000, qaAgentMemory: DEFAULT_QA_AGENT_MEMORY,
 };
@@ -30,9 +31,11 @@ export function normalizeMaxTokens(value: unknown): number {
 export function normalizeSettings(settings: Partial<AppSettings> = {}): AppSettings {
   return {
     ...DEFAULT_SETTINGS,
-    baseUrl: typeof settings.baseUrl === "string" ? settings.baseUrl : "",
+    baseUrl: "",
     providerConfigured: settings.providerConfigured === true,
     modelName: typeof settings.modelName === "string" && settings.modelName.trim() ? settings.modelName.trim() : DEFAULT_SETTINGS.modelName,
+    scrapperModelName: typeof settings.scrapperModelName === "string" && settings.scrapperModelName.trim()
+      ? settings.scrapperModelName.trim() : DEFAULT_SETTINGS.scrapperModelName,
     temperature: typeof settings.temperature === "number" && settings.temperature >= 0 && settings.temperature <= 1
       ? settings.temperature : DEFAULT_SETTINGS.temperature,
     maxTokens: normalizeMaxTokens(settings.maxTokens),
@@ -45,7 +48,8 @@ export function normalizeSettings(settings: Partial<AppSettings> = {}): AppSetti
 
 export function editableSettings(settings: AppSettings) {
   return {
-    modelName: settings.modelName, temperature: settings.temperature, maxTokens: settings.maxTokens,
+    modelName: settings.modelName, scrapperModelName: settings.scrapperModelName,
+    temperature: settings.temperature, maxTokens: settings.maxTokens,
     maxPageContentLength: settings.maxPageContentLength, qaAgentMemory: settings.qaAgentMemory,
   };
 }

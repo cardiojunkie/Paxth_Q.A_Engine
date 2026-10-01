@@ -3,7 +3,7 @@
   "build": {
     "dockerfile": "../Dockerfile",
     "context": "..",
-    "target": "system"
+    "target": "development"
   },
   "customizations": {
     "vscode": {
@@ -23,8 +23,8 @@
   "portsAttributes": {
     "3000": {
       "label": "Express + Vite Dev Server",
-      "onAutoForward": "notify"
+      "onAutoForward": "openBrowser"
     }
   },
-  "postCreateCommand": "npm install"
+  "postCreateCommand": "npm ci"
 }

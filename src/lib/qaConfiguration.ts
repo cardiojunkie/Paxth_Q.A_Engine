@@ -16,15 +16,3 @@ export async function fetchQaConfiguration(): Promise<QaConfiguration> {
   }
   return data;
 }
-
-export async function saveQaAgentMemory(qaAgentMemory: string): Promise<string> {
-  const response = await fetch("/api/qa-agent-memory", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ qaAgentMemory }),
-  });
-  if (!response.ok) throw new Error("QA agent memory was not saved to Supabase. Check the database connection and retry.");
-  const saved = await response.json();
-  if (typeof saved?.qaAgentMemory !== "string" || !saved.qaAgentMemory.trim()) throw new Error("The server did not confirm the saved QA memory.");
-  return saved.qaAgentMemory;
-}

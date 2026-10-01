@@ -1,13 +1,25 @@
 import assert from 'node:assert/strict';
 import {setTimeout as delay} from 'node:timers/promises';
-import {completeQa,validateSettings} from './provider';
-import {fetchChatCompletion} from '../lib/chatCompletion';
+import express from 'express';
+import type { Pool } from 'pg';
+import {completeQa,validateSettings,registerProviderRoutes,getProviderCredentials} from './provider';
+import {fetchChatCompletion,providerResponseError} from '../lib/chatCompletion';
 import {editableSettings,DEFAULT_SETTINGS} from '../lib/providerSettings';
 const keepAlive=setInterval(()=>{},1000);
 const original=globalThis.fetch;
 const originalUrl=process.env.LLM_BASE_URL, originalKey=process.env.LLM_API_KEY;
+const originalLegacyKey=process.env.AICREDITS_API_KEY;
 process.env.LLM_BASE_URL='https://provider.example/v1';process.env.LLM_API_KEY='test-only';
 try {
+  process.env.AICREDITS_API_KEY='legacy-test-only';
+  delete process.env.LLM_BASE_URL;delete process.env.LLM_API_KEY;
+  assert.deepEqual(getProviderCredentials(),{baseUrl:'https://api.aicredits.in/v1',apiKey:'legacy-test-only'});
+  process.env.LLM_BASE_URL='https://provider.example/v1';
+  assert.throws(()=>getProviderCredentials(),/Configure both/, 'Never send the legacy key to an overridden destination');
+  delete process.env.LLM_BASE_URL;process.env.LLM_API_KEY='test-only';
+  assert.throws(()=>getProviderCredentials(),/Configure both/, 'An explicit key requires its explicit destination');
+  process.env.LLM_BASE_URL='https://provider.example/v1';
+  assert.deepEqual(getProviderCredentials(),{baseUrl:'https://provider.example/v1',apiKey:'test-only'},'Explicit credentials override the legacy pair');
   let calls=0;
   globalThis.fetch=async()=>{calls++;return Response.json({error:'invalid'},{status:400});};
   await assert.rejects(completeQa({},new AbortController().signal),/HTTP 400/);assert.equal(calls,1);
@@ -37,10 +49,82 @@ try {
   release();await Promise.all(requests);
   assert.throws(()=>validateSettings({...editableSettings(DEFAULT_SETTINGS),apiKey:'browser-key'}),/Invalid/);
   assert.throws(()=>validateSettings({...editableSettings(DEFAULT_SETTINGS),maxTokens:Infinity}),/Invalid/);
+  for(const scrapperModelName of ['', ' ', 42, 'x'.repeat(257)]) assert.throws(()=>validateSettings({...editableSettings(DEFAULT_SETTINGS),scrapperModelName}),/Invalid/);
+  assert.equal(validateSettings({...editableSettings(DEFAULT_SETTINGS),scrapperModelName:' custom/sonar '}).scrapperModelName,'custom/sonar');
+  const legacy:any={...editableSettings(DEFAULT_SETTINGS)};delete legacy.scrapperModelName;
+  assert.equal(validateSettings(legacy).scrapperModelName,'perplexity/sonar');
+  const sanitized=await providerResponseError(Response.json({error:{message:'Invalid test-only Bearer secret sk-other-secret'}},{status:401}), 'test-only');
+  assert.equal(sanitized.status,502);assert.doesNotMatch(sanitized.message,/test-only|Bearer secret|sk-other-secret/);
+  const app=express();app.use(express.json());
+  let role='admin';app.use((_req,res,next)=>{res.locals.user={role};next();});
+  let settingsReads=0,settingsUnavailable=false;
+  const pool={query:async()=>{
+    settingsReads++;
+    if(settingsUnavailable)throw new Error('Injected settings outage');
+    return {rows:[{settings:{...editableSettings(DEFAULT_SETTINGS),maxTokens:1,qaAgentMemory:'Must never enter connectivity prompt'},memory:'Must never enter connectivity prompt'}]};
+  }} as unknown as Pool;
+  registerProviderRoutes(app,pool);
+  const http=app.listen(0,'127.0.0.1');
+  await new Promise<void>(resolve=>http.once('listening',resolve));
+  const origin='http://127.0.0.1:'+(http.address() as any).port;
+  const request=async(body:any)=>{
+    const response=await original(origin+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    return {status:response.status,body:await response.json()};
+  };
+  try {
+    const payloads:any[]=[];
+    globalThis.fetch=async(_url,init)=>{payloads.push(JSON.parse(init!.body as string));return Response.json({choices:[{finish_reason:'stop',message:{content:'OK'}}]});};
+    assert.equal((await request({modelName:' draft/qa '})).status,200);
+    assert.equal(payloads[0].model,'draft/qa');
+    assert.equal(payloads[0].messages.length,1);assert.match(payloads[0].messages[0].content,/connectivity/);
+    assert.equal(payloads[0].max_tokens,DEFAULT_SETTINGS.maxTokens,'Connectivity is independent of saved QA output limits');
+    assert.equal(settingsReads,0,'A displayed draft model does not need a saved-settings query');
+    assert.doesNotMatch(JSON.stringify(payloads),/test-only|Must never|qa_status|sku/);
+    assert.equal((await request({})).body.purpose,'qa');
+    assert.equal(payloads[1].model,DEFAULT_SETTINGS.modelName);
+    settingsUnavailable=true;
+    const draftScrapper=await request({purpose:'scrapper',modelName:'draft/sonar'});
+    assert.deepEqual(draftScrapper.body,{success:true,purpose:'scrapper',modelName:'draft/sonar'});
+    assert.equal(payloads.at(-1).model,'draft/sonar');
+    assert.deepEqual(payloads.at(-1).messages,payloads[0].messages);
+    assert.ok(!('search_domain_filter' in payloads.at(-1)),'Scrapper connectivity does not require browsing');
+    assert.equal(settingsReads,1,'Explicit model tests still work during a settings outage');
+    settingsUnavailable=false;
+    assert.equal((await request({purpose:'scrapper'})).status,200);
+    assert.equal(payloads.at(-1).model,DEFAULT_SETTINGS.scrapperModelName);
+    assert.equal((await request({purpose:'other'})).status,400);
+    assert.equal((await request({purpose:'scrapper',apiKey:'bad'})).status,400);
+    role='user';assert.equal((await request({purpose:'scrapper',modelName:'draft/sonar'})).status,403);role='admin';
+    globalThis.fetch=async()=>Response.json({choices:[{message:{content:''}}]});
+    assert.match((await request({purpose:'qa'})).body.error,/empty/);
+    globalThis.fetch=async()=>Response.json({error:{message:'Wrong key test-only'}},{status:401});
+    const upstream=await request({});assert.equal(upstream.status,502);assert.doesNotMatch(upstream.body.error,/test-only/);
+    for(const message of [{refusal:'Unavailable'},{content:'Partial'}]) {
+      globalThis.fetch=async()=>Response.json({choices:[{finish_reason:message.refusal?'stop':'length',message}]});
+      assert.equal((await request({purpose:'scrapper',modelName:'draft/sonar'})).status,502);
+    }
+    globalThis.fetch=async()=>new Response('<html>Gateway failure</html>');
+    assert.match((await request({modelName:'draft/qa'})).body.error,/invalid JSON/);
+    globalThis.fetch=async()=>{throw new DOMException('Injected timeout','TimeoutError');};
+    assert.equal((await request({modelName:'draft/qa'})).status,504);
+    delete process.env.LLM_BASE_URL;delete process.env.LLM_API_KEY;delete process.env.AICREDITS_API_KEY;
+    globalThis.fetch=async()=>{throw new Error('No provider call is allowed without credentials');};
+    const missing=await request({modelName:'draft/qa'});
+    assert.equal(missing.status,503);assert.match(missing.body.error,/Configure both/);
+    process.env.AICREDITS_API_KEY='legacy-test-only';
+    globalThis.fetch=async(url,init)=>{
+      assert.equal(String(url),'https://api.aicredits.in/v1/chat/completions');
+      assert.equal(new Headers(init?.headers).get('Authorization'),'Bearer legacy-test-only');
+      assert.doesNotMatch(String(init?.body),/legacy-test-only/);
+      return Response.json({choices:[{finish_reason:'stop',message:{content:'OK'}}]});
+    };
+    assert.equal((await request({purpose:'qa',modelName:'draft/qa'})).status,200,'The existing key restores connectivity without copying secrets');
+  } finally {http.closeAllConnections();await new Promise<void>(resolve=>http.close(()=>resolve()));}
   console.log('Provider checks passed: retry counts, persistent attempts, stalled bodies, admission, and settings validation.');
 }finally{
   clearInterval(keepAlive);
   globalThis.fetch=original;
   if(originalUrl===undefined)delete process.env.LLM_BASE_URL;else process.env.LLM_BASE_URL=originalUrl;
   if(originalKey===undefined)delete process.env.LLM_API_KEY;else process.env.LLM_API_KEY=originalKey;
+  if(originalLegacyKey===undefined)delete process.env.AICREDITS_API_KEY;else process.env.AICREDITS_API_KEY=originalLegacyKey;
 }

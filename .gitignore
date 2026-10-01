@@ -1,4 +1,15 @@
-node_modules
+node_modules/
+dist/
+.cache/
+.vite/
+coverage/
+*.log
+*.tsbuildinfo
+backups/
+*.dump
+*.dump.*
+*.sql
+*.sql.gz
 .env
 .env.*
 !.env.example
@@ -6,3 +17,8 @@ node_modules
 .venv/
 __pycache__/
 *.pyc
+
+# Local agent settings and nested worktrees.
+.codex/config.toml
+.kilo/
+.kilocode/
