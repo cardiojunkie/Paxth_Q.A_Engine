@@ -23,7 +23,7 @@ Back up the database and retain the previous source and image before deployment 
 1. **Dashboard:** import the first sheet of an `.xlsx`, `.xls`, or `.csv` file, inspect/filter SKUs, scrape selected URLs, supply source content, and create jobs.
 2. **Scrapper agent:** retrieve a public URL through the configured browsing model and preview its Markdown.
 3. **Attribute Sets:** save category names and Markdown mapping rules in PostgreSQL.
-4. **LLM Settings:** administrators edit separate Q&A and Scrapper models, output limits, and shared QA instructions; both models use the server provider credentials.
+4. **LLM Settings:** administrators edit the Q&A model, output limits, and shared QA instructions. Browser scraping does not require a model or provider credentials.
 5. **Jobs:** run selected jobs, inspect results, rerun SKUs, and export detailed Excel feedback.
 6. **Users:** administrators manage shared server-authenticated accounts and roles.
 
@@ -55,7 +55,7 @@ Every protected API checks the server session and permissions. Keep the Caddy au
 
 ## Local setup
 
-Use **Node.js 22**, npm, and an accessible PostgreSQL database. Retrieval runs at the provider; Python and a local browser are not required by the application.
+Use **Node.js 22**, npm, an accessible PostgreSQL database, and the CloakBrowser Chromium binary. URL retrieval runs in that browser; QA uses the configured model provider. Python is not required.
 
 ```bash
 npm ci
@@ -73,16 +73,16 @@ Start the application:
 ./start.sh
 ```
 
-Open [localhost:3000](http://localhost:3000). Codespaces forwards port 3000 and opens its frontend URL automatically when the port is forwarded; the launcher also prints the URL. The frontend, API, and Vite live reload share this port. The production image runs the Node application as `node`. UI tests use the existing development-only CloakBrowser/Playwright dependencies: install their browser with `npx --no-install cloakbrowser install`, or set `CHROMIUM_EXECUTABLE` to an installed Chromium binary. Install browser OS libraries only on the test host when needed.
+Open [localhost:3000](http://localhost:3000). Codespaces forwards port 3000 and opens its frontend URL automatically when the port is forwarded; the launcher also prints the URL. The frontend, API, and Vite live reload share this port. The production image runs the Node application as `node` and includes the pinned CloakBrowser binary and required system libraries. For local development, run `npm run setup:browser`, or set `CHROMIUM_EXECUTABLE` to an installed Chromium binary. The local host also needs browser system libraries.
 
 | Configuration | Current use |
 | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection; loaded from `.env` or the process environment |
-| `LLM_BASE_URL`, `LLM_API_KEY` | Complete server-only provider override; configure both together. With neither set, existing `AICREDITS_API_KEY` uses `https://api.aicredits.in/v1`. Retrieval requires native search, URL filters and citations |
+| `LLM_BASE_URL`, `LLM_API_KEY` | Complete server-only QA provider override; configure both together. With neither set, existing `AICREDITS_API_KEY` uses `https://api.aicredits.in/v1`. Browser scraping is independent of these credentials |
 | `PORT` | Express port, default `3000` |
 | `NODE_ENV=production` | Serve built frontend assets instead of Vite middleware |
 | `DISABLE_HMR=true` | Disable development HMR/file watching through Vite configuration |
-| `CLOAKBROWSER_AUTO_UPDATE=false` | Used by the existing UI browser tests to disable automatic browser updates |
+| `CLOAKBROWSER_AUTO_UPDATE=false` | Disables browser auto-updates; production and browser tests use the pinned installation |
 
 For a production build outside Docker:
 
@@ -126,21 +126,25 @@ Keep identifiers such as SKUs and barcodes as text in spreadsheets to avoid nume
 4. Use **Scrape Selected** for URL evidence. Failed scrapes can enter the manual-content queue. **Edit SAP** is available when a SKU has no nonblank scraped content; saving it preserves the uploaded row and previous QA result.
 5. Create one job from SKUs sharing one nonblank attribute set. Open **Jobs** and run it.
 
-The **Scrapper agent**, Dashboard URL retrieval, and automatic job retrieval share one bounded Chat Completions request using the saved **Scrapper model**, defaulting to `perplexity/sonar`. Jobs use their snapshotted model. The server supplies the shared `LLM_BASE_URL` and `LLM_API_KEY`; browsers send only `{url}`. No additional key, local browser, or agent runtime is needed.
+The **Scrapper agent**, Dashboard URL retrieval, and automatic job retrieval share a CloakBrowser/Playwright workflow. It opens the exact public URL, waits for rendered text, scrolls for lazy-loaded content, opens native disclosures and common description/specification tabs, and extracts readable text. Navigation, advertising, scripts and forms are excluded. The standalone module displays the full text below the URL, links to the source, and supports cancellation. Scraping does not call an LLM or require provider credentials.
 
-The request restricts native search with `search_domain_filter: [url]`. The gateway must forward this filter and return provider source metadata (`citations` or URL citation annotations). Content must be complete and nonempty, and all used citations must match the supplied URL, including its query parameters. Unavailable pages, refusals, truncation, missing citations, or outside sources fail visibly and preserve SAP/manual-content fallback. Public address validation, cancellation, a 120-second retrieval deadline, and shared provider admission still apply. Retrieved Markdown is stored in `scraped_markdown`; retrieval usage is separate from QA token totals.
+The server allows one browser scrape at a time, eight queued requests, a 60-second queue wait, and 120 seconds per execution. Each request owns an isolated browser context and closes its browser and proxy on every exit. A local egress proxy validates every destination and connects to its validated public IP; private networks, metadata addresses, non-HTTP(S) URLs and ports other than 80/443 are rejected. Browser DNS, loopback proxy bypass, QUIC, non-proxied WebRTC and service workers are disabled. Top-level interaction cannot navigate to another page or silently change the supplied product/offer parameters.
 
-CSS selectors and dynamic-tab configuration have been retired. Existing selector data remains untouched. Provider-generated factual content still requires human review; source matching cannot prove that every returned statement is accurate.
+Scrolling and section interactions are bounded (20 passes/controls). Empty pages, challenges, changing content, unsupported navigation and exhausted limits produce specific errors. The extraction cap is 200,000 characters; content is never silently truncated. QA separately applies its saved evidence limit. The existing `{url}` → `{markdown}` API and `scraped_markdown` storage remain compatible; the field can contain readable plain text. Legacy scraper-model and selector settings remain stored but are not used for retrieval. No database migration is needed.
+
+Browser setup is included in the production Docker image. For a native Debian 12 installation, install the browser libraries listed in `Dockerfile`, then run `npm run setup:browser` as the application user. This caches pinned Chromium `146.0.7680.177.5`; retrieval never downloads a browser. The packages `cloakbrowser` and `playwright-core` are production dependencies. `CHROMIUM_EXECUTABLE` can select an administrator-installed Chromium for testing or deployment. Browser dependencies are also needed to run `npm run test:scrape-browser` and `npm run test:sap-editor`.
+
+Public retailer sites may still reject a server's IP or require a location/session. A blocked or blank response is a retrieval failure, never product evidence. Use the visible source page or supplied SAP/manual content while diagnosing access; no paid proxy or scraping service is enabled by default.
 
 Jobs execute on one PostgreSQL-owned server worker, one SKU at a time. Closing the tab or switching modules does not stop execution. Reopen Jobs to view progress, cancel your runs, and choose historical results. Cancellation aborts active requests and keeps committed results. After a restart, unfinished items resume within their original deadline and attempt budget; committed results are skipped. A provider call interrupted before its result was saved can be billed again. Editing evidence increments its revision, preventing older runs from overwriting the new catalog evidence.
 
 ### QA settings and results
 
-The default QA model is `deepseek/deepseek-v4.1-flash`, requested with low reasoning effort. Defaults are 4,096 output tokens, temperature 0.1, and 40,000 evidence characters; saved settings retain their configured limits. QA allows at most three server-owned attempts for transient failures within a five-minute per-SKU deadline; permanent errors fail immediately. Each QA request has a 120-second response deadline beginning after queue admission and its saved attempt checkpoint. Provider admission is shared across QA, scraping and admin tests: two active calls, eight waiting, with a 60-second queue wait limit. Response bodies remain subject to deadlines and a 4 MiB limit. Each URL retrieval makes one provider call without automatic retries.
+The default QA model is `deepseek/deepseek-v4.1-flash`, requested with low reasoning effort. Defaults are 4,096 output tokens, temperature 0.1, and 40,000 evidence characters; saved settings retain their configured limits. QA allows at most three server-owned attempts for transient failures within a five-minute per-SKU deadline; permanent errors fail immediately. Each QA request has a 120-second response deadline beginning after queue admission and its saved attempt checkpoint. Provider admission is shared across QA and admin tests: two active calls, eight waiting, with a 60-second queue wait limit. Response bodies remain subject to deadlines and a 4 MiB limit. Browser retrieval has its own queue and makes no provider calls.
 
 Provider failures are saved before retrying. If an interrupted item resumes after consuming all three attempts, its error reports the last recorded provider failure, or explains that a fresh rerun is needed when no cause was saved. Successful completion clears transient errors.
 
-**Test API** independently checks both displayed model IDs, including unsaved edits, without saving settings. Both models receive a short connectivity prompt independent of shared QA instructions, output limits and URL retrieval. Results appear inline and in Notifications; provider errors, empty/refused/truncated responses and timeouts fail visibly. Both checks use the shared server key and incur provider cost.
+**Test API** checks the displayed Q&A model, including unsaved edits, without saving settings. It sends a short connectivity prompt independent of shared QA instructions, output limits and URL retrieval. Results appear inline and in Notifications; provider errors, empty/refused/truncated responses and timeouts fail visibly. This check uses the server key and incurs provider cost.
 
 Each run fetches shared memory and category rules before processing. Unavailable shared configuration prevents the run from starting. Missing, blank, or ambiguous rules produce a general review with a warning; truncated web content also produces a warning. A SKU with no usable SAP or web evidence fails. The same prepared evidence is retained through that SKU's retries.
 
@@ -193,7 +197,7 @@ Routes are registered in [server.ts](server.ts) and its server modules. APIs req
 | `/api/qa-configuration` | GET | Shared memory and attribute sets in one snapshot |
 | `/api/qa-agent-memory` | PUT | Save shared memory |
 | `/api/attribute-sets`, `/api/attribute-sets/:id`, `/api/attribute-sets/import` | POST collection/import; PUT/DELETE item | Maintain shared category rules |
-| `/api/scrape` | POST | `{ url }` → `{ markdown }`; failures use `{ error, details }` |
+| `/api/scrape` | POST | `{ url }` → `{ markdown }`; failures use `{ error, code }` |
 | `/api/chat` | POST | Admin test; accepts optional `modelName` and `purpose: "qa" \| "scrapper"` (defaults to QA) |
 
 Run `npm test` for the complete fast suite, including provider limits. Run `TEST_DATABASE_URL=... npm run test:security-db` against a disposable PostgreSQL instance for auth, transactions, recovery, cancellation, and failure injection. Other focused checks:
@@ -204,6 +208,7 @@ npm run test:job-state
 npm run test:llm-response
 npm run test:qa-agent
 npm run test:scrape-agent
+npm run test:scrape-browser
 ```
 
 `lint` is TypeScript checking, not ESLint. Additional checks have prerequisites:
@@ -216,7 +221,7 @@ npm run test:sap-editor
 npm run test:qa-config-db
 ```
 
-The retrieval checks exercise one-call dispatch, public URL validation, exact source matching (including query variants), refusals/unavailable content, response limits, credential isolation and cancellation. Browser checks cover the renamed screen, Dashboard context saving, model persistence, unsaved draft testing, independent mixed results and duplicate-click prevention. Test API checks model connectivity. Use Scrapper agent’s Retrieve URL action separately to validate browsing and source metadata.
+The retrieval checks exercise public URL validation, DNS pinning, rebinding rejection, queue admission and cancellation. Real browser fixtures cover rendered content, lazy loading, disclosures, tabs, redirects, blocked/empty pages, size/interaction limits and private subresources. UI checks cover full-text preview, cancellation, one error message, Dashboard saving and QA settings persistence. Test API checks QA connectivity; use Retrieve URL for a live scrape.
 
 The database test creates and drops an isolated schema. Never point it at the shared production database. The SAP editor browser test mocks API traffic; it does not prove real database persistence. Check the [implementation validation record](docs/security-and-jobs.md#implementation-validation) for what was actually run.
 
@@ -236,7 +241,7 @@ https://project22.tail608e42.ts.net/
 
 The deployment directory is `/opt/paxth-qa`. Its gateway requires separately supplied credentials; a Tailscale client is not required. The separate Rakazo application uses `https://rakazo.tail608e42.ts.net/`, its own containers, and the default Tailscale service. Do not change those resources. A legacy Rakazo-hostname listener on port 8443 also points to the QA gateway; leave that existing route unchanged.
 
-[compose.yaml](compose.yaml) defines the separate `paxth-qa` project, image `paxth-qa:local`, restart policy, loopback port binding, 1 CPU, 1,536 MiB memory, 256 MiB shared memory, and rotating container logs. The image runs the Node production build as `node`, without Python or a retrieval browser. UI browser dependencies remain development-only. Secrets and backups are excluded from the image build.
+[compose.yaml](compose.yaml) defines the separate `paxth-qa` project, image `paxth-qa:local`, restart policy, loopback port binding, 1 CPU, 1,536 MiB memory, 256 MiB shared memory, and rotating container logs. The image runs the Node production build as `node` with the retrieval browser installed. Python is not required. Secrets and backups are excluded from the image build.
 
 Keep `/opt/paxth-qa/.env` readable only by its owner (`chmod 600 .env`). Its `DATABASE_URL` must reach PostgreSQL from inside the container: container `localhost` is not the VPS host. Caddy should authenticate every page, asset, and API request, strip inbound `Authorization` before proxying, store only the password hash, and accept the Funnel hostname. This repository does not contain its Caddyfile.
 
@@ -301,7 +306,7 @@ The earlier deployment notes name `/opt/paxth-qa/backups/Caddyfile.before` as a 
 | GitHub has new code but the public URL looks unchanged | Update/rebuild on the VPS; restarting the old container is insufficient. Refresh the browser after deployment. |
 | Startup fails or readiness is unavailable | Inspect migration errors; resolve conflicting data on a restored copy before production. |
 | Settings/rules will not save | Sign in as an administrator and check PostgreSQL availability. Model settings and memory save atomically. |
-| Scrape fails or shows a challenge | Test both models in LLM Settings, then the URL in Scrapper agent; check gateway search/filter/citation support. Use SAP or manually supplied content when needed. |
+| Scrape fails or shows a challenge | Check browser installation and the URL in Scrapper agent; inspect the specific blocked/empty/timeout error. Test API checks QA connectivity only. Use SAP or manually supplied content when needed. |
 | Job remains queued | Check server worker logs, provider configuration, and database availability. Reloading the browser does not interrupt execution. |
 | An upload fails | Read the visible error. No rows from a failed batch are committed; retry after correcting the problem. |
 | A save/delete looks successful but returns after reload | Check the visible error and database availability, then reload to verify persistence. |

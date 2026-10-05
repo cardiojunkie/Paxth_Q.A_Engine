@@ -80,7 +80,7 @@ async function bufferResponse(response: Response, signal: AbortSignal) {
   }
 }
 
-/** Shared by QA, URL retrieval, and admin tests; no retries at this layer. */
+/** Shared by QA and admin connectivity tests; no retries at this layer. */
 export async function fetchChatCompletion(
   baseUrl: string, apiKey: string, payload: unknown, signal: AbortSignal,
   beforeFetch?: () => Promise<void>, requestTimeoutMs = 90_000,

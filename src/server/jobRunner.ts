@@ -225,7 +225,7 @@ async function finishRun(client: PoolClient, run: any, owner: string) {
   });
 }
 
-async function executeRun(client: PoolClient, pool: Pool, run: any, owner: string, ownership: AbortSignal) {
+async function executeRun(client: PoolClient, pool: Pool, run: any, owner: string, ownership: AbortSignal, scrape: typeof scrapeWithAgent) {
   const settings = normalizeSettings(run.configuration.settings);
   while (!ownership.aborted) {
     const item = await transaction(client, async () => {
@@ -263,11 +263,12 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
             await client.query('UPDATE job_run_items SET scrape_started=true WHERE run_id=$1 AND sku=$2', [run.id, item.sku]);
           });
           try {
-            const markdown = await scrapeWithAgent(snapshot.source.url, { ...getProviderCredentials(), modelName: settings.scrapperModelName, maxTokens: settings.maxTokens, maxPageContentLength: settings.maxPageContentLength }, execution);
+            const markdown = await scrape(snapshot.source.url, execution);
             snapshot = { ...snapshot, scraped_markdown: markdown, scrape_status: 'success' };
           } catch (error) {
             execution.throwIfAborted();
-            snapshot = { ...snapshot, scrape_status: 'failed' };
+            snapshot = { ...snapshot, scrape_status: 'failed', error: errorText(error) };
+            if (!snapshot.source.sap?.trim()) throw error;
           }
           await transaction(client, async () => {
             await assertOwner(client, run.id, owner);
@@ -316,7 +317,7 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
   }
 }
 
-export function startJobWorker(pool: Pool): () => Promise<void> {
+export function startJobWorker(pool: Pool, scrape = scrapeWithAgent): () => Promise<void> {
   const stop = new AbortController();
   const task = (async () => {
     while (!stop.signal.aborted) {
@@ -337,7 +338,7 @@ export function startJobWorker(pool: Pool): () => Promise<void> {
             const { rows: [claimed] } = await client!.query("UPDATE job_runs SET status=CASE WHEN status='cancelling' THEN status ELSE 'running' END,owner_token=$2,started_at=COALESCE(started_at,now()) WHERE id=$1 RETURNING *", [next.id, owner]);
             return claimed;
           });
-          if (run) await executeRun(client, pool, run, owner, signal);
+          if (run) await executeRun(client, pool, run, owner, signal, scrape);
         }
       } catch (error) {
         if (!stop.signal.aborted) console.error('Job worker paused; unfinished items will resume after database recovery.');

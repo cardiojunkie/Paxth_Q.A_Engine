@@ -70,7 +70,7 @@ export async function completeQa(payload: unknown, signal: AbortSignal, options:
   signal.throwIfAborted();
   throw new ProviderError(exhaustedMessage);
 }
-export function registerProviderRoutes(app: Express, pool: Pool) {
+export function registerProviderRoutes(app: Express, pool: Pool, scrape = scrapeWithAgent) {
   app.get('/api/provider-settings', async (_req, res) => { res.json(await getProviderSettings(pool)); });
   app.put('/api/provider-settings', async (req, res) => {
     if (res.locals.user?.role !== 'admin') { res.status(403).json({ error: 'Administrator access required' }); return; }
@@ -88,13 +88,12 @@ export function registerProviderRoutes(app: Express, pool: Pool) {
     res.on("close", disconnect);
     try {
       if (!req.body || typeof req.body !== "object" || Array.isArray(req.body) || Object.keys(req.body).some(key => key !== "url")) throw new ScrapeError("Only a URL is accepted", 400);
-      const settings = await getProviderSettings(pool);
-      const markdown = await scrapeWithAgent(req.body.url, { ...getProviderCredentials(), modelName: settings.scrapperModelName, maxTokens: settings.maxTokens, maxPageContentLength: settings.maxPageContentLength }, controller.signal);
+      const markdown = await scrape(req.body.url, controller.signal);
       if (!res.destroyed) res.json({ markdown });
     } catch (error) {
       if (!res.destroyed) res.status(error instanceof ScrapeError || error instanceof ProviderError ? error.status : 500).json({
         error: error instanceof ScrapeError || error instanceof ProviderError ? error.message : "Failed to retrieve URL",
-        details: "Use SAP or manually supplied source content if this page cannot be retrieved.",
+        code: error instanceof ScrapeError ? error.code : 'RETRIEVAL_FAILED',
       });
     } finally {
       res.removeListener("close", disconnect);

@@ -13,6 +13,7 @@ import {initializeProvider,registerProviderRoutes} from './provider';
 import {initializeJobRuns,registerJobRunRoutes,startJobWorker} from './jobRunner';
 import {ApiError,registerCatalogRoutes} from './catalog';
 import {ProviderError} from '../lib/chatCompletion';
+import {validateScrapeInput, ScrapeError} from '../lib/scrapeAgent';
 import {DEFAULT_SETTINGS,editableSettings} from '../lib/providerSettings';
 
 assert.ok(process.env.TEST_DATABASE_URL,'Set TEST_DATABASE_URL to a disposable PostgreSQL instance. Production DATABASE_URL is never used.');
@@ -25,6 +26,13 @@ let stopWorker:(()=>Promise<void>)|undefined;
 let stopSecond:(()=>Promise<void>)|undefined;
 let calls=0, providerMode='success';
 const providerRequests:any[]=[];
+const scrapeRequests:string[]=[];
+let scrapeBlocked=false;
+const scrape=async(rawUrl:string, signal:AbortSignal)=>{
+  const {url}=validateScrapeInput({url:rawUrl});signal.throwIfAborted();scrapeRequests.push(url);
+  if(scrapeBlocked)throw new ScrapeError('The website blocked browser access.',502,'PAGE_BLOCKED');
+  return '# Retrieved product\nBrand: TestBrand\n\nSource: <'+url+'>';
+};
 const provider=createServer(async(req,res)=>{
   let raw='';for await(const chunk of req) raw+=chunk;
   const payload=JSON.parse(raw);providerRequests.push(payload);
@@ -56,7 +64,7 @@ try {
   const app=express();app.use(express.json());
   server.on('request',app);await listen(server);
   const origin=`http://127.0.0.1:${(server.address() as any).port}`;process.env.APP_ORIGIN=origin;
-  registerAuth(app,pool);registerCatalogRoutes(app,pool);registerProviderRoutes(app,pool);registerJobRunRoutes(app,pool);registerQaConfigurationRoutes(app,drizzle(pool,{schema}));
+  registerAuth(app,pool);registerCatalogRoutes(app,pool);registerProviderRoutes(app,pool,scrape);registerJobRunRoutes(app,pool);registerQaConfigurationRoutes(app,drizzle(pool,{schema}));
   app.use((err:any,_req:any,res:any,_next:any)=>res.status(err instanceof ApiError||err instanceof ProviderError?err.status:err.code==='23505'?409:503).json({error:err.message}));
   const password='test-only-strong-password';
   const hash=await hashPassword(password);
@@ -106,11 +114,11 @@ try {
   assert.equal((await request('/api/scrape','POST',{url:'http://127.0.0.1/page'},user)).status,400);
   const retrieved=await request('/api/scrape','POST',{url:'https://8.8.8.8/product?variant=42'},user);
   assert.equal(retrieved.status,200);assert.deepEqual(Object.keys(retrieved.body),['markdown']);
-  assert.match(retrieved.body.markdown,/variant=42/);assert.equal(providerRequests.at(-1).model,'test/sonar');
+  assert.match(retrieved.body.markdown,/variant=42/);assert.equal(calls,0,'Scraping makes no provider calls');
   assert.doesNotMatch(JSON.stringify(providerRequests),/test-secret-only/);
-  providerMode='no-citations';
+  scrapeBlocked=true;
   assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product'},user)).status,502);
-  providerMode='success';calls=0;
+  scrapeBlocked=false;providerMode='success';calls=0;
   assert.equal((await request('/api/chat','POST',{baseUrl:'http://evil',apiKey:'x'},admin)).status,400);
   const mappingRules='Brand must match SAP. Review every uploaded bullet point and preserve optional blank fields.';
   const testSet=(await request('/api/qa-configuration','GET',undefined,user)).body.attributeSets.find((set:any)=>set.name==='TestSet');
@@ -129,6 +137,7 @@ try {
   const job=await request('/api/jobs','POST',{id:'job',name:'Job',skus:['a','b'],attribute_set:'TestSet'},user);assert.equal(job.status,201);
   const credentials={baseUrl:process.env.LLM_BASE_URL,key:process.env.LLM_API_KEY,legacyKey:process.env.AICREDITS_API_KEY};
   delete process.env.LLM_BASE_URL;delete process.env.LLM_API_KEY;delete process.env.AICREDITS_API_KEY;
+  assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product'},user)).status,200,'Browser retrieval does not require LLM credentials');
   const missingProvider=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'all'},user);
   assert.equal(missingProvider.status,503);
   assert.match(missingProvider.body.error,/LLM_BASE_URL.*LLM_API_KEY/,'Missing credentials return actionable configuration errors');
@@ -171,7 +180,7 @@ try {
   const waitFor=async(check:()=>Promise<boolean>,label:string)=>{
     for(let i=0;i<160;i++){if(await check())return;await delay(100);}throw new Error(`Timed out: ${label}`);
   };
-  providerMode='wait';stopWorker=startJobWorker(pool);stopSecond=startJobWorker(pool);
+  providerMode='wait';stopWorker=startJobWorker(pool,scrape);stopSecond=startJobWorker(pool,scrape);
   await waitFor(async()=>calls>=1,'first provider call');
   await request('/api/catalog/a','PUT',{source:{sap:'New evidence'}},user);
   await waitFor(async()=>(await request(`/api/job-runs/${run.body.id}`,'GET',undefined,user)).body.status==='completed','run completion');
@@ -188,7 +197,7 @@ try {
   await pool.query("UPDATE job_runs SET status='running',owner_token='old-owner',started_at=now() WHERE id=$1",[restart.body.id]);
   await pool.query("UPDATE job_run_items SET status='completed',result=$2 WHERE run_id=$1 AND sku='b'",[restart.body.id,JSON.stringify(history.items[1].result)]);
   await pool.query("UPDATE job_run_items SET status='running',attempts=1,started_at=now(),error='QA attempt 1: The model request timed out.' WHERE run_id=$1 AND sku='a'",[restart.body.id]);
-  providerMode='success';const before=calls;stopWorker=startJobWorker(pool);
+  providerMode='success';const before=calls;stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await request(`/api/job-runs/${restart.body.id}`,'GET',undefined,user)).body.status==='completed','restart recovery');
   assert.equal(calls,before+1);
   const recoveredItem=(await pool.query("SELECT attempts,error,result FROM job_run_items WHERE run_id=$1 AND sku='a'",[restart.body.id])).rows[0];
@@ -218,7 +227,7 @@ try {
   const interruptedHistory=(await request(`/api/job-runs/${interrupted.body.id}`,'GET',undefined,user)).body;
   assert.equal(interruptedHistory.items[0].error,recordedFailure);
   await pool.query("UPDATE job_run_items SET attempts=3 WHERE run_id=$1 AND sku='a'",[interrupted.body.id]);
-  providerMode='success';stopWorker=startJobWorker(pool);
+  providerMode='success';stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await request(`/api/job-runs/${interrupted.body.id}`,'GET',undefined,user)).body.status==='failed','exhausted recovery retains the provider failure');
   assert.equal(calls,beforeInterruption+1,'An exhausted resumed item never dispatches another paid request');
   const retainedFailure=(await request(`/api/job-runs/${interrupted.body.id}`,'GET',undefined,user)).body.items[0].error;
@@ -234,7 +243,7 @@ try {
   // Neither a restart nor a future retry may reset a consumed budget or deadline.
   const exhausted=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'a'},user);
   await pool.query("UPDATE job_run_items SET attempts=3 WHERE run_id=$1 AND sku='a'",[exhausted.body.id]);
-  const beforeExhaustion=calls;stopWorker=startJobWorker(pool);
+  const beforeExhaustion=calls;stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await request(`/api/job-runs/${exhausted.body.id}`,'GET',undefined,user)).body.status==='failed','exhausted attempts');
   assert.equal(calls,beforeExhaustion);
   const exhaustionError=(await request(`/api/job-runs/${exhausted.body.id}`,'GET',undefined,user)).body.items[0].error;
@@ -242,11 +251,11 @@ try {
   await stopWorker();stopWorker=undefined;
   const expired=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'a'},user);
   await pool.query("UPDATE job_run_items SET started_at=now()-interval '6 minutes' WHERE run_id=$1 AND sku='a'",[expired.body.id]);
-  stopWorker=startJobWorker(pool);
+  stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await request(`/api/job-runs/${expired.body.id}`,'GET',undefined,user)).body.status==='failed','expired item deadline');
   assert.equal(calls,beforeExhaustion);
   await stopWorker();stopWorker=undefined;
-  // Retrieval and QA use their respective run snapshots, even after settings change.
+  // Browser retrieval is independent of legacy model settings; QA retains its run snapshot.
   const productUrl='https://8.8.8.8/product?variant=42';
   assert.equal((await request('/api/catalog/b','PUT',{source:{sap:'Brand: TestBrand',url:productUrl},scraped_markdown:''},user)).status,200);
   const webRun=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'b'},user);
@@ -254,12 +263,12 @@ try {
   assert.equal(snapshotConfig.settings.scrapperModelName,'test/sonar');assert.ok(!('selectors' in snapshotConfig));
   assert.doesNotMatch(JSON.stringify(snapshotConfig),/test-secret-only|apiKey/);
   await request('/api/provider-settings','PUT',{...configured,modelName:'next/qa',scrapperModelName:'next/sonar'},admin);
-  providerMode='success';let offset=providerRequests.length;stopWorker=startJobWorker(pool);
+  providerMode='success';let offset=providerRequests.length;stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await request(`/api/job-runs/${webRun.body.id}`,'GET',undefined,user)).body.status==='completed','snapshotted retrieval');
   await stopWorker();stopWorker=undefined;
-  assert.deepEqual(providerRequests.slice(offset).map(payload=>payload.model),['test/sonar','deepseek/deepseek-v4.1-flash']);
-  assert.deepEqual(providerRequests[offset].search_domain_filter,[productUrl]);
-  const qaRequest=providerRequests[offset+1];
+  assert.deepEqual(providerRequests.slice(offset).map(payload=>payload.model),['deepseek/deepseek-v4.1-flash']);
+  assert.equal(scrapeRequests.at(-1),productUrl);
+  const qaRequest=providerRequests[offset];
   assert.equal(qaRequest.reasoning_effort,'low');assert.equal(qaRequest.max_tokens,10000);
   assert.deepEqual(qaRequest.response_format,{type:'json_object'});assert.ok(qaRequest.messages[0].content.includes(mappingRules));
   assert.match(qaRequest.messages[0].content,/SAP takes precedence/);
@@ -272,15 +281,27 @@ try {
   assert.equal(webHistory.items[1].error,null);assert.equal(webHistory.items[1].result.qa_result.qa_status,'pass');
   assert.deepEqual(webHistory.items[1].result.qa_result.source_notes,{sap_used:true,url_used:true,source_conflicts:[]});
   assert.match((await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='b').scraped_markdown,/variant=42/);
-  // Old job snapshots get the Sonar default without rewriting stored configuration.
+  // Old job snapshots still retrieve with the browser without rewriting stored configuration.
   await pool.query("UPDATE sku_data SET scraped_markdown=NULL,scrape_status=NULL WHERE sku='b'");
   const legacyRun=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'b'},user);
   await pool.query("UPDATE job_runs SET configuration=jsonb_set(configuration,'{settings}',(configuration->'settings')-'scrapperModelName') WHERE id=$1",[legacyRun.body.id]);
-  offset=providerRequests.length;stopWorker=startJobWorker(pool);
+  offset=providerRequests.length;stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await request(`/api/job-runs/${legacyRun.body.id}`,'GET',undefined,user)).body.status==='completed','legacy retrieval defaults');
   await stopWorker();stopWorker=undefined;
-  assert.equal(providerRequests[offset].model,'perplexity/sonar');
-  assert.equal(providerRequests[offset+1].model,'next/qa');
+  assert.equal(providerRequests[offset].model,'next/qa');
+  assert.equal(providerRequests.length-offset,1);
+  assert.equal(scrapeRequests.at(-1),productUrl);
+  // Keep the actual browser failure when no other evidence exists; never spend QA tokens on it.
+  await pool.query("UPDATE sku_data SET source=$1,scraped_markdown=NULL,scrape_status=NULL WHERE sku='b'",[JSON.stringify({url:productUrl})]);
+  scrapeBlocked=true;
+  const blockedRun=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'b'},user);
+  offset=providerRequests.length;stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await request(`/api/job-runs/${blockedRun.body.id}`,'GET',undefined,user)).body.status==='failed','blocked page retains its browser error');
+  await stopWorker();stopWorker=undefined;scrapeBlocked=false;
+  const blockedItem=(await request(`/api/job-runs/${blockedRun.body.id}`,'GET',undefined,user)).body.items.find((item:any)=>item.sku==='b');
+  assert.match(blockedItem.error,/website blocked browser access/);
+  assert.equal(blockedItem.result.scrape_status,'failed');
+  assert.equal(providerRequests.length,offset,'No QA request without usable source evidence');
   await initializeDatabase(pool); // Existing populated records remain readable after restart migrations.
   // Clear remains all-or-nothing even if catalog deletion fails after deleting jobs.
   await pool.query("CREATE FUNCTION fail_clear() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected clear failure'; END $$; CREATE TRIGGER fail_clear BEFORE DELETE ON sku_data FOR EACH ROW EXECUTE FUNCTION fail_clear()");
