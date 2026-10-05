@@ -120,8 +120,9 @@ async function withUserLock<T>(pool: Pool, actorId: string, action: (client: Poo
 
 export function registerAuth(app: Express, pool: Pool) {
   const production = process.env.NODE_ENV === 'production';
+  const explicitOrigin = process.env.APP_ORIGIN;
   let configuredOrigin: string | undefined;
-  const appOrigin = process.env.APP_ORIGIN || (!production && process.env.CODESPACE_NAME && process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN
+  const appOrigin = explicitOrigin || (!production && process.env.CODESPACE_NAME && process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN
     ? `https://${process.env.CODESPACE_NAME}-${Number(process.env.PORT) || 3000}.${process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}` : undefined);
   if (appOrigin) {
     const url = new URL(appOrigin);
@@ -135,8 +136,13 @@ export function registerAuth(app: Express, pool: Pool) {
   app.use('/api', (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-      const expected = configuredOrigin ?? `${req.protocol}://${req.get('host')}`;
-      if (req.get('origin') !== expected || req.get('sec-fetch-site') === 'cross-site') {
+      const origin = req.get('origin');
+      const requestOrigin = `${req.protocol}://${req.get('host')}`;
+      const expected = configuredOrigin ?? requestOrigin;
+      // Codespaces rewrites Origin and Host to loopback; require browser same-origin metadata for that development path.
+      const developmentLoopback = !production && !explicitOrigin && origin === requestOrigin &&
+        ['localhost', '127.0.0.1', '[::1]'].includes(req.hostname) && req.get('sec-fetch-site') === 'same-origin';
+      if ((origin !== expected && !developmentLoopback) || req.get('sec-fetch-site') === 'cross-site') {
         res.status(403).json({ error: 'Same-origin requests are required.' });
         return;
       }
