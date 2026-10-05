@@ -68,6 +68,7 @@ export async function verifySchema(pool: Pool) {
   }
   await pool.query('SELECT sku,source,raw_row,upload_attributes,status,attribute_set,attribute_set_id,revision,qa_result,export_data,last_job_id,scraped_markdown,scrape_status,tokens_used,time_taken,error FROM sku_data LIMIT 0');
   await pool.query('SELECT id,name,created_at,attribute_set,skus,status,tokens_used,time_taken,error FROM jobs LIMIT 0');
+  await pool.query('SELECT scrapegraph_api_key,scrapegraph_settings FROM users LIMIT 0');
   const checks = await pool.query(`SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'jobs'::regclass AND conname IN ('jobs_skus_array','jobs_valid_status')`);
   if (checks.rows.length !== 2 || checks.rows.some(row => !row.convalidated)) throw new Error('Required database constraints are unavailable');
 }

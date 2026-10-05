@@ -26,5 +26,5 @@
       "onAutoForward": "openBrowser"
     }
   },
-  "postCreateCommand": "npm ci && npm run setup:browser"
+  "postCreateCommand": "npm ci"
 }

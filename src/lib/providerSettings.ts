@@ -5,7 +5,7 @@ export interface AppSettings {
   baseUrl: string;
   providerConfigured: boolean;
   modelName: string;
-  scrapperModelName: string; // Legacy settings/snapshot compatibility; browser scraping does not use this model.
+  scrapperModelName: string; // Legacy settings/snapshot compatibility; ScrapeGraph retrieval does not use this model.
   temperature: number;
   maxTokens: number;
   maxConcurrency: number;

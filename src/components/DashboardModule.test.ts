@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "vite";
 import type { SkuData } from "../hooks/useCatalogData";
 import { DEFAULT_SETTINGS } from "../lib/providerSettings";
+import { DEFAULT_SCRAPE_SETTINGS } from "../lib/scrapeRequest";
 import { prepareQaInput } from "../lib/qaAgent";
 
 const sku = (id: string, updates: Partial<SkuData> = {}): SkuData => ({
@@ -41,6 +42,10 @@ let finishScrape: (() => void) | undefined;
 const chatRequests: any[] = [];
 const settingsWrites: any[] = [];
 let savedSettings = { ...DEFAULT_SETTINGS, providerConfigured: true };
+let savedScraperSettings = { ...DEFAULT_SCRAPE_SETTINGS, configured: false };
+let scraperSaveFailure = false;
+const scraperWrites: any[] = [];
+const keyTests: any[] = [];
 let releaseChat!: () => void;
 const chatGate = new Promise<void>(resolve => { releaseChat = resolve; });
 let chatMode: 'mixed' | 'success' | 'malformed' | 'missing' = 'mixed';
@@ -51,14 +56,12 @@ let catalogRefreshFailures = 0;
 let sampleResponse: any;
 const jobs = [{ id: "scrape-check", name: "Scrape integration", status: "pending", skus: ["present-pending"], created_at: new Date().toISOString(), attribute_set: "TV" }];
 
-process.env.CLOAKBROWSER_AUTO_UPDATE = "false";
-const { launch } = await import("cloakbrowser");
 const { chromium } = await import("playwright-core");
 const server = await createServer({ cacheDir: "/tmp/paxth-vite-browser-cache", server: { host: "127.0.0.1", port: 0, hmr: false }, logLevel: "error" });
-let browser: Awaited<ReturnType<typeof launch>> | undefined;
+let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 try {
   await server.listen();
-  browser = process.env.CHROMIUM_EXECUTABLE ? await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_EXECUTABLE, args: ["--no-sandbox"] }) : await launch({ headless: true });
+  browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_EXECUTABLE, args: ["--no-sandbox"] });
   const page = await browser.newPage();
   page.setDefaultTimeout(15000);
   await page.addInitScript(() => {
@@ -81,6 +84,19 @@ try {
     if (path === '/api/provider-settings') {
       if (request.method() === 'PUT') { settingsWrites.push(request.postDataJSON()); savedSettings = { ...savedSettings, ...request.postDataJSON() }; }
       return route.fulfill({ json: savedSettings });
+    }
+    if (path === '/api/scraper-settings') {
+      if (request.method() === 'PUT') {
+        const { apiKey, ...settings } = request.postDataJSON();
+        scraperWrites.push(request.postDataJSON());
+        if (scraperSaveFailure) return route.fulfill({ status: 503, json: { error: 'Scraper settings could not be saved.' } });
+        savedScraperSettings = { ...settings, configured: apiKey === null ? false : apiKey ? true : savedScraperSettings.configured };
+      }
+      return route.fulfill({ json: savedScraperSettings });
+    }
+    if (path === '/api/scraper-settings/test') {
+      keyTests.push(request.postDataJSON());
+      return route.fulfill({ json: { remaining: 50, used: 5, plan: 'Test' } });
     }
     if (path === '/api/jobs/scrape-check/runs') {
       if (request.method() === 'POST') {
@@ -365,7 +381,48 @@ try {
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Scrapper agent", exact: true }).click();
   assert.equal(await page.getByRole('heading', { name: 'Scrapper agent', exact: true }).count(), 1);
+  await page.getByText('No API key saved.', { exact: true }).waitFor();
+  assert.equal(await page.getByRole('alert').count(), 0, 'StrictMode effect cleanup must not report an aborted settings load');
   await page.getByLabel('URL', { exact: true }).fill("https://example.com/product");
+  const retrieve = page.getByRole('button', { name: 'Retrieve URL', exact: true });
+  assert.equal(await retrieve.isDisabled(), true, 'Retrieval requires a saved personal key');
+  const keyInput = page.getByLabel('ScrapeGraph API key', { exact: true });
+  await keyInput.fill('sgai-browser-test-key');
+  await page.getByLabel('Rendering mode', { exact: true }).selectOption('js');
+  await page.getByLabel('Wait time (ms)', { exact: true }).fill('2500');
+  await page.getByLabel('Scroll count', { exact: true }).fill('5');
+  await page.getByLabel('Stealth (+5 credits per scrape)', { exact: true }).check();
+  await page.getByRole('button', { name: 'Test key / check credits', exact: true }).click();
+  await page.getByText('Entered key (unsaved): 50 credits remaining, 5 used. Plan: Test.', { exact: true }).waitFor();
+  assert.deepEqual(keyTests, [{ apiKey: 'sgai-browser-test-key' }]);
+  assert.equal(scraperWrites.length, 0, 'Testing a draft key does not save it');
+  assert.equal(await retrieve.isDisabled(), true, 'Unsaved controls cannot affect retrieval');
+  scraperSaveFailure = true;
+  await page.getByRole('button', { name: 'Save/replace key', exact: true }).click();
+  await page.getByText('Scraper settings could not be saved.', { exact: true }).waitFor();
+  assert.equal(await keyInput.inputValue(), 'sgai-browser-test-key', 'Failed saving preserves the key draft');
+  assert.equal(await page.getByLabel('Rendering mode', { exact: true }).inputValue(), 'js');
+  scraperSaveFailure = false;
+  await page.getByRole('button', { name: 'Save/replace key', exact: true }).click();
+  await page.getByText('Personal scraper settings saved.', { exact: true }).waitFor();
+  assert.equal(await keyInput.inputValue(), '', 'Saved keys are cleared from the input');
+  assert.deepEqual(scraperWrites.at(-1), { mode: 'js', stealth: true, wait: 2500, scrolls: 5, apiKey: 'sgai-browser-test-key' });
+  await page.reload();
+  await page.getByRole('button', { name: 'Scrapper agent', exact: true }).click();
+  await page.getByText('API key saved.', { exact: true }).waitFor();
+  assert.equal(await keyInput.inputValue(), '', 'Reload never reveals the saved key');
+  assert.equal(await page.getByLabel('Rendering mode', { exact: true }).inputValue(), 'js');
+  await page.getByRole('button', { name: 'Test key / check credits', exact: true }).click();
+  await page.getByText('Saved key: 50 credits remaining, 5 used. Plan: Test.', { exact: true }).waitFor();
+  assert.deepEqual(keyTests.at(-1), {});
+  await page.getByRole('button', { name: 'Remove key', exact: true }).click();
+  await page.getByText('Your API key was removed.', { exact: true }).waitFor();
+  assert.equal(scraperWrites.at(-1).apiKey, null);
+  assert.equal(await retrieve.isDisabled(), true);
+  await keyInput.fill('sgai-browser-replacement-key');
+  await page.getByRole('button', { name: 'Save/replace key', exact: true }).click();
+  await page.getByText('Personal scraper settings saved.', { exact: true }).waitFor();
+  await page.getByLabel('URL', { exact: true }).fill('https://example.com/product');
   await page.getByRole("button", { name: "Retrieve URL", exact: true }).click();
   await page.getByText("Automatically scraped content", { exact: true }).waitFor();
   assert.equal(scrapeRequests, 2, 'Browser scrape callers send only URLs');
@@ -450,7 +507,7 @@ try {
   await recoveredCatalog;
   assert.equal(await runQa.isDisabled(), true, 'Polling recovers without starting a duplicate run');
   assert.equal(startRunRequests, 1);
-  console.log('Browser checks passed: forged-session rejection, confirmed saves, preserved drafts, and credential-free requests.');
+  console.log('Browser checks passed: authenticated saves, personal scraper controls, draft key tests, secret exclusion, preview and cancellation.');
 } finally {
   releaseSave();
   releaseScrape();

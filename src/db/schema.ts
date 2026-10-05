@@ -7,6 +7,8 @@ export const users = pgTable('users', {
   id: text('id').primaryKey(),
   username: text('username').notNull().unique(),
   password: text('password').notNull(),
+  scrapegraphApiKey: text('scrapegraph_api_key'),
+  scrapegraphSettings: jsonb('scrapegraph_settings').notNull().default({}),
   role: userRoleEnum('role').default('user').notNull(),
   lastLogin: timestamp('last_login'),
   createdAt: timestamp('created_at').defaultNow().notNull(),

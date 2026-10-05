@@ -13,7 +13,8 @@ import {initializeProvider,registerProviderRoutes} from './provider';
 import {initializeJobRuns,registerJobRunRoutes,startJobWorker} from './jobRunner';
 import {ApiError,registerCatalogRoutes} from './catalog';
 import {ProviderError} from '../lib/chatCompletion';
-import {validateScrapeInput, ScrapeError} from '../lib/scrapeAgent';
+import {validateScrapeInput, ScrapeError, type ScrapeConfiguration} from '../lib/scrapeAgent';
+import {DEFAULT_SCRAPE_SETTINGS} from '../lib/scrapeRequest';
 import {DEFAULT_SETTINGS,editableSettings} from '../lib/providerSettings';
 
 assert.ok(process.env.TEST_DATABASE_URL,'Set TEST_DATABASE_URL to a disposable PostgreSQL instance. Production DATABASE_URL is never used.');
@@ -27,9 +28,12 @@ let stopSecond:(()=>Promise<void>)|undefined;
 let calls=0, providerMode='success';
 const providerRequests:any[]=[];
 const scrapeRequests:string[]=[];
+const scrapeConfigurations:ScrapeConfiguration[]=[];
 let scrapeBlocked=false;
-const scrape=async(rawUrl:string, signal:AbortSignal)=>{
+const scrape=async(rawUrl:string, signal:AbortSignal, configuration:ScrapeConfiguration)=>{
+  if(!configuration.apiKey)throw new ScrapeError('Save your ScrapeGraph API key in Scrapper agent.',503,'API_KEY_REQUIRED');
   const {url}=validateScrapeInput({url:rawUrl});signal.throwIfAborted();scrapeRequests.push(url);
+  scrapeConfigurations.push(configuration);
   if(scrapeBlocked)throw new ScrapeError('The website blocked browser access.',502,'PAGE_BLOCKED');
   return '# Retrieved product\nBrand: TestBrand\n\nSource: <'+url+'>';
 };
@@ -83,6 +87,48 @@ try {
   assert.equal((await request('/api/users','POST',{username:' temporary ',password,role:'user'},admin)).status,409);
   const user=(await request('/api/auth/login','POST',{username:'Operator',password})).cookie!.split(';')[0];
   const other=(await request('/api/auth/login','POST',{username:'Other',password})).cookie!.split(';')[0];
+  const personal={...DEFAULT_SCRAPE_SETTINGS,mode:'js',wait:2500,scrolls:5};
+  assert.equal((await request('/api/scraper-settings')).status,401);
+  assert.deepEqual((await request('/api/scraper-settings','GET',undefined,user)).body,{...DEFAULT_SCRAPE_SETTINGS,configured:false});
+  assert.equal((await request('/api/scraper-settings/test','POST',{},user)).body.code,'API_KEY_REQUIRED');
+  assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product'},user)).body.code,'API_KEY_REQUIRED');
+  for(const invalid of [{userId:'other'},{wait:-1},{wait:30001},{scrolls:1.5},{stealth:'true'},{apiKey:'bad\nkey'}]) {
+    assert.equal((await request('/api/scraper-settings','PUT',{...personal,...invalid},user)).status,400);
+  }
+  assert.equal((await request('/api/scraper-settings','PUT',{...personal,apiKey:'sgai-user-secret'},user,'https://evil.example')).status,403);
+  const savedPersonal=await request('/api/scraper-settings','PUT',{...personal,apiKey:' sgai-user-secret '},user);
+  assert.deepEqual(savedPersonal.body,{...personal,configured:true});
+  assert.doesNotMatch(JSON.stringify(savedPersonal.body),/apiKey|sgai-user-secret/);
+  assert.equal((await request('/api/scraper-settings','PUT',{...DEFAULT_SCRAPE_SETTINGS,apiKey:'sgai-other-secret'},other)).status,200);
+  assert.equal((await request('/api/scraper-settings','GET',undefined,other)).body.mode,'auto');
+  assert.equal((await request('/api/scraper-settings','PUT',personal,user)).body.configured,true,'Omitting the key preserves it');
+  assert.equal((await pool.query("SELECT scrapegraph_api_key FROM users WHERE id='user'")).rows[0].scrapegraph_api_key,'sgai-user-secret');
+  const originalFetch=globalThis.fetch;
+  const testedKeys:string[]=[];
+  let creditsStatus=200;
+  globalThis.fetch=async(target,init)=>{
+    if(String(target)==='https://v2-api.scrapegraphai.com/api/credits') {
+      testedKeys.push(new Headers(init?.headers).get('SGAI-APIKEY')!);
+      return Response.json(creditsStatus===200?{remaining:50,used:5,plan:'Test'}:{error:{message:'sgai-user-secret'}},{status:creditsStatus});
+    }
+    return originalFetch(target,init);
+  };
+  try {
+    assert.deepEqual((await request('/api/scraper-settings/test','POST',{},user)).body,{remaining:50,used:5,plan:'Test'});
+    assert.equal((await request('/api/scraper-settings/test','POST',{apiKey:'sgai-draft-secret'},user)).status,200);
+    assert.deepEqual(testedKeys,['sgai-user-secret','sgai-draft-secret']);
+    assert.equal((await pool.query("SELECT scrapegraph_api_key FROM users WHERE id='user'")).rows[0].scrapegraph_api_key,'sgai-user-secret','Testing never persists a draft key');
+    creditsStatus=401;
+    const invalidKey=await request('/api/scraper-settings/test','POST',{},user);
+    assert.equal(invalidKey.status,502);assert.doesNotMatch(JSON.stringify(invalidKey.body),/sgai-user-secret/);
+    assert.equal((await request('/api/auth/me','GET',undefined,user)).status,200,'Upstream key failures preserve the session');
+  } finally {globalThis.fetch=originalFetch;}
+  assert.equal((await request('/api/scraper-settings','PUT',{...personal,apiKey:null},user)).body.configured,false);
+  assert.equal((await request('/api/scraper-settings','GET',undefined,other)).body.configured,true,'Removing a key affects only its owner');
+  assert.equal((await request('/api/scraper-settings','PUT',{...personal,apiKey:'sgai-user-secret'},user)).status,200);
+  await initializeAuth(pool);
+  assert.deepEqual((await request('/api/scraper-settings','GET',undefined,user)).body,{...personal,configured:true},'Repeat migrations preserve personal settings');
+  assert.doesNotMatch(JSON.stringify((await request('/api/users','GET',undefined,admin)).body),/scrapegraph|sgai-user-secret|sgai-other-secret/);
   assert.equal((await request('/api/users','GET',undefined,user)).status,403);
   assert.equal((await request('/api/catalog','DELETE',{all:true},user)).status,403);
   assert.equal((await request('/api/provider-settings','PUT',{},user)).status,403);
@@ -114,6 +160,7 @@ try {
   assert.equal((await request('/api/scrape','POST',{url:'http://127.0.0.1/page'},user)).status,400);
   const retrieved=await request('/api/scrape','POST',{url:'https://8.8.8.8/product?variant=42'},user);
   assert.equal(retrieved.status,200);assert.deepEqual(Object.keys(retrieved.body),['markdown']);
+  assert.deepEqual(scrapeConfigurations.at(-1),{...personal,apiKey:'sgai-user-secret'});
   assert.match(retrieved.body.markdown,/variant=42/);assert.equal(calls,0,'Scraping makes no provider calls');
   assert.doesNotMatch(JSON.stringify(providerRequests),/test-secret-only/);
   scrapeBlocked=true;
@@ -137,7 +184,7 @@ try {
   const job=await request('/api/jobs','POST',{id:'job',name:'Job',skus:['a','b'],attribute_set:'TestSet'},user);assert.equal(job.status,201);
   const credentials={baseUrl:process.env.LLM_BASE_URL,key:process.env.LLM_API_KEY,legacyKey:process.env.AICREDITS_API_KEY};
   delete process.env.LLM_BASE_URL;delete process.env.LLM_API_KEY;delete process.env.AICREDITS_API_KEY;
-  assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product'},user)).status,200,'Browser retrieval does not require LLM credentials');
+  assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product'},user)).status,200,'ScrapeGraph retrieval uses its own key, independently of LLM credentials');
   const missingProvider=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'all'},user);
   assert.equal(missingProvider.status,503);
   assert.match(missingProvider.body.error,/LLM_BASE_URL.*LLM_API_KEY/,'Missing credentials return actionable configuration errors');
@@ -259,15 +306,18 @@ try {
   const productUrl='https://8.8.8.8/product?variant=42';
   assert.equal((await request('/api/catalog/b','PUT',{source:{sap:'Brand: TestBrand',url:productUrl},scraped_markdown:''},user)).status,200);
   const webRun=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'b'},user);
+  await request('/api/scraper-settings','PUT',{...personal,apiKey:'sgai-rotated-secret'},user);
   const snapshotConfig=(await pool.query('SELECT configuration FROM job_runs WHERE id=$1',[webRun.body.id])).rows[0].configuration;
   assert.equal(snapshotConfig.settings.scrapperModelName,'test/sonar');assert.ok(!('selectors' in snapshotConfig));
-  assert.doesNotMatch(JSON.stringify(snapshotConfig),/test-secret-only|apiKey/);
+  assert.doesNotMatch(JSON.stringify(snapshotConfig),/test-secret-only|apiKey|sgai-.*-secret/);
   await request('/api/provider-settings','PUT',{...configured,modelName:'next/qa',scrapperModelName:'next/sonar'},admin);
   providerMode='success';let offset=providerRequests.length;stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await request(`/api/job-runs/${webRun.body.id}`,'GET',undefined,user)).body.status==='completed','snapshotted retrieval');
   await stopWorker();stopWorker=undefined;
   assert.deepEqual(providerRequests.slice(offset).map(payload=>payload.model),['deepseek/deepseek-v4.1-flash']);
   assert.equal(scrapeRequests.at(-1),productUrl);
+  assert.equal(scrapeConfigurations.at(-1)?.apiKey,'sgai-rotated-secret','Queued jobs load the actor\'s latest key instead of another user\'s key or a snapshot');
+  assert.equal(scrapeConfigurations.at(-1)?.mode,'js');
   const qaRequest=providerRequests[offset];
   assert.equal(qaRequest.reasoning_effort,'low');assert.equal(qaRequest.max_tokens,10000);
   assert.deepEqual(qaRequest.response_format,{type:'json_object'});assert.ok(qaRequest.messages[0].content.includes(mappingRules));
@@ -278,6 +328,7 @@ try {
   assert.deepEqual(qaData.uploaded_template,{sku:'b',attributes__brand:'TestBrand',attributes__bullet_point_7:'Extra supplied bullet',custom_optional:''},'QA receives every original upload field without source-only columns');
   const webHistory=(await request(`/api/job-runs/${webRun.body.id}`,'GET',undefined,user)).body;
   assert.match(webHistory.items[1].result.scraped_markdown,/Retrieved product/);
+  assert.doesNotMatch(JSON.stringify(webHistory),/sgai-.*-secret|apiKey/);
   assert.equal(webHistory.items[1].error,null);assert.equal(webHistory.items[1].result.qa_result.qa_status,'pass');
   assert.deepEqual(webHistory.items[1].result.qa_result.source_notes,{sap_used:true,url_used:true,source_conflicts:[]});
   assert.match((await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='b').scraped_markdown,/variant=42/);

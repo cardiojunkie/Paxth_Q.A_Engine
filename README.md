@@ -21,9 +21,9 @@ Back up the database and retain the previous source and image before deployment 
 ## What the application does
 
 1. **Dashboard:** import the first sheet of an `.xlsx`, `.xls`, or `.csv` file, inspect/filter SKUs, scrape selected URLs, supply source content, and create jobs.
-2. **Scrapper agent:** retrieve a public URL through the configured browsing model and preview its Markdown.
+2. **Scrapper agent:** retrieve a public URL through ScrapeGraphAI and preview its Markdown; save a personal key and loading controls.
 3. **Attribute Sets:** save category names and Markdown mapping rules in PostgreSQL.
-4. **LLM Settings:** administrators edit the Q&A model, output limits, and shared QA instructions. Browser scraping does not require a model or provider credentials.
+4. **LLM Settings:** administrators edit the Q&A model, output limits, and shared QA instructions. ScrapeGraph credentials and loading controls are managed per user in Scrapper agent.
 5. **Jobs:** run selected jobs, inspect results, rerun SKUs, and export detailed Excel feedback.
 6. **Users:** administrators manage shared server-authenticated accounts and roles.
 
@@ -36,7 +36,8 @@ flowchart LR
     B[Browser: React UI and progress polling] -->|JSON API| E[Express API and durable worker]
     B -->|Import and export| X[Spreadsheet files]
     E --> D[(PostgreSQL via Drizzle)]
-    E --> M[Shared LLM gateway: Q&A and native URL retrieval]
+    E --> M[Shared LLM gateway: Q&A]
+    E --> S[ScrapeGraphAI: Markdown retrieval]
 ```
 
 Express mounts Vite middleware in development. With `NODE_ENV=production`, it serves `dist/public` and the same API routes. The server entrypoint is `dist/server.mjs`; it is outside the public asset directory.
@@ -48,6 +49,7 @@ Express mounts Vite middleware in development. With `NODE_ENV=production`, it se
 | Category rules and QA agent memory | `attribute_sets`, `qa_agent_settings` | Shared; a configuration snapshot is loaded at each run |
 | Legacy domain selectors | Existing PostgreSQL `site_selectors` data | Retained untouched; no runtime routes or dependencies |
 | Provider URL/API key; model/settings | Server environment; PostgreSQL `provider_settings` | Shared, admin-configured; secrets never reach browsers |
+| Personal ScrapeGraph key and loading controls | PostgreSQL `users` | Used only by the signed-in user and jobs they start; keys are never returned to clients |
 | Accounts and sessions | PostgreSQL `users`/`sessions` | Scrypt password hashes, hashed session tokens, eight-hour HttpOnly cookies, server role enforcement |
 | Notifications; run controls | React memory; server run state | Notifications reset on reload; job controls reconnect by polling |
 
@@ -55,7 +57,7 @@ Every protected API checks the server session and permissions. Keep the Caddy au
 
 ## Local setup
 
-Use **Node.js 22**, npm, an accessible PostgreSQL database, and the CloakBrowser Chromium binary. URL retrieval runs in that browser; QA uses the configured model provider. Python is not required.
+Use **Node.js 22**, npm, and an accessible PostgreSQL database. URL retrieval uses the hosted ScrapeGraphAI v2 API; QA uses the configured model provider. Each user supplies a ScrapeGraph v2 key through Scrapper agent.
 
 ```bash
 npm ci
@@ -65,7 +67,7 @@ test -e .env || cp .env.example .env
 
 Edit `.env` and set `DATABASE_URL` to the intended database. Create that database with your PostgreSQL service first; Compose does not provision PostgreSQL. For Supabase, use the exact TLS-enabled connection URI from the project's Connect dialog. In an IPv4-only environment, use its Session pooler connection details rather than guessing the hostname or region.
 
-Startup creates the application schema and verifies required constraints before serving requests or starting the worker. It stops on migration errors. Existing selector rows are neither inspected nor modified. Before upgrading existing data, back up and test against a restored copy; do not run `db:push` blindly. Configure `APP_ORIGIN`, `LLM_BASE_URL`, and `LLM_API_KEY`, then create the first administrator with `npm run admin:bootstrap` using the environment variables described in [security setup](docs/security-and-jobs.md). Use a direct PostgreSQL connection or session pooler; the worker requires a session-scoped advisory lock.
+Startup creates the application schema and verifies required constraints before serving requests or starting the worker. It stops on migration errors. Existing selector rows are neither inspected nor modified. Before upgrading existing data, back up and test against a restored copy; do not run `db:push` blindly. Configure `LLM_BASE_URL` and `LLM_API_KEY`, set `APP_ORIGIN` to the exact HTTPS origin for production (development derives the Codespaces origin when unset), then create the first administrator with `npm run admin:bootstrap` using the environment variables described in [security setup](docs/security-and-jobs.md). Use a direct PostgreSQL connection or session pooler; the worker requires a session-scoped advisory lock.
 
 Start the application:
 
@@ -73,16 +75,16 @@ Start the application:
 ./start.sh
 ```
 
-Open [localhost:3000](http://localhost:3000). Codespaces forwards port 3000 and opens its frontend URL automatically when the port is forwarded; the launcher also prints the URL. The frontend, API, and Vite live reload share this port. The production image runs the Node application as `node` and includes the pinned CloakBrowser binary and required system libraries. For local development, run `npm run setup:browser`, or set `CHROMIUM_EXECUTABLE` to an installed Chromium binary. The local host also needs browser system libraries.
+Open [localhost:3000](http://localhost:3000). Codespaces forwards port 3000 and opens its frontend URL automatically when the port is forwarded; the launcher also prints the URL. The frontend, API, and Vite live reload share this port. Development also watches backend imports and restarts Express when server code changes; new API routes do not require a manual restart. The production image runs the Node application as `node`; Chromium is needed only for the development UI test.
 
 | Configuration | Current use |
 | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection; loaded from `.env` or the process environment |
-| `LLM_BASE_URL`, `LLM_API_KEY` | Complete server-only QA provider override; configure both together. With neither set, existing `AICREDITS_API_KEY` uses `https://api.aicredits.in/v1`. Browser scraping is independent of these credentials |
+| `LLM_BASE_URL`, `LLM_API_KEY` | Complete server-only QA provider override; configure both together. With neither set, existing `AICREDITS_API_KEY` uses `https://api.aicredits.in/v1`. ScrapeGraph retrieval uses each user’s separately saved key |
 | `PORT` | Express port, default `3000` |
 | `NODE_ENV=production` | Serve built frontend assets instead of Vite middleware |
 | `DISABLE_HMR=true` | Disable development HMR/file watching through Vite configuration |
-| `CLOAKBROWSER_AUTO_UPDATE=false` | Disables browser auto-updates; production and browser tests use the pinned installation |
+| `CHROMIUM_EXECUTABLE` | Optional installed Chromium path for the development UI test only |
 
 For a production build outside Docker:
 
@@ -120,27 +122,27 @@ Keep identifiers such as SKUs and barcodes as text in spreadsheets to avoid nume
 
 ### Prepare evidence and create a job
 
-1. Configure the server provider URL/key, then sign in as an admin and save the model and instructions in **LLM Settings**. Users can operate QA; admins control shared settings and deletions.
+1. Configure the server provider URL/key, then sign in as an admin and save the model and instructions in **LLM Settings**. Users can operate QA; admins control shared settings and deletions. Save your personal ScrapeGraph key in **Scrapper agent** for URL evidence.
 2. Add mapping rules in **Attribute Sets**, matching the spreadsheet category. Seeded category names initially have blank rules.
 3. Upload the spreadsheet and select SKUs. A URL makes a row initially `ready`, but job creation still requires SAP text or actual scraped/pasted content.
 4. Use **Scrape Selected** for URL evidence. Failed scrapes can enter the manual-content queue. **Edit SAP** is available when a SKU has no nonblank scraped content; saving it preserves the uploaded row and previous QA result.
 5. Create one job from SKUs sharing one nonblank attribute set. Open **Jobs** and run it.
 
-The **Scrapper agent**, Dashboard URL retrieval, and automatic job retrieval share a CloakBrowser/Playwright workflow. It opens the exact public URL, waits for rendered text, scrolls for lazy-loaded content, opens native disclosures and common description/specification tabs, and extracts readable text. Navigation, advertising, scripts and forms are excluded. The standalone module displays the full text below the URL, links to the source, and supports cancellation. Scraping does not call an LLM or require provider credentials.
+The **Scrapper agent**, Dashboard URL retrieval, and automatic job retrieval share the [ScrapeGraphAI v2 Scrape API](https://docs.scrapegraphai.com/api-reference/endpoint/scrape). It returns normal-mode Markdown with a source line. The standalone screen previews that text, links to the source, and supports cancellation. The server uses native fetch; production requires no local browser, proxy, or Python service.
 
-The server allows one browser scrape at a time, eight queued requests, a 60-second queue wait, and 120 seconds per execution. Each request owns an isolated browser context and closes its browser and proxy on every exit. A local egress proxy validates every destination and connects to its validated public IP; private networks, metadata addresses, non-HTTP(S) URLs and ports other than 80/443 are rejected. Browser DNS, loopback proxy bypass, QUIC, non-proxied WebRTC and service workers are disabled. Top-level interaction cannot navigate to another page or silently change the supplied product/offer parameters.
+Each signed-in user saves one personal API key and loading controls in **Scrapper agent**. Defaults are auto rendering, stealth off, a 2,000 ms wait, and three scrolls. Rendering can be auto, fast, or JavaScript; wait accepts 0–30,000 ms and scroll count 0–100. Stealth currently adds five credits per scrape. Save edits before retrieving URLs. **Test key / check credits** checks an entered draft key or the saved key without saving or spending scrape credits. The password input clears after successful saving; failed saves preserve the draft. Saved keys are held on the server and never returned to browsers or included in QA/run snapshots.
 
-Scrolling and section interactions are bounded (20 passes/controls). Empty pages, challenges, changing content, unsupported navigation and exhausted limits produce specific errors. The extraction cap is 200,000 characters; content is never silently truncated. QA separately applies its saved evidence limit. The existing `{url}` → `{markdown}` API and `scraped_markdown` storage remain compatible; the field can contain readable plain text. Legacy scraper-model and selector settings remain stored but are not used for retrieval. No database migration is needed.
+Dashboard requests use the signed-in user's latest saved configuration. Background retrieval reads the initiating user's current key and controls immediately before each scrape. Replacing a key affects subsequent requests; requests already dispatched retain their configuration. An invalid key or exhausted credit balance produces an actionable error without signing the user out. After replacing a key, scrape failed URLs again through Dashboard. Existing SAP fallback and durable scrape checkpoints remain in place; failed paid requests are not automatically retried.
 
-Browser setup is included in the production Docker image. For a native Debian 12 installation, install the browser libraries listed in `Dockerfile`, then run `npm run setup:browser` as the application user. This caches pinned Chromium `146.0.7680.177.5`; retrieval never downloads a browser. The packages `cloakbrowser` and `playwright-core` are production dependencies. `CHROMIUM_EXECUTABLE` can select an administrator-installed Chromium for testing or deployment. Browser dependencies are also needed to run `npm run test:scrape-browser` and `npm run test:sap-editor`.
+The application validates public HTTP(S) URLs and checks that DNS resolves only to public addresses. ScrapeGraph manages fetching, redirects, rendering and loading; the old exact-page navigation restrictions and custom accordion/tab interactions are retired. Each scrape has a 120-second deadline, a 60-second upstream fetch timeout, a 4 MiB response limit, and a 200,000-character output ceiling including its source line. Empty, malformed and recognizable challenge results fail rather than becoming evidence. Content is never silently truncated; QA separately applies its saved evidence limit.
 
-Public retailer sites may still reject a server's IP or require a location/session. A blocked or blank response is a retrieval failure, never product evidence. Use the visible source page or supplied SAP/manual content while diagnosing access; no paid proxy or scraping service is enabled by default.
+Startup adds personal key/settings columns to users without changing existing catalog evidence. Existing users begin with no scraper key. The existing URL-to-Markdown API and scraped_markdown storage remain compatible; legacy scraper-model/selector data remains readable but does not control retrieval. Public retailer pages may still fail; SAP or manually supplied content remains available.
 
 Jobs execute on one PostgreSQL-owned server worker, one SKU at a time. Closing the tab or switching modules does not stop execution. Reopen Jobs to view progress, cancel your runs, and choose historical results. Cancellation aborts active requests and keeps committed results. After a restart, unfinished items resume within their original deadline and attempt budget; committed results are skipped. A provider call interrupted before its result was saved can be billed again. Editing evidence increments its revision, preventing older runs from overwriting the new catalog evidence.
 
 ### QA settings and results
 
-The default QA model is `deepseek/deepseek-v4.1-flash`, requested with low reasoning effort. Defaults are 4,096 output tokens, temperature 0.1, and 40,000 evidence characters; saved settings retain their configured limits. QA allows at most three server-owned attempts for transient failures within a five-minute per-SKU deadline; permanent errors fail immediately. Each QA request has a 120-second response deadline beginning after queue admission and its saved attempt checkpoint. Provider admission is shared across QA and admin tests: two active calls, eight waiting, with a 60-second queue wait limit. Response bodies remain subject to deadlines and a 4 MiB limit. Browser retrieval has its own queue and makes no provider calls.
+The default QA model is `deepseek/deepseek-v4.1-flash`, requested with low reasoning effort. Defaults are 4,096 output tokens, temperature 0.1, and 40,000 evidence characters; saved settings retain their configured limits. QA allows at most three server-owned attempts for transient failures within a five-minute per-SKU deadline; permanent errors fail immediately. Each QA request has a 120-second response deadline beginning after queue admission and its saved attempt checkpoint. Provider admission is shared across QA and admin tests: two active calls, eight waiting, with a 60-second queue wait limit. Response bodies remain subject to deadlines and a 4 MiB limit. ScrapeGraph retrieval uses a separate API and has no local admission queue; provider rate-limit errors are reported to the user.
 
 Provider failures are saved before retrying. If an interrupted item resumes after consuming all three attempts, its error reports the last recorded provider failure, or explains that a fresh rerun is needed when no cause was saved. Successful completion clears transient errors.
 
@@ -197,6 +199,8 @@ Routes are registered in [server.ts](server.ts) and its server modules. APIs req
 | `/api/qa-configuration` | GET | Shared memory and attribute sets in one snapshot |
 | `/api/qa-agent-memory` | PUT | Save shared memory |
 | `/api/attribute-sets`, `/api/attribute-sets/:id`, `/api/attribute-sets/import` | POST collection/import; PUT/DELETE item | Maintain shared category rules |
+| `/api/scraper-settings` | GET/PUT | Personal loading controls and configured status; optional write-only `apiKey`, with `null` to remove it |
+| `/api/scraper-settings/test` | POST | Optional draft `{apiKey}` or `{}` for the saved key; returns `{remaining, used, plan}` |
 | `/api/scrape` | POST | `{ url }` → `{ markdown }`; failures use `{ error, code }` |
 | `/api/chat` | POST | Admin test; accepts optional `modelName` and `purpose: "qa" \| "scrapper"` (defaults to QA) |
 
@@ -208,20 +212,21 @@ npm run test:job-state
 npm run test:llm-response
 npm run test:qa-agent
 npm run test:scrape-agent
-npm run test:scrape-browser
 ```
 
 `lint` is TypeScript checking, not ESLint. Additional checks have prerequisites:
 
 ```bash
-# Requires an installed CloakBrowser binary and its OS libraries.
+# Development UI test only: install standard Chromium and its OS libraries.
+npm run setup:browser
+# On Linux, install missing OS libraries with: npx playwright-core install-deps chromium
 npm run test:sap-editor
 
 # Set TEST_DATABASE_URL to a disposable test database before running.
 npm run test:qa-config-db
 ```
 
-The retrieval checks exercise public URL validation, DNS pinning, rebinding rejection, queue admission and cancellation. Real browser fixtures cover rendered content, lazy loading, disclosures, tabs, redirects, blocked/empty pages, size/interaction limits and private subresources. UI checks cover full-text preview, cancellation, one error message, Dashboard saving and QA settings persistence. Test API checks QA connectivity; use Retrieve URL for a live scrape.
+Retrieval checks mock ScrapeGraph and cover public URL/DNS checks, Markdown parsing, empty/challenge results, invalid keys, exhausted credits, rate limits, deadlines, response/output limits and cancellation. UI checks cover personal key/control saving, retained drafts, credit tests, reloads, secret exclusion, Markdown preview, cancellation, Dashboard saving and QA settings persistence. Database checks cover key ownership, replacement, removal, migrations and job actors. These checks incur no ScrapeGraph charges; use Retrieve URL for a live scrape with your saved key.
 
 The database test creates and drops an isolated schema. Never point it at the shared production database. The SAP editor browser test mocks API traffic; it does not prove real database persistence. Check the [implementation validation record](docs/security-and-jobs.md#implementation-validation) for what was actually run.
 
@@ -241,7 +246,7 @@ https://project22.tail608e42.ts.net/
 
 The deployment directory is `/opt/paxth-qa`. Its gateway requires separately supplied credentials; a Tailscale client is not required. The separate Rakazo application uses `https://rakazo.tail608e42.ts.net/`, its own containers, and the default Tailscale service. Do not change those resources. A legacy Rakazo-hostname listener on port 8443 also points to the QA gateway; leave that existing route unchanged.
 
-[compose.yaml](compose.yaml) defines the separate `paxth-qa` project, image `paxth-qa:local`, restart policy, loopback port binding, 1 CPU, 1,536 MiB memory, 256 MiB shared memory, and rotating container logs. The image runs the Node production build as `node` with the retrieval browser installed. Python is not required. Secrets and backups are excluded from the image build.
+[compose.yaml](compose.yaml) defines the separate `paxth-qa` project, image `paxth-qa:local`, restart policy, loopback port binding, 1 CPU, 1,536 MiB memory, 256 MiB shared memory, and rotating container logs. The image runs the Node production build as `node` without a retrieval browser. Secrets and backups are excluded from the image build.
 
 Keep `/opt/paxth-qa/.env` readable only by its owner (`chmod 600 .env`). Its `DATABASE_URL` must reach PostgreSQL from inside the container: container `localhost` is not the VPS host. Caddy should authenticate every page, asset, and API request, strip inbound `Authorization` before proxying, store only the password hash, and accept the Funnel hostname. This repository does not contain its Caddyfile.
 
@@ -306,7 +311,7 @@ The earlier deployment notes name `/opt/paxth-qa/backups/Caddyfile.before` as a 
 | GitHub has new code but the public URL looks unchanged | Update/rebuild on the VPS; restarting the old container is insufficient. Refresh the browser after deployment. |
 | Startup fails or readiness is unavailable | Inspect migration errors; resolve conflicting data on a restored copy before production. |
 | Settings/rules will not save | Sign in as an administrator and check PostgreSQL availability. Model settings and memory save atomically. |
-| Scrape fails or shows a challenge | Check browser installation and the URL in Scrapper agent; inspect the specific blocked/empty/timeout error. Test API checks QA connectivity only. Use SAP or manually supplied content when needed. |
+| Scrape fails or shows a challenge | Check your saved key, credits and loading controls in Scrapper agent; inspect the specific key/credit/blocked/empty/timeout error. Test API checks QA connectivity only. Use SAP or manually supplied content when needed. |
 | Job remains queued | Check server worker logs, provider configuration, and database availability. Reloading the browser does not interrupt execution. |
 | An upload fails | Read the visible error. No rows from a failed batch are committed; retry after correcting the problem. |
 | A save/delete looks successful but returns after reload | Check the visible error and database availability, then reload to verify persistence. |

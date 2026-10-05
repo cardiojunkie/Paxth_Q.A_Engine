@@ -9,7 +9,7 @@ import { hasCompletedQa } from '../lib/jobRunState';
 import { normalizeSettings } from '../lib/providerSettings';
 import { scrapeWithAgent } from '../lib/scrapeAgent';
 import { ProviderError } from '../lib/chatCompletion';
-import { completeQa, getProviderCredentials, getProviderSettings } from './provider';
+import { completeQa, getProviderCredentials, getProviderSettings, getScraperConfiguration } from './provider';
 import { mapCatalogRow } from './catalog';
 
 // ponytail: global mutation lock and one worker fit this deployment; partition by job if throughput requires it.
@@ -263,7 +263,7 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
             await client.query('UPDATE job_run_items SET scrape_started=true WHERE run_id=$1 AND sku=$2', [run.id, item.sku]);
           });
           try {
-            const markdown = await scrape(snapshot.source.url, execution);
+            const markdown = await scrape(snapshot.source.url, execution, await getScraperConfiguration(pool, run.actor_id));
             snapshot = { ...snapshot, scraped_markdown: markdown, scrape_status: 'success' };
           } catch (error) {
             execution.throwIfAborted();

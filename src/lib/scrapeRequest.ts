@@ -12,3 +12,11 @@ export async function scrapeUrl(url: string, signal?: AbortSignal): Promise<stri
   }
   return data.markdown;
 }
+export interface ScrapeSettings {
+  mode: 'auto' | 'fast' | 'js';
+  stealth: boolean;
+  wait: number;
+  scrolls: number;
+}
+export type ScraperSettings = ScrapeSettings & { configured: boolean };
+export const DEFAULT_SCRAPE_SETTINGS: ScrapeSettings = { mode: 'auto', stealth: false, wait: 2000, scrolls: 3 };
