@@ -1,10 +1,11 @@
-import type { Express } from 'express';
+import type { Express, Response } from 'express';
 import type { Pool, PoolClient } from 'pg';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fetchChatCompletion, ProviderError, providerResponseError } from '../lib/chatCompletion';
 import { DEFAULT_SETTINGS, editableSettings, normalizeSettings, type AppSettings } from '../lib/providerSettings';
 import { extractLLMResponseContent } from '../lib/llmResponse';
-import { scrapeWithAgent, ScrapeError } from '../lib/scrapeAgent';
+import { scrapeWithAgent, ScrapeError, checkScrapeCredits, validateScrapeInput, validateScrapeKey, validateScrapeSettings, type ScrapeConfiguration } from '../lib/scrapeAgent';
+import { DEFAULT_SCRAPE_SETTINGS } from '../lib/scrapeRequest';
 import { transaction } from './database';
 
 export function getProviderCredentials() {
@@ -42,6 +43,20 @@ export function validateSettings(value: any) {
     typeof value.qaAgentMemory !== 'string' || value.qaAgentMemory.length > 200000) throw new ProviderError('Invalid model settings or unsupported fields', 400);
   return editableSettings(normalizeSettings(value));
 }
+export async function getScraperConfiguration(pool: Pool | PoolClient, userId: string): Promise<ScrapeConfiguration> {
+  const { rows: [row] } = await pool.query('SELECT scrapegraph_api_key AS "apiKey", scrapegraph_settings AS settings FROM users WHERE id=$1', [userId]);
+  if (!row) throw new ScrapeError('The scraper account is unavailable. Sign in again or start a new job run.', 503, 'API_KEY_REQUIRED');
+  return { apiKey: row.apiKey, ...validateScrapeSettings({ ...DEFAULT_SCRAPE_SETTINGS, ...row.settings }) };
+}
+function publicScraperSettings({ apiKey, ...settings }: ScrapeConfiguration) {
+  return { ...settings, configured: !!apiKey };
+}
+function scrapeFailure(res: Response, error: unknown) {
+  if (!res.destroyed) res.status(error instanceof ScrapeError ? error.status : 503).json({
+    error: error instanceof ScrapeError ? error.message : 'Scraper service unavailable. Please retry.',
+    code: error instanceof ScrapeError ? error.code : 'RETRIEVAL_FAILED',
+  });
+}
 export async function completeQa(payload: unknown, signal: AbortSignal, options: {
   attempts?: number; beforeAttempt?: (attempt: number) => Promise<void>;
   lastError?: string | null; onAttemptError?: (attempt: number, error: ProviderError) => Promise<void>;
@@ -70,7 +85,41 @@ export async function completeQa(payload: unknown, signal: AbortSignal, options:
   signal.throwIfAborted();
   throw new ProviderError(exhaustedMessage);
 }
-export function registerProviderRoutes(app: Express, pool: Pool) {
+export function registerProviderRoutes(app: Express, pool: Pool, scrape = scrapeWithAgent) {
+  app.get('/api/scraper-settings', async (_req, res) => {
+    try { res.json(publicScraperSettings(await getScraperConfiguration(pool, res.locals.user.id))); }
+    catch (error) { scrapeFailure(res, error); }
+  });
+  app.put('/api/scraper-settings', async (req, res) => {
+    try {
+      if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) ||
+          Object.keys(req.body).some(key => !['apiKey', 'mode', 'stealth', 'wait', 'scrolls'].includes(key))) {
+        throw new ScrapeError('Only an API key and scraper loading settings are accepted.', 400, 'INVALID_SETTINGS');
+      }
+      const settings = validateScrapeSettings(req.body);
+      const apiKey = req.body.apiKey === undefined || req.body.apiKey === null ? null : validateScrapeKey(req.body.apiKey);
+      const { rows: [row] } = await pool.query(`UPDATE users SET scrapegraph_settings=$2,
+        scrapegraph_api_key=CASE WHEN $3 THEN $4 ELSE scrapegraph_api_key END WHERE id=$1
+        RETURNING scrapegraph_api_key IS NOT NULL AS configured`,
+        [res.locals.user.id, JSON.stringify(settings), req.body.apiKey !== undefined, apiKey]);
+      if (!row) throw new ScrapeError('Your account is unavailable. Sign in again.', 503, 'API_KEY_REQUIRED');
+      res.json({ ...settings, configured: row.configured });
+    } catch (error) { scrapeFailure(res, error); }
+  });
+  app.post('/api/scraper-settings/test', async (req, res) => {
+    const controller = new AbortController();
+    const disconnect = () => { if (!res.writableEnded) controller.abort(); };
+    res.on('close', disconnect);
+    try {
+      if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) || Object.keys(req.body).some(key => key !== 'apiKey')) {
+        throw new ScrapeError('Key testing accepts an optional API key only.', 400, 'INVALID_SETTINGS');
+      }
+      const apiKey = req.body.apiKey === undefined ? (await getScraperConfiguration(pool, res.locals.user.id)).apiKey : validateScrapeKey(req.body.apiKey);
+      const credits = await checkScrapeCredits(apiKey, controller.signal);
+      if (!res.destroyed) res.json(credits);
+    } catch (error) { scrapeFailure(res, error); }
+    finally { res.removeListener('close', disconnect); }
+  });
   app.get('/api/provider-settings', async (_req, res) => { res.json(await getProviderSettings(pool)); });
   app.put('/api/provider-settings', async (req, res) => {
     if (res.locals.user?.role !== 'admin') { res.status(403).json({ error: 'Administrator access required' }); return; }
@@ -88,13 +137,13 @@ export function registerProviderRoutes(app: Express, pool: Pool) {
     res.on("close", disconnect);
     try {
       if (!req.body || typeof req.body !== "object" || Array.isArray(req.body) || Object.keys(req.body).some(key => key !== "url")) throw new ScrapeError("Only a URL is accepted", 400);
-      const settings = await getProviderSettings(pool);
-      const markdown = await scrapeWithAgent(req.body.url, { ...getProviderCredentials(), modelName: settings.scrapperModelName, maxTokens: settings.maxTokens, maxPageContentLength: settings.maxPageContentLength }, controller.signal);
+      const { url } = validateScrapeInput(req.body);
+      const markdown = await scrape(url, controller.signal, await getScraperConfiguration(pool, res.locals.user.id));
       if (!res.destroyed) res.json({ markdown });
     } catch (error) {
       if (!res.destroyed) res.status(error instanceof ScrapeError || error instanceof ProviderError ? error.status : 500).json({
         error: error instanceof ScrapeError || error instanceof ProviderError ? error.message : "Failed to retrieve URL",
-        details: "Use SAP or manually supplied source content if this page cannot be retrieved.",
+        code: error instanceof ScrapeError ? error.code : 'RETRIEVAL_FAILED',
       });
     } finally {
       res.removeListener("close", disconnect);

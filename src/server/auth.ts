@@ -53,6 +53,8 @@ export async function initializeAuth(pool: Pool) {
       last_login timestamp, created_at timestamp NOT NULL DEFAULT now()
     );
     CREATE UNIQUE INDEX IF NOT EXISTS users_normalized_username_idx ON users (lower(btrim(username)));
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS scrapegraph_api_key text;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS scrapegraph_settings jsonb NOT NULL DEFAULT '{}';
     CREATE TABLE IF NOT EXISTS sessions (
       token_hash text PRIMARY KEY, user_id text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       created_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz NOT NULL
@@ -119,8 +121,10 @@ async function withUserLock<T>(pool: Pool, actorId: string, action: (client: Poo
 export function registerAuth(app: Express, pool: Pool) {
   const production = process.env.NODE_ENV === 'production';
   let configuredOrigin: string | undefined;
-  if (process.env.APP_ORIGIN) {
-    const url = new URL(process.env.APP_ORIGIN);
+  const appOrigin = process.env.APP_ORIGIN || (!production && process.env.CODESPACE_NAME && process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN
+    ? `https://${process.env.CODESPACE_NAME}-${Number(process.env.PORT) || 3000}.${process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}` : undefined);
+  if (appOrigin) {
+    const url = new URL(appOrigin);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/' || url.search || url.hash || (production && url.protocol !== 'https:')) {
       throw new Error('APP_ORIGIN must be an HTTPS origin in production, without a path or credentials.');
     }

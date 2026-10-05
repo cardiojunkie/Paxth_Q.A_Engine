@@ -50,7 +50,7 @@ async function acquire(signal: AbortSignal): Promise<() => void> {
   };
 }
 
-async function bufferResponse(response: Response, signal: AbortSignal) {
+export async function bufferResponse(response: Response, signal: AbortSignal, limitError: Error = new ProviderError("The model response exceeded the 4 MiB limit.")) {
   const reader = response.body?.getReader();
   if (!reader) return response;
   const chunks: Uint8Array[] = [];
@@ -66,7 +66,7 @@ async function bufferResponse(response: Response, signal: AbortSignal) {
       length += value.byteLength;
       if (length > 4 * 1024 * 1024) {
         void reader.cancel().catch(() => {});
-        throw new ProviderError("The model response exceeded the 4 MiB limit.");
+        throw limitError;
       }
       chunks.push(value);
     }
@@ -80,7 +80,7 @@ async function bufferResponse(response: Response, signal: AbortSignal) {
   }
 }
 
-/** Shared by QA, URL retrieval, and admin tests; no retries at this layer. */
+/** Shared by QA and admin connectivity tests; no retries at this layer. */
 export async function fetchChatCompletion(
   baseUrl: string, apiKey: string, payload: unknown, signal: AbortSignal,
   beforeFetch?: () => Promise<void>, requestTimeoutMs = 90_000,

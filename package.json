@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "tsx watch server.ts",
     "build": "vite build --outDir dist/public && esbuild server.ts --bundle --platform=node --format=esm --packages=external --sourcemap --outfile=dist/server.mjs && esbuild scripts/bootstrap-admin.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/bootstrap-admin.mjs",
     "start": "node dist/server.mjs",
     "preview": "vite preview --outDir dist/public",
@@ -21,9 +21,11 @@
     "test:scrape-agent": "tsx src/lib/scrapeAgent.test.ts && tsx src/lib/scrapeRequest.test.ts",
     "admin:bootstrap": "tsx scripts/bootstrap-admin.ts",
     "test:provider": "tsx src/server/provider.test.ts",
+    "test:auth": "tsx src/server/auth.test.ts",
     "test:security-db": "tsx src/server/security.test.ts",
-    "test": "npm run lint && npm run test:provider && npm run test:job-state && npm run test:job-runner && npm run test:llm-response && npm run test:qa-agent && npm run test:scrape-agent",
-    "test:job-runner": "tsx src/server/jobRunner.test.ts"
+    "test": "npm run lint && npm run test:auth && npm run test:provider && npm run test:job-state && npm run test:job-runner && npm run test:llm-response && npm run test:qa-agent && npm run test:scrape-agent",
+    "test:job-runner": "tsx src/server/jobRunner.test.ts",
+    "setup:browser": "playwright-core install chromium"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.20",
@@ -50,12 +52,11 @@
     "@types/file-saver": "^2.0.7",
     "@types/node": "^22.14.0",
     "@types/pg": "^8.21.0",
-    "cloakbrowser": "^0.5.5",
     "drizzle-kit": "^0.31.10",
     "esbuild": "^0.25.0",
-    "playwright-core": "^1.62.1",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
-    "typescript": "~5.8.2"
+    "typescript": "~5.8.2",
+    "playwright-core": "^1.62.1"
   }
 }
