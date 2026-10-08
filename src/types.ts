@@ -41,3 +41,15 @@ export interface UserAccountInput {
   password: string;
   role: 'admin' | 'user';
 }
+
+export interface CatalogFileGroup {
+  attributeSet: string;
+  headers: string[];
+  rows: Record<string, string>[];
+}
+
+export interface CatalogOutputs {
+  groups: CatalogFileGroup[];
+  shipping: { region: string; headers: string[]; rows: Record<string, string>[] } | null;
+  shippingError?: string;
+}

@@ -41,7 +41,7 @@ Apply these rules only to the `Elec-M&W-MA-Power Adapters / Chargers & Utility C
 * **`attributes__design`**: MUST describe only verified form-factor details, such as wall, desktop, car, foldable plug, braided cable, right-angle connector, or retractable design. Flag a design that changes fit or use and contradicts the source as CRITICAL; flag unsupported cosmetic/construction claims as MODERATE.
 * **`attributes__country_of_origin`**: MUST match the explicit country in SAP or scraped content. Flag a different or source-supported missing country as MODERATE. Do not infer origin from brand headquarters or seller location.
 
-## Interfaces, Power, and Performances
+## Interfaces, Power, and Performancesd
 
 * **`attributes__interfaces`**: MUST state the correct input/output connector and mains-plug standards, such as USB-A, USB-C, Micro-USB, Lightning, barrel connector, Type-G plug, or Type-C plug. Direction and gender MUST remain accurate when the source specifies them. Flag a wrong or unsupported interface as CRITICAL and missing source-supported detail as MODERATE.
 * **`attributes__ports`**: MUST state the correct number and type of charger/adapter receptacles and agree with `attributes__interfaces`. Cable endpoints are not ports unless the source describes them that way. A cable with no receptacle may leave this field blank. Flag a wrong port count/type or internal contradiction as CRITICAL; flag an incomplete source-supported list as MODERATE.
@@ -71,3 +71,9 @@ Apply these rules only to the `Elec-M&W-MA-Power Adapters / Chargers & Utility C
 * `attributes__no_of_pieces`, `attributes__pack`, `attributes__package_contents`, and `attributes__in_the_box` MUST describe one consistent selling configuration.
 * `attributes__weight` and `attributes__product_dimensions` MUST refer to the product; `attributes__shipping_weight` and `attributes__package_dimensions` MUST refer to the packed item.
 * `attributes__compatible_models` and `attributes__compatible_devices` MUST be supported by the stated interfaces, electrical ratings, protocols, and source limitations.
+
+
+
+
+
+

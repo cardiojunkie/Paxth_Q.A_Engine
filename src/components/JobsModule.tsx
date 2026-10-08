@@ -4,8 +4,10 @@ import { useAppContext, Job } from "../context/AppContext";
 import type { SkuData } from "../hooks/useCatalogData";
 import { getCommonAttributeSet, getCommonHeaderOrder, hasCompletedQa, unreviewedRunSnapshot } from "../lib/jobRunState";
 import { populateQaWorksheet } from "../lib/qaExcelExport";
-import { hasCompletedCatalog, populateCatalogWorksheet } from "../lib/catalogGeneration";
-import type { JobType } from '../types';
+import { hasCompletedCatalog } from "../lib/catalogGeneration";
+import { completedCatalogGroups, prepareCatalogOutputs, populateCatalogFile } from '../lib/catalogFiles';
+import { CatalogFileDownload } from './CatalogFileDownload';
+import type { JobType, CatalogOutputs, CatalogFileGroup } from '../types';
 import { api } from "../lib/api";
 import { cn } from "../lib/utils";
 import ExcelJS from "exceljs";
@@ -15,6 +17,8 @@ type Run = {
   id: string; jobId: string; actorId: string; actorName: string; status: string;
   jobType?: JobType;
   catalogHeaders?: string[];
+  catalogGroups?: Pick<CatalogFileGroup, 'attributeSet' | 'headers'>[];
+  catalogOutputs?: CatalogOutputs;
   createdAt: string; finishedAt?: string; error?: string;
   items?: Array<{ sku: string; status: string; attempts: number; error?: string; snapshot: SkuData; result?: SkuData }>;
 };
@@ -33,6 +37,10 @@ const runSkus = (run: Run) => (run.items || []).map(item => {
     } : {}),
   } as SkuData;
 });
+const runGroups = (run: Run) => run.catalogGroups?.length ? run.catalogGroups : run.catalogHeaders ?
+  [{ attributeSet: run.items?.[0]?.snapshot.attribute_set || '', headers: run.catalogHeaders }] : [];
+const runOutputs = (run: Run): CatalogOutputs => run.catalogOutputs || prepareCatalogOutputs(
+  (run.items || []).map(item => item.snapshot), runGroups(run).map(group => ({ ...group, rulesMarkdown: '' })), true);
 
 export function JobsModule() {
   const { skuDataList, jobs: allJobs, workspaceMode, removeJob, addNotification, refreshData, user } = useAppContext();
@@ -48,6 +56,9 @@ export function JobsModule() {
   const [viewRun, setViewRun] = useState<Run | null>(null);
   const [expandedSku, setExpandedSku] = useState<string | null>(null);
   const [selectedJobs, setSelectedJobs] = useState<Set<string>>(new Set());
+  const [preparedFiles, setPreparedFiles] = useState<CatalogOutputs | null>(null);
+  const [filesError, setFilesError] = useState('');
+  const [combinedFiles, setCombinedFiles] = useState<CatalogFileGroup[] | null>(null);
   const latest = useRef({ refreshData, jobs });
   latest.current = { refreshData, jobs };
   const jobIds = jobs.map(job => job.id).join("\n");
@@ -56,6 +67,7 @@ export function JobsModule() {
   useEffect(() => {
     setSelectedJobs(new Set()); setSelectedJobToView(null); setSelectedRunId(''); setExpandedSku(null);
     setActiveRuns([]); setCatalogRuns({}); setPollError('');
+    setPreparedFiles(null); setCombinedFiles(null); setFilesError('');
   }, [workspaceMode]);
 
   useEffect(() => {
@@ -97,6 +109,16 @@ export function JobsModule() {
     const timer = setInterval(poll, 2000);
     return () => { disposed = true; clearInterval(timer); };
   }, [selectedRunId]);
+
+  useEffect(() => {
+    setPreparedFiles(null); setFilesError('');
+    if (!isCatalog || !selectedJobToView || selectedRunId) return;
+    let disposed = false;
+    request<CatalogOutputs>(`/api/jobs/${encodeURIComponent(selectedJobToView.id)}/outputs`)
+      .then(outputs => { if (!disposed) setPreparedFiles(outputs); })
+      .catch(error => { if (!disposed) setFilesError(error instanceof Error ? error.message : 'Could not load prepared files.'); });
+    return () => { disposed = true; };
+  }, [selectedJobToView?.id, selectedRunId, isCatalog]);
 
   const runJob = async (jobId: string, _sequential = false, sku?: string, all = false) => {
     const key = `${jobId}:${sku || (all ? "all" : "unfinished")}`;
@@ -141,11 +163,11 @@ export function JobsModule() {
     const id = runId || history.find(run => !active(run))?.id || history[0]?.id;
     if (id) {
       const run = await request<Run>(`/api/job-runs/${id}`);
-      return { skus: runSkus(run), headers: run.catalogHeaders };
+      return { skus: runSkus(run), groups: runGroups(run) };
     }
     const skus = job.skus.map(id => skuDataList.find(sku => sku.sku === id));
     if (skus.some(sku => !sku)) throw new Error("Some legacy job SKUs no longer exist in the catalog.");
-    return { skus: skus as SkuData[], headers: undefined };
+    return { skus: skus as SkuData[], groups: [] as Pick<CatalogFileGroup, 'attributeSet' | 'headers'>[] };
   };
 
   const exportJobExcel = async (jobOrJobs: Job | Job[], issuesOnly: boolean = false) => {
@@ -164,6 +186,35 @@ export function JobsModule() {
       const snapshots = await Promise.all(jobsToExport.map(job => loadJobSkus(job,
         !Array.isArray(jobOrJobs) && selectedJobToView?.id === job.id ? selectedRunId : undefined)));
       const allJobSkus = [...new Map(snapshots.flatMap(snapshot => snapshot.skus).map(sku => [sku.sku, sku])).values()];
+      if (jobsToExport.every(job => job.jobType === 'catalog')) {
+        const groups = new Map<string, CatalogFileGroup>();
+        for (const snapshot of snapshots) {
+          if (!snapshot.groups.length) throw new Error('No saved Catalog headers are available for these jobs.');
+          for (const group of completedCatalogGroups(snapshot.skus, snapshot.groups)) {
+            const previous = groups.get(group.attributeSet);
+            if (previous && JSON.stringify(previous.headers) !== JSON.stringify(group.headers)) {
+              throw new Error('Catalog jobs must have identical saved header order to export together.');
+            }
+            groups.set(group.attributeSet, { ...group, rows: [...(previous?.rows || []), ...group.rows] });
+          }
+        }
+        const files = [...groups.values()].map(group => ({ ...group, rows: [...new Map(group.rows.map(row => [row.sku, row])).values()] }));
+        if (!files.some(file => file.rows.length)) throw new Error('No validated catalog rows are available to export.');
+        if (files.length === 1) {
+          const workbook = new ExcelJS.Workbook();
+          populateCatalogFile(workbook.addWorksheet('Catalog'), files[0]);
+          const exportName = jobsToExport.length === 1 ? jobsToExport[0].name : files[0].attributeSet + '_Combined';
+          saveAs(new Blob([await workbook.xlsx.writeBuffer()], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+            exportName.replace(/[^a-zA-Z0-9_-]/g, '_') + '_Catalog_Upload.xlsx');
+        } else setCombinedFiles(files);
+        const count = files.reduce((total, file) => total + file.rows.length, 0);
+        const assigned = new Set(snapshots.flatMap(snapshot => snapshot.skus.map(sku => JSON.stringify([sku.attribute_set, sku.sku])))).size;
+        const omitted = assigned - count;
+        addNotification({ type: omitted ? 'warning' : 'success', title: files.length === 1 ? 'Catalog Exported' : 'Catalog Files Ready',
+          message: 'Prepared ' + count + ' validated row(s); omitted ' + omitted + ' unfinished or failed SKU(s). Review cell warnings in job results.' });
+        return;
+      }
+
       const attributeSet = getCommonAttributeSet(allJobSkus);
       if (!attributeSet) {
         addNotification({
@@ -171,24 +222,6 @@ export function JobsModule() {
           title: "Cannot Export Jobs",
           message: "The selected completed jobs contain multiple or missing attribute sets. All exported SKUs must use one non-empty attribute set."
         });
-        return;
-      }
-
-      if (jobsToExport.every(job => job.jobType === 'catalog')) {
-        const headers = snapshots[0].headers;
-        if (!headers?.length || snapshots.some(snapshot => !snapshot.headers || snapshot.headers.length !== headers.length ||
-          snapshot.headers.some((header, index) => header !== headers[index]))) {
-          throw new Error('Catalog jobs must have identical saved header order to export together.');
-        }
-        const completed = [...new Map(snapshots.flatMap(snapshot => snapshot.skus).filter(hasCompletedCatalog).map(sku => [sku.sku, sku])).values()];
-        const workbook = new ExcelJS.Workbook();
-        populateCatalogWorksheet(workbook.addWorksheet('Catalog'), completed.map(sku => sku.catalog_state!));
-        const exportName = jobsToExport.length === 1 ? jobsToExport[0].name : `${attributeSet}_Combined`;
-        saveAs(new Blob([await workbook.xlsx.writeBuffer()], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
-          `${exportName.replace(/[^a-zA-Z0-9_-]/g, '_')}_Catalog_Upload.xlsx`);
-        const omitted = allJobSkus.length - completed.length;
-        addNotification({ type: omitted ? 'warning' : 'success', title: 'Catalog Exported',
-          message: `Exported ${completed.length} validated row(s); omitted ${omitted} unfinished or failed SKU(s). Review cell warnings in job results.` });
         return;
       }
 
@@ -261,9 +294,13 @@ export function JobsModule() {
 
   const getJobSkusList = (job: Job) => {
     if (selectedJobToView?.id === job.id && selectedRunId) return viewRun?.id === selectedRunId ? runSkus(viewRun) : [];
-    if (job.jobType === 'catalog') return catalogRuns[job.id] ? runSkus(catalogRuns[job.id]) : [];
-    return job.skus.map(s => skuDataList.find(item => item.sku === s)).filter(Boolean) as typeof skuDataList;
+    if (job.jobType === 'catalog' && selectedJobToView?.id !== job.id && catalogRuns[job.id]) return runSkus(catalogRuns[job.id]).filter(sku => job.skus.includes(sku.sku));
+    const skus = job.skus.map(s => skuDataList.find(item => item.sku === s)).filter(Boolean) as typeof skuDataList;
+    return job.jobType === 'catalog' ? skus.map(sku => unreviewedRunSnapshot(sku, false)) : skus;
   };
+
+  const selectedOutputs = selectedRunId ? viewRun?.id === selectedRunId ? runOutputs(viewRun) : null : preparedFiles;
+  const finalGroups = selectedOutputs && viewRun?.id === selectedRunId ? completedCatalogGroups(runSkus(viewRun), selectedOutputs.groups) : [];
 
   return (
     <div className="flex-1 flex flex-col h-full bg-[#FDFCFB] overflow-hidden">
@@ -280,6 +317,15 @@ export function JobsModule() {
         <div className="max-w-6xl mx-auto space-y-8">
           
           {pollError && <p role="alert" className="text-sm text-red-700">{pollError}. Progress will retry automatically.</p>}
+          {isCatalog && combinedFiles && <section aria-label="Selected Catalog files" className="border border-[#E5E2DE] p-4 space-y-3">
+            <div className="flex justify-between"><h3 className="font-serif text-xl">Selected Catalog files</h3>
+              <button onClick={() => setCombinedFiles(null)} aria-label="Close selected files"><X className="w-4 h-4" /></button></div>
+            {combinedFiles.map(file => <div key={file.attributeSet} className="flex items-center justify-between gap-3">
+              <span>{file.attributeSet} · {file.rows.length} validated rows</span>
+              {file.rows.length > 0 ? <CatalogFileDownload file={file} filename={`${file.attributeSet}_Combined_Catalog_Upload`}
+                label={`Download ${file.attributeSet} Upload`} /> : <span>No validated rows available.</span>}
+            </div>)}
+          </section>}
           {activeRuns.filter(run => jobs.some(job => job.id === run.jobId)).map(run => {
             const items = (run.items || []).filter(item => item.status !== "skipped");
             const completed = items.filter(item => ["completed", "failed", "cancelled"].includes(item.status)).length;
@@ -385,6 +431,7 @@ export function JobsModule() {
                     <div className="flex items-center gap-4 text-[11px] font-mono text-[#8C8882] mt-1">
                       <span className="flex items-center gap-1"><Clock className="w-3 h-3" /> {new Date(job.createdAt).toLocaleString()}</span>
                       <span>SKUs: {job.skus.length}</span>
+                      {isCatalog && <span>Sets: {(job.attributeSets || [job.attribute_set]).filter(Boolean).join(', ')}</span>}
                       {completedCount > 0 && (
                         <span className="text-emerald-700 font-semibold">{isCatalog ? 'Catalog rows' : 'Current QA'}: {completedCount}/{job.skus.length}</span>
                       )}
@@ -435,7 +482,7 @@ export function JobsModule() {
                       </>
                     )}
 
-                    {unresolvedCount > 0 && (
+                    {(isCatalog || unresolvedCount > 0) && (
                       <button
                         onClick={() => runJob(job.id)}
                         disabled={submitting || activeRuns.some(run => run.jobId === job.id)}
@@ -502,16 +549,16 @@ export function JobsModule() {
               </div>
 
               <div className="flex items-center gap-3">
-                <button
+                {!isCatalog && <button
                   onClick={() => exportJobExcel(selectedJobToView)}
                   className="flex items-center gap-2 px-5 py-2 text-[11px] uppercase tracking-widest font-bold text-white bg-emerald-700 hover:bg-emerald-800 transition-colors rounded-sm shadow-sm"
                 >
                   <Download className="w-4 h-4" />
                   Export Excel (.xlsx)
-                </button>
+                </button>}
 
                 <button
-                  onClick={() => setSelectedJobToView(null)}
+                  onClick={() => setSelectedJobToView(null)} aria-label="Close job details"
                   className="p-2 text-[#8C8882] hover:text-[#1A1A1A] transition-colors rounded-sm"
                 >
                   <X className="w-5 h-5" />
@@ -524,6 +571,7 @@ export function JobsModule() {
               {Boolean(histories[selectedJobToView.id]?.length) && <label className="block text-sm">
                 Run history
                 <select className="ml-3 border rounded p-2" value={selectedRunId} onChange={event => setSelectedRunId(event.target.value)}>
+                  {isCatalog && <option value="">Current prepared files</option>}
                   {(histories[selectedJobToView.id] || []).map(run => <option key={run.id} value={run.id}>
                     {new Date(run.createdAt).toLocaleString()} · {run.actorName} · {run.status}
                   </option>)}
@@ -531,6 +579,29 @@ export function JobsModule() {
               </label>}
               {selectedRunId && !viewRun && <p>Loading saved run results…</p>}
               {viewRun?.error && <p role="alert" className="text-red-700">{viewRun.error}</p>}
+              {isCatalog && <section aria-label="Catalog job files" className="border border-[#E5E2DE] rounded-sm p-4 space-y-3">
+                <h4 className="font-serif text-xl">Files</h4>
+                {filesError && <p role="alert">{filesError} Close and reopen job details to retry.</p>}
+                {!selectedOutputs && !filesError && <p className="text-sm">Loading prepared files…</p>}
+                {selectedOutputs?.groups.map(group => {
+                  const final = finalGroups.find(file => file.attributeSet === group.attributeSet);
+                  const prefix = `${selectedJobToView.name}_${group.attributeSet}`;
+                  return <div key={group.attributeSet} className="space-y-2 border-t border-[#E5E2DE] pt-3">
+                    <p className="text-sm">{group.attributeSet} · {group.rows.length} assigned SKU(s)</p>
+                    <div className="flex flex-wrap gap-3">
+                      <CatalogFileDownload file={group} filename={`${prefix}_Catalog_Template`} label={`Download ${group.attributeSet} Template`} />
+                      {final && final.rows.length > 0 && <CatalogFileDownload file={final} filename={`${prefix}_Catalog_Upload`} label={`Download ${group.attributeSet} Upload`} />}
+                    </div>
+                    {final && <p className="text-xs text-[#8C8882]">{final.rows.length} validated row(s); {group.rows.length - final.rows.length} unfinished or failed row(s) omitted from the upload.</p>}
+                  </div>;
+                })}
+                {selectedOutputs?.shipping && <div className="border-t border-[#E5E2DE] pt-3 space-y-2">
+                  <p className="text-sm">Shipping · {selectedOutputs.shipping.region.toUpperCase()} · {selectedOutputs.shipping.rows.length} SKU(s)</p>
+                  <CatalogFileDownload file={selectedOutputs.shipping} filename={`${selectedJobToView.name}_Shipping`}
+                    label="Download Shipping File" sheetName="Shipping" />
+                </div>}
+                {selectedOutputs?.shippingError && <p role="status" className="text-sm text-amber-800">{selectedOutputs.shippingError}</p>}
+              </section>}
               <div className="text-xs text-[#8C8882] uppercase tracking-widest font-semibold mb-2">
                 {isCatalog ? 'Catalog Results per SKU' : 'QA Results per SKU'}
               </div>

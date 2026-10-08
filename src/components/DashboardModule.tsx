@@ -10,6 +10,7 @@ import { cn } from "../lib/utils";
 import { usableScrapedMarkdown } from "../lib/scrapeEvidence";
 import { ApiError } from "../lib/api";
 import { CATALOG_INPUT_HEADERS, catalogStatus, hasCompletedCatalog, missingCatalogInputHeaders, populateCatalogWorksheet } from "../lib/catalogGeneration";
+import { shippingRegion } from '../lib/catalogFiles';
 
 type FilterType = "all" | "ready" | "cannot_qa" | "completed" | "failed";
 
@@ -180,7 +181,7 @@ export function DashboardModule() {
     const skusToProcess = skuDataList.filter(s => selectedSkus.has(s.sku));
     const attributeSet = getCommonAttributeSet(skusToProcess);
 
-    if (!attributeSet) {
+    if (!attributeSet && (!isCatalog || skusToProcess.some(sku => !sku.attribute_set?.trim()))) {
       const selectedSets = [...new Set(skusToProcess.map((sku) => sku.attribute_set?.trim() ? sku.attribute_set : "(missing)"))];
       addNotification({
         type: "error",
@@ -188,6 +189,13 @@ export function DashboardModule() {
         message: `Selected SKUs contain multiple or missing attribute sets (${selectedSets.join(", ")}). Choose SKUs with one non-empty attribute set.`
       });
       return;
+    }
+    if (isCatalog) {
+      try { shippingRegion(skusToProcess); }
+      catch (error) {
+        addNotification({ type: 'error', title: 'Cannot Create Job', message: (error as Error).message });
+        return;
+      }
     }
     
     const invalidSkus = skusToProcess.filter(s => !usableScrapedMarkdown(s) && !s.source.sap?.trim() && !s.source.url?.trim());
@@ -203,11 +211,11 @@ export function DashboardModule() {
 
     const createdAt = new Date().toISOString();
     const job: Job = {
-      id: `job_${Date.now()}_${attributeSet.replace(/[^a-zA-Z0-9]/g, '_')}`,
-      name: `Job for ${attributeSet}`,
+      id: `job_${Date.now()}_${(attributeSet || 'Catalog').replace(/[^a-zA-Z0-9]/g, '_')}`,
+      name: `Job for ${attributeSet || `${new Set(skusToProcess.map(sku => sku.attribute_set)).size} attribute sets`}`,
       jobType: workspaceMode,
       createdAt,
-      attribute_set: attributeSet,
+      attribute_set: attributeSet || '',
       skus: skusToProcess.map(sku => sku.sku),
       status: "pending"
     };
@@ -479,7 +487,7 @@ export function DashboardModule() {
     if (isCatalog) {
       try {
         const skus = skuDataList.filter(hasCompletedCatalog);
-        if (!getCommonAttributeSet(skus)) throw new Error('Select catalog jobs with one attribute set in the Jobs tab to export their saved upload files.');
+        if (!getCommonAttributeSet(skus)) throw new Error('Open Catalog job Files in the Jobs tab to download a separate upload file for each attribute set.');
         const workbook = new ExcelJS.Workbook();
         populateCatalogWorksheet(workbook.addWorksheet('Catalog'), skus.map(sku => sku.catalog_state!));
         saveAs(new Blob([await workbook.xlsx.writeBuffer()]), 'catalog-upload.xlsx');

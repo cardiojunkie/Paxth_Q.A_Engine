@@ -5,7 +5,7 @@ import { LEGACY_REVIEW_ERROR, unprocessedStatus, withoutRawQaResult } from '../l
 import { scrapePage, ScrapeError, validateScrapeInput } from '../lib/browserScrape';
 import { usableScrapedMarkdown } from '../lib/scrapeEvidence';
 import { getCatalogMapping, missingCatalogInputHeaders } from '../lib/catalogGeneration';
-import { getCommonAttributeSet } from '../lib/jobRunState';
+import { prepareCatalogOutputs } from '../lib/catalogFiles';
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -29,6 +29,7 @@ export function validateCatalogImport(items: unknown, mode: unknown = 'qa'): ass
       requireInput(String(item.raw_row.sku).trim() === item.sku, 'Catalog row SKU must match the uploaded sku cell');
     }
     requireInput(!Object.hasOwn(item.raw_row, 'qa_result'), 'raw_row.qa_result is reserved for server-generated QA; remove it before importing.');
+    requireInput(!['catalog_outputs', 'catalogOutputs'].some(key => Object.hasOwn(item, key) || Object.hasOwn(item.raw_row, key)), 'Catalog outputs are written by the server');
     requireInput(!Object.hasOwn(item.raw_row, 'catalog_state') && !Object.hasOwn(item, 'catalog_state'), 'Catalog results are written by the server; remove catalog_state before importing.');
     requireInput(item.attribute_set === undefined || typeof item.attribute_set === 'string', 'Invalid attribute set');
     requireInput(item.status === undefined || ['pending','ready','cannot_qa'].includes(item.status), 'Imports must contain unprocessed SKUs');
@@ -37,6 +38,7 @@ export function validateCatalogImport(items: unknown, mode: unknown = 'qa'): ass
 }
 export function validateJob(value: any) {
   requireInput(object(value) && identifier(value.id) && identifier(value.name) && skuIds(value.skus), 'A job needs an ID, name, and unique non-empty SKU identifiers');
+  requireInput(!['catalog_outputs', 'catalogOutputs', 'attributeSets'].some(key => Object.hasOwn(value, key)), 'Catalog outputs and attribute-set summaries are written by the server');
   requireInput(value.attribute_set === undefined || typeof value.attribute_set === 'string', 'Invalid attribute set');
   requireInput(value.jobType === undefined || ['qa','catalog'].includes(value.jobType), 'Job type must be qa or catalog');
   requireInput(value.status === undefined || value.status === 'pending', 'New jobs must be pending');
@@ -59,14 +61,24 @@ export const mapCatalogRow = (row: any) => {
 };
 export const mapJobRow = (row: any) => ({
   id: row.id, name: row.name, jobType: row.job_type || 'qa', createdAt: row.created_at, attribute_set: row.attribute_set || '', skus: row.skus || [],
+  attributeSets: row.attribute_sets || row.catalog_outputs?.groups?.map((group: any) => group.attributeSet) || (row.attribute_set ? [row.attribute_set] : []),
   status: row.status || 'pending', tokensUsed: row.tokens_used, timeTaken: row.time_taken, error: row.error,
 });
 
-export async function validateCatalogJob(client: PoolClient, rows: any[], attributeSet: string) {
-  requireInput(getCommonAttributeSet(rows.map(mapCatalogRow)) === attributeSet, 'Catalog job SKUs must use the job’s one non-empty attribute set');
+export async function validateCatalogJob(client: PoolClient, rows: any[]) {
+  const skus = rows.map(mapCatalogRow);
+  requireInput(skus.every(sku => sku.attribute_set?.trim()), 'Every Catalog SKU needs a non-empty attribute set');
   requireInput(rows.every(row => row.source?.sap?.trim() || row.source?.url?.trim() || usableScrapedMarkdown(row)), 'Every catalog job SKU needs SAP, usable page evidence, or a source URL');
   const { rows: sets } = await client.query('SELECT name,rules_markdown AS "rulesMarkdown",catalog_headers AS "catalogHeaders" FROM attribute_sets');
-  try { return getCatalogMapping(attributeSet, sets); }
+  return [...new Set(skus.map(sku => sku.attribute_set!))].map(attributeSet => {
+    try { return getCatalogMapping(attributeSet, sets); }
+    catch (error) { throw new ApiError(400, `${attributeSet}: ${(error as Error).message}`); }
+  });
+}
+
+export async function prepareJobCatalogOutputs(client: PoolClient, rows: any[], allowUnavailableShipping = false) {
+  const mappings = await validateCatalogJob(client, rows);
+  try { return { mappings, outputs: prepareCatalogOutputs(rows.map(mapCatalogRow), mappings, allowUnavailableShipping) }; }
   catch (error) { throw new ApiError(400, (error as Error).message); }
 }
 
@@ -212,7 +224,15 @@ export function registerCatalogRoutes(app: Express, pool: Pool, scrape = scrapeP
     });
     res.json({ success:true });
   });
-  app.get('/api/jobs', async (_req, res) => res.json((await pool.query('SELECT * FROM jobs ORDER BY created_at,id')).rows.map(mapJobRow)));
+  app.get('/api/jobs', async (_req, res) => res.json((await pool.query(`SELECT id,name,created_at,attribute_set,skus,status,
+    tokens_used,time_taken,error,job_type,jsonb_path_query_array(catalog_outputs,'$.groups[*].attributeSet') AS attribute_sets
+    FROM jobs ORDER BY created_at,id`)).rows.map(mapJobRow)));
+  app.get('/api/jobs/:id/outputs', async (req, res) => {
+    const { rows: [job] } = await pool.query('SELECT job_type,catalog_outputs FROM jobs WHERE id=$1', [req.params.id]);
+    if (!job) throw new ApiError(404, 'Job not found');
+    requireInput(job.job_type === 'catalog', 'Prepared files are available only for Catalog jobs');
+    res.json(job.catalog_outputs || { groups: [], shipping: null, shippingError: 'Shipping file unavailable: this older job has no prepared files. Run Catalog to prepare its available templates.' });
+  });
   app.post('/api/jobs', async (req, res) => {
     const items = Array.isArray(req.body) ? req.body : [req.body];
     requireInput(items.length > 0 && items.length <= 1000, 'Expected 1–1000 jobs');
@@ -223,9 +243,12 @@ export function registerCatalogRoutes(app: Express, pool: Pool, scrape = scrapeP
         const existing = await client.query('SELECT * FROM sku_data WHERE sku=ANY($1)', [item.skus]);
         requireInput(existing.rows.length === item.skus.length, 'Every job SKU must exist in the catalog');
         requireInput(existing.rows.every(row => row.source?.sap?.trim() || row.source?.url?.trim() || usableScrapedMarkdown(row)), 'Every job SKU needs SAP, usable page evidence, or a source URL');
-        if (item.jobType === 'catalog') await validateCatalogJob(client, existing.rows, item.attribute_set);
-        const result = await client.query(`INSERT INTO jobs (id,name,created_at,attribute_set,skus,status,job_type)
-          VALUES ($1,$2,$3,$4,$5,'pending',$6) RETURNING *`, [item.id,item.name,new Date().toISOString(),item.attribute_set || null,JSON.stringify(item.skus),item.jobType || 'qa']);
+        const bySku = new Map(existing.rows.map(row => [row.sku, row]));
+        const ordered = item.skus.map((sku: string) => bySku.get(sku));
+        const prepared = item.jobType === 'catalog' ? await prepareJobCatalogOutputs(client, ordered) : undefined;
+        const attributeSet = prepared ? prepared.mappings.length === 1 ? prepared.mappings[0].attributeSet : null : item.attribute_set || null;
+        const result = await client.query(`INSERT INTO jobs (id,name,created_at,attribute_set,skus,status,job_type,catalog_outputs)
+          VALUES ($1,$2,$3,$4,$5,'pending',$6,$7) RETURNING *`, [item.id,item.name,new Date().toISOString(),attributeSet,JSON.stringify(item.skus),item.jobType || 'qa',prepared ? JSON.stringify(prepared.outputs) : null]);
         rows.push(mapJobRow(result.rows[0]));
       }
       return rows;
@@ -239,11 +262,16 @@ export function registerCatalogRoutes(app: Express, pool: Pool, scrape = scrapeP
       const current = (await client.query('SELECT * FROM jobs WHERE id=$1', [req.params.id])).rows[0];
       if (!current) throw new ApiError(404, 'Job not found');
       const next = { ...mapJobRow(current), ...req.body, status:'pending' };
-      validateJob(next);
+      const { attributeSets: _summary, ...jobInput } = next;
+      validateJob(jobInput);
       const existing = await client.query('SELECT * FROM sku_data WHERE sku=ANY($1)', [next.skus]);
       requireInput(existing.rows.length === next.skus.length, 'Every job SKU must exist in the catalog');
-      if (next.jobType === 'catalog') await validateCatalogJob(client, existing.rows, next.attribute_set);
-      const result = await client.query('UPDATE jobs SET name=$2,skus=$3,attribute_set=$4,status=\'pending\' WHERE id=$1 RETURNING *', [next.id,next.name,JSON.stringify(next.skus),next.attribute_set]);
+      const bySku = new Map(existing.rows.map(row => [row.sku, row]));
+      const prepared = next.jobType === 'catalog' && req.body.skus !== undefined
+        ? await prepareJobCatalogOutputs(client, next.skus.map((sku: string) => bySku.get(sku))) : undefined;
+      const outputs = prepared?.outputs || current.catalog_outputs;
+      const attributeSet = prepared ? prepared.mappings.length === 1 ? prepared.mappings[0].attributeSet : null : current.job_type === 'catalog' ? current.attribute_set : next.attribute_set;
+      const result = await client.query("UPDATE jobs SET name=$2,skus=$3,attribute_set=$4,catalog_outputs=$5,status='pending' WHERE id=$1 RETURNING *", [next.id,next.name,JSON.stringify(next.skus),attributeSet,outputs ? JSON.stringify(outputs) : null]);
       return mapJobRow(result.rows[0]);
     });
     res.json(saved);

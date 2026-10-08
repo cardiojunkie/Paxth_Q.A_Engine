@@ -34,6 +34,7 @@ export const jobs = pgTable('jobs', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
   jobType: text('job_type').notNull().default('qa'),
+  catalogOutputs: jsonb('catalog_outputs'),
   createdAt: text('created_at').notNull(),
   attributeSet: text('attribute_set'),
   skus: jsonb('skus').notNull().default([]),

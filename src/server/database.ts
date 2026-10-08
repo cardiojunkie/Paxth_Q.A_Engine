@@ -54,6 +54,7 @@ export async function initializeDatabase(pool: Pool) {
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS time_taken INTEGER;
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS error TEXT;
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS job_type TEXT NOT NULL DEFAULT 'qa';
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS catalog_outputs JSONB;
     `);
     await client.query(`
       DO $$ BEGIN
@@ -79,7 +80,7 @@ export async function verifySchema(pool: Pool) {
     await pool.query(`SELECT 1 FROM ${table} LIMIT 0`);
   }
   await pool.query('SELECT sku,source,raw_row,upload_attributes,status,attribute_set,attribute_set_id,revision,qa_result,qa_revision,export_data,last_job_id,scraped_markdown,scrape_status,scrape_metadata,scrape_error,tokens_used,time_taken,error,catalog_state FROM sku_data LIMIT 0');
-  await pool.query('SELECT id,name,created_at,attribute_set,skus,status,tokens_used,time_taken,error,job_type FROM jobs LIMIT 0');
+  await pool.query('SELECT id,name,created_at,attribute_set,skus,status,tokens_used,time_taken,error,job_type,catalog_outputs FROM jobs LIMIT 0');
   await pool.query('SELECT id,name,rules_markdown,catalog_headers FROM attribute_sets LIMIT 0');
   const checks = await pool.query(`SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'jobs'::regclass AND conname IN ('jobs_skus_array','jobs_valid_status','jobs_valid_type')`);
   if (checks.rows.length !== 3 || checks.rows.some(row => !row.convalidated)) throw new Error('Required database constraints are unavailable');

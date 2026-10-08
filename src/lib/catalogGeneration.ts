@@ -77,11 +77,7 @@ export const catalogStatus = (sku: SkuData) =>
   sku.catalog_state?.revision === (sku.revision ?? 0) ? sku.catalog_state.status
     : sku.source.sap?.trim() || sku.source.url?.trim() || usableScrapedMarkdown(sku) ? 'ready' : 'cannot_qa';
 
-export function prepareCatalogInput(sku: SkuData, mapping: CatalogMapping, maxPageContentLength: number) {
-  const sap = sku.source.sap?.trim() || '';
-  const web = usableScrapedMarkdown(sku);
-  if (!sap && !web) throw new Error('Cannot create catalog: no usable SAP or product-page evidence. Add SAP data or scrape/paste product content.');
-  const limit = Number.isSafeInteger(maxPageContentLength) && maxPageContentLength > 0 ? maxPageContentLength : 40000;
+export function prepareCatalogTemplate(sku: SkuData, mapping: CatalogMapping) {
   // Admitted runs retain their original header snapshot across this rename.
   const passThroughHeaders = mapping.headers.filter(header => CATALOG_PASS_THROUGH_HEADERS.includes(header) || header === 'attributes__product_type');
   const copied = Object.fromEntries(mapping.headers.flatMap(header => {
@@ -98,6 +94,15 @@ export function prepareCatalogInput(sku: SkuData, mapping: CatalogMapping, maxPa
     return value !== undefined && value !== null && String(value).trim() ? [[header, String(value)]] : [];
   }));
   const template = Object.fromEntries(mapping.headers.map(header => [header, Object.hasOwn(copied, header) ? copied[header] : '']));
+  return { copied, template, passThroughHeaders };
+}
+
+export function prepareCatalogInput(sku: SkuData, mapping: CatalogMapping, maxPageContentLength: number) {
+  const { copied, template, passThroughHeaders } = prepareCatalogTemplate(sku, mapping);
+  const sap = sku.source.sap?.trim() || '';
+  const web = usableScrapedMarkdown(sku);
+  if (!sap && !web) throw new Error('Cannot create catalog: no usable SAP or product-page evidence. Add SAP data or scrape/paste product content.');
+  const limit = Number.isSafeInteger(maxPageContentLength) && maxPageContentLength > 0 ? maxPageContentLength : 40000;
   const warnings = web.length > limit ? ['Product-page evidence was truncated; review the full source before uploading.'] : [];
   return {
     copied, template, warnings, passThroughHeaders,
@@ -138,6 +143,7 @@ export function populateCatalogWorksheet(sheet: import('exceljs').Worksheet, sta
   if (completed.some(state => state.headers.length !== headers.length || state.headers.some((header, index) => header !== headers[index]))) {
     throw new Error('Catalog jobs must have identical saved header order to export together.');
   }
+  sheet.columns = headers.map(header => ({ width: Math.max(20, header.length + 2), style: { numFmt: '@' } }));
   sheet.addRow(headers);
   completed.forEach(state => sheet.addRow(headers.map(header => state.row![header])));
   sheet.getRow(1).font = { bold: true };

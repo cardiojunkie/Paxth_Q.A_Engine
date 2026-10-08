@@ -9,6 +9,7 @@ export interface Job {
   jobType?: JobType;
   createdAt: string;
   attribute_set: string;
+  attributeSets?: string[];
   skus: string[];
   status: 'pending' | 'running' | 'completed' | 'failed';
   tokensUsed?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };

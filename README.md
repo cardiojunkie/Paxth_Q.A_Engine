@@ -229,17 +229,30 @@ Use the **QA / Catalog** toggle beside Notifications. A fresh page load defaults
 
    Missing headers reject the whole upload and list the missing names. Input columns may appear in any order, and extra columns are allowed. Headers are mandatory; individual cells may be blank subject to the existing SKU/evidence requirements. `attributes__attribute_set` selects the category mapping, `attributes__sap` supplies factual context, and `attributes__url` supplies the scraper URL. Older `source__*` columns cannot substitute for or override these columns in Catalog mode. QA uploads retain their existing format. API clients use `POST /api/catalog?mode=catalog` for this validation; omitted mode defaults to QA.
 
-3. Select SKUs sharing one non-empty attribute set, then choose **Create Catalog Job**. Every SKU needs SAP, usable saved page evidence, or a URL. Invalid/missing catalog mappings block job creation and execution with an error.
-4. In **Jobs**, choose **Run Catalog**. The server builds the separately configured output template. SKU, base code, EAN, shipping weight, brand, and product type pass through unchanged, including blank cells. Other empty cells are generated using SAP/page evidence and explicit mapping defaults. SAP takes factual precedence; mapping examples are formatting guidance, not product facts.
-5. Inspect generated cells and warnings in **View Results**, then export the final `.xlsx` upload file. Unknown facts remain blank with warnings; malformed or incomplete model responses fail that SKU. Exports include only validated rows, report omitted unfinished/failed SKUs, and contain exactly the mapped columns without QA or warning columns.
+3. Select SKUs with one common region and one or more non-empty attribute sets, then choose **Create Catalog Job**. Every SKU needs SAP, usable saved page evidence, or a URL. Every set needs valid Catalog output headers and non-empty mapping rules. Creation prepares one template per set and one populated shipping file, without scraping or model calls.
+4. Open **Jobs → View Results → Files** to download the prepared templates and shipping workbook immediately. Choose **Run Catalog** to fill remaining Catalog cells. SKU, base code, EAN, shipping weight, brand, and product type pass through unchanged, including blank cells. Other empty cells are generated using SAP/page evidence and explicit mapping defaults. SAP takes factual precedence; mapping examples are formatting guidance, not product facts.
+5. Inspect generated cells and warnings in **View Results**, then download each set's final `.xlsx` upload file from **Files**. Unknown facts remain blank with warnings; malformed or incomplete model responses fail that SKU. Final uploads include only validated rows, report omitted unfinished/failed SKUs per set, and contain exactly the mapped columns without QA or warning columns. Shipping always contains every assigned SKU. Run history selects that run's saved files and schemas; **Current prepared files** shows the most recent prepared snapshot.
 
 Catalog imports retain displayed Excel text and CSV identifiers, including leading zeroes and the exact capitalization of attribute names. Keep identifiers as text in source files: formatting or precision already lost in a numeric spreadsheet cell cannot be reconstructed.
 
-The four `attribute__` shipping columns and `attributes__region` are retained unchanged for a future shipping-profile export. That separate exporter is not implemented yet.
+The shipping workbook has one **Shipping** worksheet and exactly 16 text-formatted columns: `sku`, `base_code`, six shipping-attribute columns in UAE/KWT/QTR/OMAN/KSA/BAHRAIN order, six shipment-type columns in that same order, and the selected region's Whippy and fallback columns. The UAE shipping attribute is `attributes__erp_shipping_attribute`; the other five append their region code. Shipment types use `attributes__erp_shipment_type_<region>`.
+
+| Region | Whippy column | Fallback column |
+| --- | --- | --- |
+| UAE | `attributes__common_item_whippy_uae` | `fallback_uae` |
+| KWT | `attributes__common_item_whippy_kwt` | `fallback_kuwait` |
+| QTR | `attributes__common_item_whippy_qtr` | `fallback_qatar` |
+| OMAN | `attributes__common_item_whippy_oman` | `fallback_oman` |
+| KSA | `attributes__common_item_whippy_ksa` | `fallback_ksa` |
+| BAHRAIN | `attributes__common_item_whippy_bahrain` | `fallback_bahrain` |
+
+All shipping attributes default to `Courier delivery`; all shipment types default to `Scheduled`. Only the selected region uses non-empty `attribute__shipping_attribute` and `attribute__shipment_type` input cells. `attribute__common_item_whippy` and `attribute__fallback` pass through unchanged, including blanks. Shipping reads these exact original input fields; extra ERP columns cannot override the rules. Region validation ignores case and surrounding whitespace. New jobs reject missing, unknown, or mixed regions; older incompatible jobs can still run Catalog but show shipping as unavailable.
 
 Generated content never replaces the original upload or becomes QA input automatically. Catalog results live separately in `catalog_state` and durable run history. Shared evidence edits/scrapes still advance the evidence revision and invalidate older current results. Historical exports remain available without another model call.
 
-Catalog unfinished runs reuse completed results from the same job only when the evidence revision, mapping rules, and ordered output headers still match. Header-only changes require regeneration. New catalog jobs generate their own results. Cancellation preserves committed rows; resume retries unfinished/failed rows. Combined exports require the same attribute set and exact saved header order, and deduplicate SKUs in selected-job order.
+Catalog unfinished runs reuse completed results from the same job only when the evidence revision, category, mapping rules, and ordered output headers still match. Changes invalidate only the affected set's rows. New runs refresh prepared templates and snapshot each set's rules/headers; historical files keep their saved snapshots. Cancellation preserves committed rows; resume retries unfinished/failed rows. Selected-job Catalog exports group by attribute set, require identical saved header order within each set, and deduplicate SKUs. Multiple sets get individual download buttons; shipping remains one file per job.
+
+**Resume Catalog** remains available after completion so it can regenerate only rows affected by later mapping changes. **Rerun All** regenerates every assigned SKU. Startup adds the nullable `jobs.catalog_outputs` snapshot column automatically; older jobs keep their saved results and prepare available files on their next run.
 
 ## Spreadsheet format
 
@@ -488,7 +501,7 @@ Login throttling is process-local: 10 attempts per socket-address/username key a
 | Table/data | Purpose |
 | --- | --- |
 | `sku_data` | Upload, original row, evidence/provenance/error, revision, QA revision/result, and independent `catalog_state` |
-| `jobs` | Definitions, QA/catalog job type, JSON SKU membership, aggregate totals |
+| `jobs` | Definitions, QA/catalog job type, JSON SKU membership, server-owned `catalog_outputs` file snapshots, aggregate totals |
 | `job_runs` | Execution history, actor, idempotency key, configuration snapshot |
 | `job_run_items` | Per-SKU snapshot, attempts, scrape checkpoint, historical result |
 | `attribute_sets` | Category names, shared Markdown rules, and ordered Catalog output headers |
@@ -545,7 +558,8 @@ Except `/healthz` and login, these routes require an application session. Login 
 | `/api/catalog` | GET, POST, DELETE | Full list; import array; delete `{ skus }` or `{ all: true }` |
 | `/api/catalog/:sku` | PUT | Edit evidence with `expectedRevision`; QA fields are server-controlled |
 | `/api/data` | DELETE | Admin clear jobs/catalog |
-| `/api/jobs` | GET, POST, DELETE | Full list with `jobType`; create one/array with optional `jobType: "qa" \| "catalog"` (default `qa`); delete `{ ids }` or `{ all: true }` |
+| `/api/jobs` | GET, POST, DELETE | Full list with `jobType` and server-derived `attributeSets`; create one/array with optional `jobType: "qa" \| "catalog"` (default `qa`); delete `{ ids }` or `{ all: true }` |
+| `/api/jobs/:id/outputs` | GET | Authenticated Catalog-only prepared templates and shipping data; large file snapshots are excluded from job-list responses |
 | `/api/jobs/:id` | PUT, DELETE | Edit name/SKUs/category while idle; job type is immutable; admin deletion |
 | `/api/jobs/:id/runs` | GET, POST | History; queue `{ requestId, mode, sku? }` |
 | `/api/job-runs/:id` | GET | Metadata and all item snapshots/results |
@@ -628,7 +642,7 @@ The historically named browser script also checks QA settings, SKU-connected Mar
 | `npm run test:auth` | Origin/auth boundaries |
 | `npm run test:provider` | Provider admission/retries |
 | `npm run test:catalog` | Import trust boundary and canonical result/history projections |
-| `npm run test:catalog-generation` | Catalog headers, copied cells, model validation, independent results, and exact workbook exports |
+| `npm run test:catalog-generation` | Catalog headers, copied cells, model validation, independent results, regional shipping, grouping, and exact workbook exports |
 | `npm run test:catalog-browser` | QA/Catalog switch, text-preserving CSV/XLSX imports, job controls, warnings, and upload exports |
 | `npm run test:job-state` | Job state and Excel feedback |
 | `npm run test:job-runner` | Transaction retries/rollback |

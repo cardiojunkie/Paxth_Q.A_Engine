@@ -60,8 +60,8 @@ const provider=createServer(async(req,res)=>{
   if (catalogInput?.template) {
     const row = { ...catalogInput.template, name: 'TestBrand USB Hub', attributes__fallback: 'No',
       ...Object.fromEntries(CATALOG_PASS_THROUGH_HEADERS.map(header=>[header,'MODEL MUST NOT CHANGE THIS'])) };
-    const result = providerMode === 'catalog-mixed' && catalogInput.sku === 'cat-b'
-      ? { row: { sku: 'cat-b' }, warnings: [] } : { row, warnings: [] };
+    const result = providerMode === 'catalog-mixed' && ['cat-b','multi-b'].includes(catalogInput.sku)
+      ? { row: { sku: catalogInput.sku }, warnings: [] } : { row, warnings: [] };
     res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify(result)}}],usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}}));return;
   }
   if(payload.search_domain_filter) {
@@ -496,7 +496,7 @@ try {
     'attributes__Shipment_Type','attributes__Common_Item_Whippy','attributes__fallback','name','attributes__color',
     'attributes__shipping_weight','attributes__brand','attributes__lulu_product_type'];
   const catalogRules='name: use the sourced brand and model, for example TestBrand USB Hub.\nattributes__fallback: default No. Leave unsourced color blank.';
-  const catSku=(id:string)=>({...sku(id),raw_row:{sku:id,base_code:'00001',attributes__lulu_ean:'0001234567890'},
+  const catSku=(id:string)=>({...sku(id),raw_row:{sku:id,base_code:'00001',attributes__lulu_ean:'0001234567890',attributes__region:'UAE'},
     upload_attributes:{lulu_ean:'0001234567890',Shipping_Attribute:'001',Shipment_Type:'Normal',Common_Item_Whippy:'No'}});
   const legacyCatSku={...catSku('cat-a'),raw_row:{...catSku('cat-a').raw_row,attributes__product_type:' 000Legacy Hub '}};
   assert.equal((await request('/api/catalog','POST',[legacyCatSku,catSku('cat-b')],user)).status,200);
@@ -608,6 +608,114 @@ try {
   providerMode='success';stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await catalogRun(changedMapping.body.id)).status==='completed','catalog changed mapping regeneration');
   await stopWorker();stopWorker=undefined;
+
+  // Grouped jobs prepare files without model calls, then retain each set's own run schema.
+  await saveCatalogRules(catalogRules,catalogHeaders);
+  const hubHeaders=[...catalogHeaders].reverse().concat('attributes__description');
+  const hubSet=(await request('/api/attribute-sets','POST',{name:'Hub',rulesMarkdown:catalogRules,catalogHeaders:hubHeaders},admin)).body;
+  const shippingSku=(id:string,set:string,region='UAE')=>({...sku(id),attribute_set:set,
+    raw_row:{...Object.fromEntries(CATALOG_INPUT_HEADERS.map(header=>[header,''])),sku:id,base_code:'00003',
+      attributes__lulu_ean:'0001234567893',attributes__sap:'Brand: TestBrand',attributes__url:'',attributes__attribute_set:set,
+      attributes__region:region,attribute__shipping_attribute:' 003 ',attribute__shipment_type:'Express',
+      attribute__common_item_whippy:'0007',attribute__fallback:''}});
+  const multiA=shippingSku('multi-a','TestSet',' uae '),multiB=shippingSku('multi-b','Hub'),multiC=shippingSku('multi-c','TestSet');
+  multiC.raw_row.attributes__sap='';multiC.raw_row.attributes__url='https://8.8.8.8/grouped-url-only';
+  assert.equal((await request('/api/catalog?mode=catalog','POST',[multiA,multiB,multiC,shippingSku('multi-qtr','Hub','QTR'),shippingSku('multi-missing','Hub','')],user)).status,200);
+  const multiJob={id:'multi-job',name:'Multiple sets',skus:['multi-b','multi-c','multi-a'],jobType:'catalog'};
+  assert.equal((await request('/api/jobs','POST',{...multiJob,skus:['multi-a','multi-qtr']},user)).status,400);
+  assert.equal((await request('/api/jobs','POST',{...multiJob,skus:['multi-missing']},user)).status,400);
+  await request(`/api/attribute-sets/${hubSet.id}`,'PUT',{name:'Hub',rulesMarkdown:catalogRules,catalogHeaders:[]},admin);
+  const missingGroup=await request('/api/jobs','POST',multiJob,user);assert.equal(missingGroup.status,400);assert.match(missingGroup.body.error,/Hub:.*Catalog Output Headers/);
+  assert.equal((await pool.query("SELECT 1 FROM jobs WHERE id='multi-job'")).rowCount,0,'Every set is validated before saving any job files');
+  await request(`/api/attribute-sets/${hubSet.id}`,'PUT',{name:'Hub',rulesMarkdown:catalogRules,catalogHeaders:hubHeaders},admin);
+  for(const key of ['catalog_outputs','catalogOutputs','attributeSets']) assert.equal((await request('/api/jobs','POST',{...multiJob,[key]:{}},user)).status,400);
+  const beforeFilesCalls=calls,beforeFilesScrapes=scrapeRequests.length;
+  const createdMulti=await request('/api/jobs','POST',multiJob,user);assert.equal(createdMulti.status,201);
+  assert.equal(calls,beforeFilesCalls);assert.equal(scrapeRequests.length,beforeFilesScrapes);
+  assert.deepEqual(createdMulti.body[0].attributeSets,['Hub','TestSet']);assert.equal(createdMulti.body[0].attribute_set,'');
+  assert.ok(!('catalog_outputs' in createdMulti.body[0]));
+  assert.equal((await request('/api/jobs/multi-job/outputs')).status,401);
+  assert.equal((await request('/api/jobs/job/outputs','GET',undefined,user)).status,400);
+  assert.equal((await request('/api/jobs/no-such-job/outputs','GET',undefined,user)).status,404);
+  const preparedMulti=(await request('/api/jobs/multi-job/outputs','GET',undefined,user)).body;
+  assert.deepEqual(preparedMulti.groups.map((group:any)=>group.headers),[hubHeaders,catalogHeaders]);
+  assert.deepEqual(preparedMulti.groups[1].rows.map((row:any)=>row.sku),['multi-c','multi-a']);
+  assert.equal(preparedMulti.groups[0].rows[0].name,'');
+  assert.deepEqual(preparedMulti.shipping.rows.map((row:any)=>row.sku),multiJob.skus);
+  assert.equal(preparedMulti.shipping.headers.length,16);assert.equal(preparedMulti.shipping.rows[0].attributes__erp_shipping_attribute,' 003 ');
+  assert.equal(preparedMulti.shipping.rows[0].attributes__erp_shipping_attribute_qtr,'Courier delivery');
+  assert.equal(preparedMulti.shipping.rows[0].attributes__common_item_whippy_uae,'0007');
+  assert.equal(preparedMulti.shipping.rows[0].fallback_uae,'');
+  assert.equal((await request('/api/jobs/multi-job','PUT',{catalogOutputs:{}},user)).status,400);
+  const editMulti=await request('/api/jobs/multi-job','PUT',{skus:['multi-a','multi-b']},user);assert.equal(editMulti.status,200);
+  assert.deepEqual((await request('/api/jobs/multi-job/outputs','GET',undefined,user)).body.shipping.rows.map((row:any)=>row.sku),['multi-a','multi-b']);
+  const rejectedMembership=await request('/api/jobs/multi-job','PUT',{skus:['multi-a','multi-qtr']},user);assert.equal(rejectedMembership.status,400);
+  assert.deepEqual((await request('/api/jobs/multi-job/outputs','GET',undefined,user)).body.shipping.rows.map((row:any)=>row.sku),['multi-a','multi-b'],'Invalid membership edits retain the saved files');
+  assert.equal((await request('/api/jobs/multi-job','PUT',{skus:multiJob.skus},user)).status,200);
+  const multiRun=await startCatalog('unfinished',undefined,'multi-job');assert.equal(multiRun.status,202);
+  assert.deepEqual(multiRun.body.catalogGroups.map((group:any)=>group.attributeSet),['Hub','TestSet']);
+  await request(`/api/attribute-sets/${hubSet.id}`,'PUT',{name:'Hub',rulesMarkdown:catalogRules,catalogHeaders:[...hubHeaders].reverse()},admin);
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(multiRun.body.id)).status==='completed','grouped Catalog generation');
+  await stopWorker();stopWorker=undefined;
+  const generatedMulti=await catalogRun(multiRun.body.id);
+  assert.deepEqual(generatedMulti.items[0].result.catalog_state.headers,hubHeaders,'Running groups keep their admitted headers');
+  assert.deepEqual(generatedMulti.items[1].result.catalog_state.headers,catalogHeaders);
+  assert.equal(generatedMulti.catalogOutputs.shipping.rows.length,3);
+  const changedGroup=await startCatalog('unfinished',undefined,'multi-job');assert.equal(changedGroup.status,202);
+  assert.deepEqual(changedGroup.body.items.map((item:any)=>item.status),['queued','skipped','skipped'],'Only a changed group is regenerated');
+  assert.deepEqual(changedGroup.body.catalogOutputs.groups[0].headers,[...hubHeaders].reverse());
+  assert.deepEqual((await request('/api/jobs/multi-job/outputs','GET',undefined,user)).body.groups[0].headers,[...hubHeaders].reverse());
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(changedGroup.body.id)).status==='completed','changed group resume');
+  await stopWorker();stopWorker=undefined;
+  assert.deepEqual((await catalogRun(multiRun.body.id)).catalogOutputs,generatedMulti.catalogOutputs,'Historical files never follow live mapping edits');
+  await initializeDatabase(pool);
+  assert.deepEqual((await request('/api/jobs/multi-job/outputs','GET',undefined,user)).body.shipping,preparedMulti.shipping,'Prepared shipping survives migrations');
+
+  await request(`/api/attribute-sets/${hubSet.id}`,'PUT',{name:'Hub',rulesMarkdown:catalogRules+' Changed rule.'},admin);
+  const groupRules=await startCatalog('unfinished',undefined,'multi-job');
+  assert.deepEqual(groupRules.body.items.map((item:any)=>item.status),['queued','skipped','skipped'],'Rules-only changes invalidate their own group');
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(groupRules.body.id)).status==='completed','group rules-only resume');
+  await stopWorker();stopWorker=undefined;
+  providerMode='catalog-mixed';const groupFailure=await startCatalog('all',undefined,'multi-job');
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(groupFailure.body.id)).status==='failed','group failed-row handling');
+  await stopWorker();stopWorker=undefined;
+  const failedGroups=await catalogRun(groupFailure.body.id);
+  assert.deepEqual(failedGroups.items.map((item:any)=>item.status),['failed','completed','completed']);
+  assert.equal(failedGroups.catalogOutputs.shipping.rows.length,3,'Shipping retains failed Catalog SKUs');
+  const groupRetry=await startCatalog('unfinished',undefined,'multi-job');
+  assert.deepEqual(groupRetry.body.items.map((item:any)=>item.status),['queued','skipped','skipped']);
+  providerMode='success';stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(groupRetry.body.id)).status==='completed','group failed-row retry');
+  await stopWorker();stopWorker=undefined;
+  providerMode='wait';const groupCancel=await startCatalog('all',undefined,'multi-job');stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>{ const run=await catalogRun(groupCancel.body.id);return run.items[0].status==='completed' && run.items[1].attempts===1; },'group partial completion');
+  assert.equal((await request(`/api/job-runs/${groupCancel.body.id}/cancel`,'POST',{},user)).status,200);
+  await waitFor(async()=>(await catalogRun(groupCancel.body.id)).status==='cancelled','group cancellation');
+  await stopWorker();stopWorker=undefined;
+  assert.equal((await catalogRun(groupCancel.body.id)).items[0].result.catalog_state.status,'completed');
+  assert.equal((await catalogRun(groupCancel.body.id)).catalogOutputs.shipping.rows.length,3);
+  const groupResume=await startCatalog('unfinished',undefined,'multi-job');
+  assert.deepEqual(groupResume.body.items.map((item:any)=>item.status),['skipped','queued','queued']);
+  providerMode='success';stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(groupResume.body.id)).status==='completed','group cancelled-row resume');
+  await stopWorker();stopWorker=undefined;
+
+  // Legacy regionless and mixed-region definitions can still generate Catalog files.
+  await pool.query("INSERT INTO jobs(id,name,created_at,job_type,attribute_set,skus) VALUES('legacy-shipping','Legacy', $1,'catalog','Hub',$2)",[new Date().toISOString(),JSON.stringify(['multi-missing','multi-qtr'])]);
+  const legacyShipping=await startCatalog('unfinished',undefined,'legacy-shipping');assert.equal(legacyShipping.status,202);
+  assert.equal(legacyShipping.body.catalogOutputs.shipping,null);assert.match(legacyShipping.body.catalogOutputs.shippingError,/unavailable/);
+  // Simulate the saved singleton configuration of a run admitted before this upgrade.
+  await pool.query("UPDATE job_runs SET configuration=configuration-'catalogMappings'-'catalogOutputs' WHERE id=$1",[legacyShipping.body.id]);
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(legacyShipping.body.id)).status==='completed','legacy shipping-unavailable run');
+  await stopWorker();stopWorker=undefined;
+  assert.equal((await catalogRun(legacyShipping.body.id)).catalogOutputs.shipping,null);
+  assert.equal((await request('/api/jobs/multi-job','DELETE',undefined,admin)).status,200);
+  assert.equal((await request('/api/jobs/legacy-shipping','DELETE',undefined,admin)).status,200);
   await saveCatalogRules('');
   assert.equal((await startCatalog()).status,400,'Existing catalog jobs require nonempty mapping rules at every run');
   await saveCatalogRules(catalogRules,[]);

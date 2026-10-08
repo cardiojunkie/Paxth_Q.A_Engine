@@ -11,8 +11,9 @@ import { scrapePage } from '../lib/browserScrape';
 import { usableScrapedMarkdown } from '../lib/scrapeEvidence';
 import { ProviderError } from '../lib/chatCompletion';
 import { completeQa, getProviderCredentials, getProviderSettings } from './provider';
-import { ApiError, mapCatalogRow, saveScrapedEvidence, saveScrapeFailure, validateCatalogJob } from './catalog';
+import { ApiError, mapCatalogRow, saveScrapedEvidence, saveScrapeFailure, prepareJobCatalogOutputs } from './catalog';
 import { CATALOG_PASS_THROUGH_HEADERS, catalogPassThroughValue, hasCompletedCatalog, prepareCatalogInput, parseCatalogResponse } from '../lib/catalogGeneration';
+import { catalogMappings, catalogMappingFor, prepareCatalogOutputs } from '../lib/catalogFiles';
 
 // ponytail: global mutation lock and one worker fit this deployment; partition by job if throughput requires it.
 export const JOB_MUTATION_LOCK = 73462190;
@@ -70,6 +71,7 @@ const publicRun = (row: any) => ({
   id: row.id, jobId: row.job_id, actorId: row.actor_id, actorName: row.actor_name,
   jobType: row.configuration?.jobType || 'qa',
   catalogHeaders: row.configuration?.catalogMapping?.headers,
+  catalogGroups: catalogMappings(row.configuration || {}).map(mapping => ({ attributeSet: mapping.attributeSet, headers: mapping.headers })),
   mode: row.mode, status: row.status, createdAt: row.created_at, startedAt: row.started_at,
   finishedAt: row.finished_at, error: row.error,
 });
@@ -78,7 +80,9 @@ async function readRun(pool: Pool | PoolClient, id: string) {
   const { rows: [run] } = await pool.query('SELECT * FROM job_runs WHERE id=$1', [id]);
   if (!run) throw new JobError('Run does not exist', 404);
   const { rows } = await pool.query('SELECT * FROM job_run_items WHERE run_id=$1 ORDER BY position', [id]);
-  return { ...publicRun(run), items: rows.map(item => ({
+  const catalogOutputs = run.configuration.jobType === 'catalog' ? run.configuration.catalogOutputs ||
+    prepareCatalogOutputs(rows.map(item => item.snapshot), catalogMappings(run.configuration), true) : undefined;
+  return { ...publicRun(run), catalogOutputs, items: rows.map(item => ({
     sku: item.sku, status: item.status, attempts: item.attempts,
     startedAt: item.started_at, finishedAt: item.finished_at, error: item.error,
     snapshot: unreviewedRunSnapshot(item.snapshot),
@@ -121,14 +125,17 @@ export function registerJobRunRoutes(app: Express, pool: Pool) {
         if (!Array.isArray(job.skus) || job.skus.some((sku: string) => !rowsBySku.has(sku))) throw new JobError('A job SKU no longer exists', 409);
         if (input.mode === 'single' && !job.skus.includes(input.sku)) throw new JobError('The SKU is not in this job');
         const jobType = job.job_type || 'qa';
-        const catalogMapping = jobType === 'catalog' ? await validateCatalogJob(client!, catalog, job.attribute_set) : undefined;
+        const prepared = jobType === 'catalog' ? await prepareJobCatalogOutputs(client!, job.skus.map((sku: string) => rowsBySku.get(sku)), !job.catalog_outputs?.shipping) : undefined;
         getProviderCredentials();
         const settings = await getProviderSettings(client!);
         const { rows: [memory] } = await client!.query("SELECT memory FROM qa_agent_settings WHERE id='default'");
         const { rows: sets } = await client!.query('SELECT id,name,rules_markdown AS "rulesMarkdown",catalog_headers AS "catalogHeaders" FROM attribute_sets');
         if (!memory?.memory) throw new JobError('QA memory is unavailable', 503);
-        const configuration = { settings, qaAgentMemory: memory.memory, attributeSets: sets, jobType, catalogMapping };
-        const priorCatalog = jobType === 'catalog' ? (await client!.query(`SELECT DISTINCT ON (i.sku) i.sku,i.result,r.configuration
+        const configuration = { settings, qaAgentMemory: memory.memory, attributeSets: sets, jobType,
+          catalogMappings: prepared?.mappings, catalogOutputs: prepared?.outputs,
+          catalogMapping: prepared?.mappings.length === 1 ? prepared.mappings[0] : undefined };
+        const priorCatalog = jobType === 'catalog' ? (await client!.query(`SELECT DISTINCT ON (i.sku) i.sku,i.result,
+          jsonb_build_object('catalogMappings',r.configuration->'catalogMappings','catalogMapping',r.configuration->'catalogMapping') AS configuration
           FROM job_run_items i JOIN job_runs r ON r.id=i.run_id
           WHERE r.job_id=$1 ORDER BY i.sku,r.created_at DESC,r.id DESC`, [job.id])).rows : [];
         const priorBySku = new Map(priorCatalog.map(previous => [previous.sku, previous]));
@@ -139,9 +146,13 @@ export function registerJobRunRoutes(app: Express, pool: Pool) {
           const row = rowsBySku.get(sku)!;
           const snapshot = mapCatalogRow(row);
           const previous = priorBySku.get(sku);
-          const catalogResult = previous?.result && previous.configuration.catalogMapping?.rulesMarkdown === catalogMapping?.rulesMarkdown &&
-            previous.configuration.catalogMapping?.attributeSet === catalogMapping?.attributeSet &&
-            JSON.stringify(previous.configuration.catalogMapping?.headers) === JSON.stringify(catalogMapping?.headers) &&
+          const mapping = prepared?.mappings.find(mapping => mapping.attributeSet === snapshot.attribute_set);
+          const previousMapping = previous && catalogMappings(previous.configuration).find(mapping => mapping.attributeSet === snapshot.attribute_set);
+          const catalogResult = previous?.result && previousMapping?.rulesMarkdown === mapping?.rulesMarkdown &&
+            previous.result.attribute_set === snapshot.attribute_set &&
+            previousMapping?.attributeSet === mapping?.attributeSet &&
+            JSON.stringify(previousMapping?.headers) === JSON.stringify(mapping?.headers) &&
+            JSON.stringify(previous.result.catalog_state?.headers) === JSON.stringify(mapping?.headers) &&
             CATALOG_PASS_THROUGH_HEADERS.every(header => previous.result.catalog_state?.row?.[header] === catalogPassThroughValue(snapshot, header)) &&
             previous.result.catalog_state?.jobId === job.id && previous.result.catalog_state?.revision === row.revision &&
             hasCompletedCatalog(previous.result) ? previous.result : null;
@@ -151,7 +162,8 @@ export function registerJobRunRoutes(app: Express, pool: Pool) {
           await client!.query('INSERT INTO job_run_items(run_id,sku,position,revision,snapshot,status,result) VALUES($1,$2,$3,$4,$5,$6,$7)',
             [runId, sku, position, row.revision, JSON.stringify(unreviewedRunSnapshot(snapshot, false)), selected ? 'queued' : 'skipped', priorResult ? JSON.stringify(priorResult) : null]);
         }
-        await client!.query("UPDATE jobs SET status='running', error=NULL WHERE id=$1", [job.id]);
+        await client!.query("UPDATE jobs SET status='running', error=NULL,catalog_outputs=COALESCE($2::jsonb,catalog_outputs),attribute_set=CASE WHEN $2::jsonb IS NOT NULL THEN $3::text ELSE attribute_set END WHERE id=$1",
+          [job.id, prepared ? JSON.stringify(prepared.outputs) : null, prepared?.mappings.length === 1 ? prepared.mappings[0].attributeSet : null]);
         return runId;
       });
       res.status(202).json(await readRun(client, id));
@@ -317,7 +329,7 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
         } else if (!snapshot.source.sap?.trim()) throw new Error(snapshot.scrape_error || 'Scraping was interrupted. Rerun this SKU to collect evidence.');
       }
       const input = isCatalog
-        ? prepareCatalogInput(snapshot, run.configuration.catalogMapping, settings.maxPageContentLength)
+        ? prepareCatalogInput(snapshot, catalogMappingFor(run.configuration, snapshot.attribute_set), settings.maxPageContentLength)
         : prepareQaInput(snapshot, run.configuration.attributeSets, run.configuration.qaAgentMemory, settings.maxPageContentLength);
       const response = await completeQa(buildQaRequest(settings, input).payload, execution, {
         taskLabel: isCatalog ? 'Catalog' : 'QA',
@@ -344,7 +356,7 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
         const catalog = parseCatalogResponse(response, input as ReturnType<typeof prepareCatalogInput>);
         const timeTaken = Date.now() - start;
         result = { ...snapshot, status: 'completed', error: null, tokensUsed: catalogTokens, timeTaken,
-          catalog_state: { ...catalog, headers: run.configuration.catalogMapping.headers, status: 'completed',
+          catalog_state: { ...catalog, headers: catalogMappingFor(run.configuration, snapshot.attribute_set).headers, status: 'completed',
             revision: item.revision, jobId: run.job_id, tokensUsed: catalogTokens, timeTaken } };
       } else {
         result = withResult(snapshot, parseQaResponse(response, input as ReturnType<typeof prepareQaInput>), response.usage, Date.now() - start, run.job_id);
@@ -355,7 +367,7 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
       result = { ...snapshot, status: 'failed', qa_result: undefined, export_data: undefined,
         ...(isCatalog && catalogTokens ? { tokensUsed: catalogTokens } : {}),
         error: execution.aborted ? 'SKU exceeded its five-minute execution budget' : errorText(error), timeTaken: Date.now() - start };
-      if (isCatalog) result.catalog_state = { status: 'failed', headers: run.configuration.catalogMapping.headers,
+      if (isCatalog) result.catalog_state = { status: 'failed', headers: catalogMappingFor(run.configuration, snapshot.attribute_set).headers,
         warnings: [], revision: item.revision, jobId: run.job_id, error: result.error, timeTaken: result.timeTaken, tokensUsed: catalogTokens };
     }
     try {
