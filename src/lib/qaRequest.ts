@@ -4,7 +4,7 @@ import { extractLLMResponseContent, parseLLMJsonResponse } from "./llmResponse";
 
 type QaInput = ReturnType<typeof prepareQaInput>;
 
-export function buildQaRequest(settings: AppSettings, input: QaInput) {
+export function buildQaRequest(settings: AppSettings, input: Pick<QaInput, 'messages'>) {
   const normalized = normalizeSettings(settings);
   return {
     payload: {

@@ -5,8 +5,11 @@ import { useAttributeSets } from "../hooks/useAttributeSets";
 import { AttributeSet } from "../types";
 import { AttributeSetEditor } from "./AttributeSetEditor";
 import { cn } from "../lib/utils";
+import { useAppContext } from '../context/AppContext';
 
 export function AttributeSetsModule() {
+  const { user } = useAppContext();
+  const canEdit = user?.role === 'admin';
   const { attributeSets, addSet, updateSet, deleteSet, isLoading, loadError, reloadSets, browserRules, importBrowserRules } = useAttributeSets();
   const [editingSet, setEditingSet] = useState<AttributeSet | null>(null);
   const [isCreating, setIsCreating] = useState(false);
@@ -108,15 +111,15 @@ export function AttributeSetsModule() {
         <div className="p-8 pt-6 border-t border-[#E5E2DE] shrink-0 bg-[#FDFCFB]">
           <button
             onClick={() => { setEditingSet(null); setIsCreating(true); setEditorError(null); }}
-            disabled={isLoading || isSaving || Boolean(loadError)}
+            disabled={!canEdit || isLoading || isSaving || Boolean(loadError)}
             className="text-[11px] uppercase tracking-widest border border-[#1A1A1A] px-5 py-2 hover:bg-[#1A1A1A] hover:text-white transition-colors w-full mb-4"
           >
             New Attribute Set
           </button>
           <div className="p-4 bg-[#F5F2EF] rounded-sm">
-            <p className="text-[10px] leading-relaxed text-[#8C8882]">Mapping rules are shared through Supabase and loaded when each QA job starts.</p>
+            <p className="text-[10px] leading-relaxed text-[#8C8882]">Mapping rules are shared by QA and Catalog. Output headers apply only to Catalog jobs.</p>
             {browserRules.length > 0 && <>
-              <button type="button" disabled={isSaving || isLoading || Boolean(loadError)} onClick={async () => {
+              <button type="button" disabled={!canEdit || isSaving || isLoading || Boolean(loadError)} onClick={async () => {
                 setIsSaving(true);
                 try { setImportMessage(`Imported ${await importBrowserRules()} rule sets. Existing shared rules were preserved.`); }
                 catch (error: any) { setImportMessage(error.message); }
@@ -136,12 +139,13 @@ export function AttributeSetsModule() {
             initialData={editingSet}
             onSave={handleSave}
             disabled={isSaving || isLoading || Boolean(loadError)}
+            readOnly={!canEdit}
             onCancel={() => {
               setIsCreating(false);
               setEditingSet(null);
               setEditorError(null);
             }}
-            onDelete={editingSet ? () => handleDelete(editingSet.id) : undefined}
+            onDelete={editingSet && canEdit ? () => handleDelete(editingSet.id) : undefined}
             error={editorError}
           />
         ) : (

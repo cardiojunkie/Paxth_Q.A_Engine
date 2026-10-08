@@ -2,6 +2,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { api } from '../lib/api';
 import { scrapeCatalogSku } from '../lib/scrapeRequest';
+import type { CatalogState, JobType } from '../types';
 
 export type QAStatus = "pending" | "ready" | "cannot_qa" | "running" | "completed" | "failed";
 
@@ -38,6 +39,7 @@ export interface SkuData {
   qa_result?: Record<string, any>;
   export_data?: Record<string, any>;
   last_job_id?: string;
+  catalog_state?: CatalogState | null;
 }
 
 export function useCatalogData(enabled = true, sessionKey?: string) {
@@ -73,10 +75,10 @@ export function useCatalogData(enabled = true, sessionKey?: string) {
     return () => { active = false; generation.current++; };
   }, [enabled, refreshCatalog]);
 
-  const addParsedData = useCallback(async (data: SkuData[]) => {
+  const addParsedData = useCallback(async (data: SkuData[], mode: JobType = 'qa') => {
     const current = generation.current;
     try {
-      const result = await api<{inserted: SkuData[]; skipped: string[]}>('/api/catalog', { method:'POST', body:JSON.stringify(data) });
+      const result = await api<{inserted: SkuData[]; skipped: string[]}>(mode === 'catalog' ? '/api/catalog?mode=catalog' : '/api/catalog', { method:'POST', body:JSON.stringify(data) });
       if (current !== generation.current) return null;
       refreshSerial.current++;
       setSkuDataList(previous => {

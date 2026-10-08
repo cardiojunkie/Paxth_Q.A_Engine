@@ -9,16 +9,20 @@ import { getCommonAttributeSet } from "../lib/jobRunState";
 import { cn } from "../lib/utils";
 import { usableScrapedMarkdown } from "../lib/scrapeEvidence";
 import { ApiError } from "../lib/api";
+import { CATALOG_INPUT_HEADERS, catalogStatus, hasCompletedCatalog, missingCatalogInputHeaders, populateCatalogWorksheet } from "../lib/catalogGeneration";
 
 type FilterType = "all" | "ready" | "cannot_qa" | "completed" | "failed";
 
 export function DashboardModule() {
-  const { user, catalogError, skuDataList, addParsedData, clearData, updateSku, scrapeSku, removeSkus, isLoadingSkuData, jobs, addJobs, addNotification } = useAppContext();
+  const { user, workspaceMode, catalogError, skuDataList, addParsedData, clearData, updateSku, scrapeSku, removeSkus, isLoadingSkuData, jobs, addJobs, addNotification } = useAppContext();
+  const isCatalog = workspaceMode === 'catalog';
+  const statusOf = (sku: SkuData) => isCatalog ? catalogStatus(sku) : sku.status;
   const [fileName, setFileName] = useState<string | null>(localStorage.getItem('lastFileName') || null);
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<FilterType>("all");
   const [selectedSkus, setSelectedSkus] = useState<Set<string>>(new Set());
+  useEffect(() => { setFilter('all'); setSelectedSkus(new Set()); }, [workspaceMode]);
   const [isScraping, setIsScraping] = useState(false);
   const [scrapeProgress, setScrapeProgress] = useState<{current: number, total: number} | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -57,7 +61,7 @@ export function DashboardModule() {
   const currentFileName = fileName || skuDataList.find(s => s.source?.fileName)?.source?.fileName || null;
 
   const filteredList = skuDataList.filter(sku => {
-    const matchesFilter = filter === "all" || sku.status === filter;
+    const matchesFilter = filter === "all" || statusOf(sku) === filter;
     const matchesSearch = !searchTerm || 
       sku.sku.toLowerCase().includes(searchTerm.toLowerCase()) || 
       (sku.attribute_set && sku.attribute_set.toLowerCase().includes(searchTerm.toLowerCase()));
@@ -201,6 +205,7 @@ export function DashboardModule() {
     const job: Job = {
       id: `job_${Date.now()}_${attributeSet.replace(/[^a-zA-Z0-9]/g, '_')}`,
       name: `Job for ${attributeSet}`,
+      jobType: workspaceMode,
       createdAt,
       attribute_set: attributeSet,
       skus: skusToProcess.map(sku => sku.sku),
@@ -331,7 +336,7 @@ export function DashboardModule() {
     reader.onload = async (e) => {
       try {
         const data = new Uint8Array(e.target?.result as ArrayBuffer);
-        const workbook = XLSX.read(data, { type: "array" });
+        const workbook = XLSX.read(data, { type: "array", ...(isCatalog ? { raw: true } : {}) });
         const firstSheetName = workbook.SheetNames[0];
         const worksheet = workbook.Sheets[firstSheetName];
         const [headerRow = []] = XLSX.utils.sheet_to_json<any[]>(worksheet, {
@@ -341,7 +346,14 @@ export function DashboardModule() {
           blankrows: false,
         });
         const headerOrder = headerRow.map(String);
-        const jsonData = XLSX.utils.sheet_to_json<Record<string, any>>(worksheet);
+        if (isCatalog) {
+          const missing = missingCatalogInputHeaders(headerOrder);
+          if (missing.length) {
+            setError(`Catalog upload is missing required headers: ${missing.join(', ')}. Header names are case-sensitive.`);
+            return;
+          }
+        }
+        const jsonData = XLSX.utils.sheet_to_json<Record<string, any>>(worksheet, isCatalog ? { raw: false, defval: '' } : {});
 
         if (jsonData.length === 0) {
           setError("The uploaded file is empty.");
@@ -365,16 +377,22 @@ export function DashboardModule() {
 
           const upload_attributes: Record<string, any> = {};
           const source: SkuData["source"] = { fileName: file.name, headerOrder };
-          let attribute_set: string | undefined = undefined;
+          let attribute_set: string | undefined = isCatalog ? String(row.attributes__attribute_set) : undefined;
 
           for (const [key, value] of Object.entries(row)) {
-            if (key.startsWith("attributes__")) {
-              upload_attributes[key.replace("attributes__", "")] = value;
-            } else if (key === "source__sap" || key.toLowerCase() === "sap") {
+            if (isCatalog && key === 'attributes__sap') {
               source.sap = String(value);
-            } else if (key === "source__url" || key.toLowerCase() === "url") {
+            } else if (isCatalog && key === 'attributes__url') {
               source.url = String(value);
-            } else if (key.toLowerCase() === "attribute_set" || key.toLowerCase() === "attribute set") {
+            } else if (key.startsWith("attributes__")) {
+              upload_attributes[key.replace("attributes__", "")] = value;
+            } else if (isCatalog && key.startsWith("attribute__")) {
+              upload_attributes[key.slice("attribute__".length)] = value;
+            } else if (!isCatalog && (key === "source__sap" || key.toLowerCase() === "sap")) {
+              source.sap = String(value);
+            } else if (!isCatalog && (key === "source__url" || key.toLowerCase() === "url")) {
+              source.url = String(value);
+            } else if (!isCatalog && (key.toLowerCase() === "attribute_set" || key.toLowerCase() === "attribute set")) {
               attribute_set = String(value);
             }
           }
@@ -401,7 +419,7 @@ export function DashboardModule() {
           return;
         }
 
-        const saved = await addParsedData(parsedSkus);
+        const saved = await addParsedData(parsedSkus, workspaceMode);
         if (!saved) { setError("Import could not be saved. Your existing catalog is unchanged; retry the upload."); return; }
         setFileName(file.name);
         localStorage.setItem('lastFileName', file.name);
@@ -440,7 +458,39 @@ export function DashboardModule() {
 
   
 
+  const downloadInputTemplate = async () => {
+    try {
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet('Catalog Input');
+      worksheet.columns = CATALOG_INPUT_HEADERS.map(header => ({
+        header, width: Math.max(header.length + 2, 18), style: { numFmt: '@' },
+      }));
+      worksheet.getRow(1).font = { bold: true };
+      saveAs(new Blob([await workbook.xlsx.writeBuffer()], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      }), 'Catalog_Input_Template.xlsx');
+    } catch (error) {
+      addNotification({ type: 'error', title: 'Template Download Failed',
+        message: error instanceof Error ? error.message : 'Could not download the Catalog input template. Please retry.' });
+    }
+  };
+
   const exportToExcel = async () => {
+    if (isCatalog) {
+      try {
+        const skus = skuDataList.filter(hasCompletedCatalog);
+        if (!getCommonAttributeSet(skus)) throw new Error('Select catalog jobs with one attribute set in the Jobs tab to export their saved upload files.');
+        const workbook = new ExcelJS.Workbook();
+        populateCatalogWorksheet(workbook.addWorksheet('Catalog'), skus.map(sku => sku.catalog_state!));
+        saveAs(new Blob([await workbook.xlsx.writeBuffer()]), 'catalog-upload.xlsx');
+        const omitted = skuDataList.length - skus.length;
+        addNotification({ type: omitted ? 'warning' : 'success', title: 'Catalog Exported',
+          message: `Exported ${skus.length} validated row(s); omitted ${omitted} SKU(s) without current completed catalog results. Review cell warnings in Jobs.` });
+      } catch (error) {
+        addNotification({ type: 'error', title: 'Export Failed', message: (error as Error).message });
+      }
+      return;
+    }
     if (skuDataList.length === 0) return;
     
     const workbook = new ExcelJS.Workbook();
@@ -474,10 +524,10 @@ export function DashboardModule() {
 
   const stats = {
     total: skuDataList.length,
-    ready: skuDataList.filter(s => s.status === 'ready').length,
-    missingSource: skuDataList.filter(s => s.status === 'cannot_qa').length,
-    completed: skuDataList.filter(s => s.status === 'completed').length,
-    failed: skuDataList.filter(s => s.status === 'failed').length,
+    ready: skuDataList.filter(s => statusOf(s) === 'ready').length,
+    missingSource: skuDataList.filter(s => statusOf(s) === 'cannot_qa').length,
+    completed: skuDataList.filter(s => statusOf(s) === 'completed').length,
+    failed: skuDataList.filter(s => statusOf(s) === 'failed').length,
   };
 
   return (
@@ -488,7 +538,7 @@ export function DashboardModule() {
         <div className="flex items-center gap-5">
           <h2 className="font-serif text-2xl tracking-tighter text-[#1A1A1A]">Indexed SKUs Dashboard</h2>
 
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <button
               onClick={() => fileInputRef.current?.click()}
               className="flex items-center gap-2 px-3 py-1.5 bg-[#1A1A1A] text-white text-xs font-bold uppercase tracking-wider rounded-sm hover:bg-[#333333] transition-colors shadow-sm"
@@ -496,6 +546,16 @@ export function DashboardModule() {
               <UploadCloud className="w-4 h-4" />
               Upload New File
             </button>
+            {isCatalog && (
+              <button
+                type="button"
+                onClick={downloadInputTemplate}
+                className="flex items-center gap-2 px-3 py-1.5 bg-white text-[#1A1A1A] border border-[#E5E2DE] text-xs font-bold uppercase tracking-wider rounded-sm hover:bg-[#F5F2EF] transition-colors"
+              >
+                <Download className="w-4 h-4" aria-hidden="true" />
+                Download Input Template
+              </button>
+            )}
             <input
               type="file"
               ref={fileInputRef}
@@ -540,7 +600,7 @@ export function DashboardModule() {
           <div className="grid grid-cols-5 gap-4">
             {[
               { label: "Total Indexed SKUs", value: stats.total, color: "text-[#1A1A1A]" },
-              { label: "Ready for QA", value: stats.ready, color: "text-emerald-600" },
+              { label: isCatalog ? 'Ready for Catalog' : "Ready for QA", value: stats.ready, color: "text-emerald-600" },
               { label: "Missing Source", value: stats.missingSource, color: "text-amber-600" },
               { label: "Completed", value: stats.completed, color: "text-blue-600" },
               { label: "Failed", value: stats.failed, color: "text-rose-600" },
@@ -568,7 +628,7 @@ export function DashboardModule() {
                         : "text-[#8C8882] hover:text-[#1A1A1A]"
                     )}
                   >
-                    {f.replace("_", " ")}
+                    {isCatalog && f === 'cannot_qa' ? 'Missing source' : f.replace("_", " ")}
                   </button>
                 ))}
               </div>
@@ -616,7 +676,7 @@ export function DashboardModule() {
                 )}
               >
                 <FileText className="w-3.5 h-3.5" />
-                Create QA Job ({selectedSkus.size})
+                Create {isCatalog ? 'Catalog' : 'QA'} Job ({selectedSkus.size})
               </button>
               
               <button
@@ -643,7 +703,7 @@ export function DashboardModule() {
                 )}
               >
                 <Download className="w-3.5 h-3.5" />
-                Export Results
+                {isCatalog ? 'Export Catalog' : 'Export Results'}
               </button>
             </div>
           </div>
@@ -777,7 +837,7 @@ export function DashboardModule() {
                             </div>
                             <h3 className="font-serif text-xl text-[#1A1A1A]">No Indexed SKUs Found</h3>
                             <p className="text-xs text-[#8C8882] leading-relaxed">
-                              Upload an Excel (.xlsx, .csv) file containing catalog SKU data to index them for quality assurance.
+                              Upload an Excel (.xlsx, .csv) file containing SKU data for {isCatalog ? 'catalog creation' : 'quality assurance'}.
                             </p>
                             <button
                               onClick={() => fileInputRef.current?.click()}

@@ -4,6 +4,8 @@ import { useAppContext, Job } from "../context/AppContext";
 import type { SkuData } from "../hooks/useCatalogData";
 import { getCommonAttributeSet, getCommonHeaderOrder, hasCompletedQa, unreviewedRunSnapshot } from "../lib/jobRunState";
 import { populateQaWorksheet } from "../lib/qaExcelExport";
+import { hasCompletedCatalog, populateCatalogWorksheet } from "../lib/catalogGeneration";
+import type { JobType } from '../types';
 import { api } from "../lib/api";
 import { cn } from "../lib/utils";
 import ExcelJS from "exceljs";
@@ -11,6 +13,8 @@ import { saveAs } from "file-saver";
 
 type Run = {
   id: string; jobId: string; actorId: string; actorName: string; status: string;
+  jobType?: JobType;
+  catalogHeaders?: string[];
   createdAt: string; finishedAt?: string; error?: string;
   items?: Array<{ sku: string; status: string; attempts: number; error?: string; snapshot: SkuData; result?: SkuData }>;
 };
@@ -20,6 +24,7 @@ const request = <T,>(url: string, body?: unknown) => api<T>(url, body === undefi
 const runSkus = (run: Run) => (run.items || []).map(item => {
   if (item.result) return item.result;
   const snapshot = unreviewedRunSnapshot(item.snapshot);
+  if (run.jobType === 'catalog') snapshot.error = null;
   return {
     ...snapshot,
     ...(["queued", "running", "cancelled", "failed"].includes(item.status) ? {
@@ -30,9 +35,12 @@ const runSkus = (run: Run) => (run.items || []).map(item => {
 });
 
 export function JobsModule() {
-  const { skuDataList, jobs, removeJob, addNotification, refreshData, user } = useAppContext();
+  const { skuDataList, jobs: allJobs, workspaceMode, removeJob, addNotification, refreshData, user } = useAppContext();
+  const isCatalog = workspaceMode === 'catalog';
+  const jobs = allJobs.filter(job => (job.jobType || 'qa') === workspaceMode);
   const [histories, setHistories] = useState<Record<string, Run[]>>({});
   const [activeRuns, setActiveRuns] = useState<Run[]>([]);
+  const [catalogRuns, setCatalogRuns] = useState<Record<string, Run>>({});
   const [submitting, setSubmitting] = useState(false);
   const [pollError, setPollError] = useState("");
   const [selectedJobToView, setSelectedJobToView] = useState<Job | null>(null);
@@ -46,6 +54,11 @@ export function JobsModule() {
   const pendingRequests = useRef(new Map<string, string>());
 
   useEffect(() => {
+    setSelectedJobs(new Set()); setSelectedJobToView(null); setSelectedRunId(''); setExpandedSku(null);
+    setActiveRuns([]); setCatalogRuns({}); setPollError('');
+  }, [workspaceMode]);
+
+  useEffect(() => {
     let disposed = false;
     let busy = false;
     const poll = async () => {
@@ -53,15 +66,20 @@ export function JobsModule() {
       busy = true;
       try {
         const pairs = await Promise.all(latest.current.jobs.map(async job => [job.id, await request<Run[]>(`/api/jobs/${encodeURIComponent(job.id)}/runs`)] as const));
-        const runs = await Promise.all(pairs.flatMap(([, history]) => history.filter(active)).map(run => request<Run>(`/api/job-runs/${run.id}`)));
-        if (!disposed) { setHistories(Object.fromEntries(pairs)); setActiveRuns(runs); setPollError(""); await latest.current.refreshData(); }
+        const detailRuns = pairs.flatMap(([, history]) => isCatalog ? history.slice(0, 1) : history.filter(active));
+        const runs = await Promise.all(detailRuns.map(run => request<Run>(`/api/job-runs/${run.id}`)));
+        if (!disposed) {
+          setHistories(Object.fromEntries(pairs)); setActiveRuns(runs.filter(active));
+          setCatalogRuns(Object.fromEntries(runs.map(run => [run.jobId, run])));
+          setPollError(""); await latest.current.refreshData();
+        }
       } catch (error) { if (!disposed) setPollError(error instanceof Error ? error.message : "Could not load job progress"); }
       finally { busy = false; }
     };
     void poll();
     const timer = setInterval(poll, 2000);
     return () => { disposed = true; clearInterval(timer); };
-  }, [jobIds]);
+  }, [jobIds, workspaceMode]);
 
   useEffect(() => {
     setViewRun(null);
@@ -121,10 +139,13 @@ export function JobsModule() {
   const loadJobSkus = async (job: Job, runId?: string) => {
     const history = await request<Run[]>(`/api/jobs/${encodeURIComponent(job.id)}/runs`);
     const id = runId || history.find(run => !active(run))?.id || history[0]?.id;
-    if (id) return runSkus(await request<Run>(`/api/job-runs/${id}`));
+    if (id) {
+      const run = await request<Run>(`/api/job-runs/${id}`);
+      return { skus: runSkus(run), headers: run.catalogHeaders };
+    }
     const skus = job.skus.map(id => skuDataList.find(sku => sku.sku === id));
     if (skus.some(sku => !sku)) throw new Error("Some legacy job SKUs no longer exist in the catalog.");
-    return skus as SkuData[];
+    return { skus: skus as SkuData[], headers: undefined };
   };
 
   const exportJobExcel = async (jobOrJobs: Job | Job[], issuesOnly: boolean = false) => {
@@ -142,7 +163,7 @@ export function JobsModule() {
 
       const snapshots = await Promise.all(jobsToExport.map(job => loadJobSkus(job,
         !Array.isArray(jobOrJobs) && selectedJobToView?.id === job.id ? selectedRunId : undefined)));
-      const allJobSkus = [...new Map(snapshots.flat().map(sku => [sku.sku, sku])).values()];
+      const allJobSkus = [...new Map(snapshots.flatMap(snapshot => snapshot.skus).map(sku => [sku.sku, sku])).values()];
       const attributeSet = getCommonAttributeSet(allJobSkus);
       if (!attributeSet) {
         addNotification({
@@ -150,6 +171,24 @@ export function JobsModule() {
           title: "Cannot Export Jobs",
           message: "The selected completed jobs contain multiple or missing attribute sets. All exported SKUs must use one non-empty attribute set."
         });
+        return;
+      }
+
+      if (jobsToExport.every(job => job.jobType === 'catalog')) {
+        const headers = snapshots[0].headers;
+        if (!headers?.length || snapshots.some(snapshot => !snapshot.headers || snapshot.headers.length !== headers.length ||
+          snapshot.headers.some((header, index) => header !== headers[index]))) {
+          throw new Error('Catalog jobs must have identical saved header order to export together.');
+        }
+        const completed = [...new Map(snapshots.flatMap(snapshot => snapshot.skus).filter(hasCompletedCatalog).map(sku => [sku.sku, sku])).values()];
+        const workbook = new ExcelJS.Workbook();
+        populateCatalogWorksheet(workbook.addWorksheet('Catalog'), completed.map(sku => sku.catalog_state!));
+        const exportName = jobsToExport.length === 1 ? jobsToExport[0].name : `${attributeSet}_Combined`;
+        saveAs(new Blob([await workbook.xlsx.writeBuffer()], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+          `${exportName.replace(/[^a-zA-Z0-9_-]/g, '_')}_Catalog_Upload.xlsx`);
+        const omitted = allJobSkus.length - completed.length;
+        addNotification({ type: omitted ? 'warning' : 'success', title: 'Catalog Exported',
+          message: `Exported ${completed.length} validated row(s); omitted ${omitted} unfinished or failed SKU(s). Review cell warnings in job results.` });
         return;
       }
 
@@ -222,6 +261,7 @@ export function JobsModule() {
 
   const getJobSkusList = (job: Job) => {
     if (selectedJobToView?.id === job.id && selectedRunId) return viewRun?.id === selectedRunId ? runSkus(viewRun) : [];
+    if (job.jobType === 'catalog') return catalogRuns[job.id] ? runSkus(catalogRuns[job.id]) : [];
     return job.skus.map(s => skuDataList.find(item => item.sku === s)).filter(Boolean) as typeof skuDataList;
   };
 
@@ -229,9 +269,9 @@ export function JobsModule() {
     <div className="flex-1 flex flex-col h-full bg-[#FDFCFB] overflow-hidden">
       <header className="px-10 py-8 border-b border-[#E5E2DE] shrink-0 flex items-end justify-between">
         <div>
-          <h2 className="font-serif text-4xl tracking-tighter mb-2 text-[#1A1A1A]">QA Jobs</h2>
+          <h2 className="font-serif text-4xl tracking-tighter mb-2 text-[#1A1A1A]">{isCatalog ? 'Catalog Jobs' : 'QA Jobs'}</h2>
           <p className="text-[#8C8882] text-sm leading-relaxed max-w-lg">
-            Manage, execute, and export Quality Assurance tasks against selected SKUs.
+            {isCatalog ? 'Generate catalog rows from mapping rules and export final upload files.' : 'Manage, execute, and export Quality Assurance tasks against selected SKUs.'}
           </p>
         </div>
       </header>
@@ -240,7 +280,7 @@ export function JobsModule() {
         <div className="max-w-6xl mx-auto space-y-8">
           
           {pollError && <p role="alert" className="text-sm text-red-700">{pollError}. Progress will retry automatically.</p>}
-          {activeRuns.map(run => {
+          {activeRuns.filter(run => jobs.some(job => job.id === run.jobId)).map(run => {
             const items = (run.items || []).filter(item => item.status !== "skipped");
             const completed = items.filter(item => ["completed", "failed", "cancelled"].includes(item.status)).length;
             const canStop = user?.role === "admin" || user?.id === run.actorId;
@@ -304,8 +344,9 @@ export function JobsModule() {
             )}
             {jobs.map((job) => {
               const jobSkus = getJobSkusList(job);
-              const completedCount = jobSkus.filter(hasCompletedQa).length;
-              const unresolvedCount = jobSkus.length - completedCount;
+              const completedCount = isCatalog ? jobSkus.filter(sku => hasCompletedCatalog(sku) &&
+                sku.catalog_state?.revision === skuDataList.find(current => current.sku === sku.sku)?.revision).length : jobSkus.filter(hasCompletedQa).length;
+              const unresolvedCount = (isCatalog ? job.skus.length : jobSkus.length) - completedCount;
               const lastRunStatus = histories[job.id]?.[0]?.status;
               const badgeStatus = lastRunStatus || job.status;
 
@@ -345,7 +386,7 @@ export function JobsModule() {
                       <span className="flex items-center gap-1"><Clock className="w-3 h-3" /> {new Date(job.createdAt).toLocaleString()}</span>
                       <span>SKUs: {job.skus.length}</span>
                       {completedCount > 0 && (
-                        <span className="text-emerald-700 font-semibold">Current QA: {completedCount}/{job.skus.length}</span>
+                        <span className="text-emerald-700 font-semibold">{isCatalog ? 'Catalog rows' : 'Current QA'}: {completedCount}/{job.skus.length}</span>
                       )}
                       {job.tokensUsed && (
                         <span className="text-purple-700 font-semibold">Tokens: {job.tokensUsed.total_tokens.toLocaleString()}</span>
@@ -377,20 +418,20 @@ export function JobsModule() {
                         <button
                           onClick={() => exportJobExcel(job)}
                           className="flex items-center gap-1.5 px-3 py-2 text-[11px] uppercase tracking-widest font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 transition-colors rounded-sm shadow-sm"
-                          title="Export All Job QA Results to Excel"
+                          title={isCatalog ? 'Export Catalog Upload File' : 'Export All Job QA Results to Excel'}
                         >
                           <FileSpreadsheet className="w-3.5 h-3.5" />
                           Export All
                         </button>
                         
-                        <button
+                        {!isCatalog && <button
                           onClick={() => exportJobExcel(job, true)}
                           className="flex items-center gap-1.5 px-3 py-2 text-[11px] uppercase tracking-widest font-bold text-orange-800 bg-orange-50 border border-orange-200 hover:bg-orange-100 transition-colors rounded-sm shadow-sm"
                           title="Export Only Failed/Warning SKUs to Excel"
                         >
                           <AlertTriangle className="w-3.5 h-3.5" />
                           Issues Only
-                        </button>
+                        </button>}
                       </>
                     )}
 
@@ -401,7 +442,7 @@ export function JobsModule() {
                         className="flex items-center gap-2 px-4 py-2 text-[11px] uppercase tracking-widest border border-[#1A1A1A] bg-[#1A1A1A] text-white hover:bg-black transition-colors rounded-sm disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <Play className="w-3.5 h-3.5" />
-                        {job.status === 'pending' && completedCount === 0 ? 'Run Q.A' : 'Resume Q.A'}
+                        {isCatalog ? completedCount === 0 ? 'Run Catalog' : 'Resume Catalog' : job.status === 'pending' && completedCount === 0 ? 'Run Q.A' : 'Resume Q.A'}
                       </button>
                     )}
 
@@ -491,10 +532,38 @@ export function JobsModule() {
               {selectedRunId && !viewRun && <p>Loading saved run results…</p>}
               {viewRun?.error && <p role="alert" className="text-red-700">{viewRun.error}</p>}
               <div className="text-xs text-[#8C8882] uppercase tracking-widest font-semibold mb-2">
-                QA Results per SKU
+                {isCatalog ? 'Catalog Results per SKU' : 'QA Results per SKU'}
               </div>
 
               {getJobSkusList(selectedJobToView).map((sku) => {
+                if (isCatalog) {
+                  const state = sku.catalog_state;
+                  const isExpanded = expandedSku === sku.sku;
+                  return <div key={sku.sku} className="border border-[#E5E2DE] rounded-sm overflow-hidden bg-[#FDFCFB]">
+                    <div className="p-4 bg-white flex items-center justify-between gap-4">
+                      <button onClick={() => setExpandedSku(isExpanded ? null : sku.sku)} aria-expanded={isExpanded}
+                        className="text-left flex-1 text-sm font-mono font-bold">
+                        SKU: {sku.sku} · {state?.status || sku.status} · Warnings: {state?.warnings.length || 0}
+                      </button>
+                      {state?.tokensUsed && <span className="text-xs text-purple-700">Tokens: {state.tokensUsed.total_tokens.toLocaleString()}</span>}
+                      <button onClick={() => runJob(selectedJobToView.id, false, sku.sku)}
+                        disabled={submitting || activeRuns.some(run => run.jobId === selectedJobToView.id)}
+                        className="px-3 py-1.5 text-xs border rounded-sm disabled:opacity-50">Rerun Catalog</button>
+                    </div>
+                    {(state?.error || sku.error) && <p role="alert" className="p-4 text-red-700">{state?.error || sku.error}</p>}
+                    {isExpanded && <div className="p-4 space-y-3 overflow-x-auto">
+                      {state?.warnings.length ? <ul className="list-disc pl-5 text-xs text-amber-800">
+                        {state.warnings.map((warning, index) => <li key={index}>{warning}</li>)}
+                      </ul> : null}
+                      {state?.row ? <table className="w-full text-left text-xs border-collapse">
+                        <thead><tr><th className="p-2">Header</th><th className="p-2">Generated value</th></tr></thead>
+                        <tbody>{state.headers.map(header => <tr key={header} className="border-t border-[#E5E2DE]">
+                          <th className="p-2 font-mono font-normal">{header}</th><td className="p-2 whitespace-pre-wrap">{state.row![header] || '—'}</td>
+                        </tr>)}</tbody>
+                      </table> : <p className="text-xs text-[#8C8882]">No generated row available yet.</p>}
+                    </div>}
+                  </div>;
+                }
                 const qa = sku.qa_result;
                 const issues = qa?.issues || [];
                 const isExpanded = expandedSku === sku.sku;

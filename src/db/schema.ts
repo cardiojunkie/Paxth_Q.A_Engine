@@ -19,6 +19,7 @@ export const attributeSets = pgTable('attribute_sets', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
   rulesMarkdown: text('rules_markdown').notNull(),
+  catalogHeaders: jsonb('catalog_headers').$type<string[]>().notNull().default([]),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 }, (table) => [uniqueIndex('attribute_sets_normalized_name_idx').on(sql`lower(btrim(${table.name}))`)]);
@@ -32,6 +33,7 @@ export const qaAgentSettings = pgTable('qa_agent_settings', {
 export const jobs = pgTable('jobs', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
+  jobType: text('job_type').notNull().default('qa'),
   createdAt: text('created_at').notNull(),
   attributeSet: text('attribute_set'),
   skus: jsonb('skus').notNull().default([]),
@@ -39,7 +41,7 @@ export const jobs = pgTable('jobs', {
   tokensUsed: jsonb('tokens_used'),
   timeTaken: integer('time_taken'),
   error: text('error'),
-}, table => [check('jobs_valid_status',sql`${table.status} IN ('pending','running','completed','failed')`), check('jobs_skus_array',sql`jsonb_typeof(${table.skus})='array' AND NOT jsonb_path_exists(${table.skus}, '$[*] ? (@.type() != "string" || @ == "")')`)]);
+}, table => [check('jobs_valid_type',sql`${table.jobType} IN ('qa','catalog')`), check('jobs_valid_status',sql`${table.status} IN ('pending','running','completed','failed')`), check('jobs_skus_array',sql`jsonb_typeof(${table.skus})='array' AND NOT jsonb_path_exists(${table.skus}, '$[*] ? (@.type() != "string" || @ == "")')`)]);
 
 export const qaStatusEnum = pgEnum('qa_status', ['pending', 'ready', 'cannot_qa', 'running', 'completed', 'failed']);
 export const scrapeStatusEnum = pgEnum('scrape_status', ['success', 'failed', 'skipped_no_url']);
@@ -61,6 +63,7 @@ export const skuData = pgTable('sku_data', {
   timeTaken: integer('time_taken'),
   error: text('error'),
   qaResult: jsonb('qa_result'),
+  catalogState: jsonb('catalog_state'),
   qaRevision: integer('qa_revision'),
   exportData: jsonb('export_data'),
   lastJobId: text('last_job_id'),

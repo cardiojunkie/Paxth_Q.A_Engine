@@ -44,12 +44,14 @@ export function validateSettings(value: any) {
   return editableSettings(normalizeSettings(value));
 }
 export async function completeQa(payload: unknown, signal: AbortSignal, options: {
+  taskLabel?: 'QA' | 'Catalog';
   attempts?: number; beforeAttempt?: (attempt: number) => Promise<void>;
   lastError?: string | null; onAttemptError?: (attempt: number, error: ProviderError) => Promise<void>;
 } = {}) {
+  const label = options.taskLabel || 'QA';
   const exhaustedMessage = options.lastError?.trim()
-    ? `QA exhausted its three-attempt budget. Last recorded failure: ${options.lastError} Start a fresh run to retry this SKU.`
-    : 'QA used all three attempts before a result was saved; execution was interrupted. Start a fresh run to retry this SKU.';
+    ? `${label} exhausted its three-attempt budget. Last recorded failure: ${options.lastError} Start a fresh run to retry this SKU.`
+    : `${label} used all three attempts before a result was saved; execution was interrupted. Start a fresh run to retry this SKU.`;
   signal.throwIfAborted();
   if ((options.attempts ?? 0) >= 3) throw new ProviderError(exhaustedMessage);
   const { baseUrl, apiKey } = getProviderCredentials();

@@ -1,11 +1,12 @@
 import React, { createContext, useContext, useState, useCallback, ReactNode, useEffect } from 'react';
 import { useCatalogData } from '../hooks/useCatalogData';
-import { User, UserAccount, UserAccountInput } from '../types';
+import { User, UserAccount, UserAccountInput, JobType } from '../types';
 import { api, ApiError } from '../lib/api';
 
 export interface Job {
   id: string;
   name: string;
+  jobType?: JobType;
   createdAt: string;
   attribute_set: string;
   skus: string[];
@@ -27,6 +28,8 @@ export interface AppNotification {
 type AccountResult = { success: boolean; error?: string };
 type Catalog = ReturnType<typeof useCatalogData>;
 interface AppContextType {
+  workspaceMode: JobType;
+  setWorkspaceMode: (mode: JobType) => void;
   user: User | null;
   sessionLoading: boolean;
   login: (username: string, password: string) => Promise<AccountResult>;
@@ -59,6 +62,7 @@ const AppContext = createContext<AppContextType | undefined>(undefined);
 const messageOf = (error: unknown) => error instanceof Error ? error.message : 'Request failed. Please retry.';
 
 export function AppProvider({ children }: { children: ReactNode }) {
+  const [workspaceMode, setWorkspaceMode] = useState<JobType>('qa');
   const [user, setUser] = useState<User | null>(null);
   const [sessionLoading, setSessionLoading] = useState(true);
   const [usersList, setUsersList] = useState<UserAccount[]>([]);
@@ -177,6 +181,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const clearNotifications = useCallback(() => setNotifications([]), []);
   return (
     <AppContext.Provider value={{
+      workspaceMode, setWorkspaceMode,
       user, sessionLoading, login, logout, usersList, addUserAccount, updateUserAccount, deleteUserAccount,
       skuDataList, addParsedData, updateSku, scrapeSku, deleteSku, clearData, removeSkus, catalogError, isLoadingSkuData: isLoading,
       jobs, addJobs, updateJob, removeJob, refreshData,

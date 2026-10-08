@@ -1,7 +1,22 @@
+export type JobType = 'qa' | 'catalog';
+
+export interface CatalogState {
+  status: 'completed' | 'failed';
+  revision: number;
+  jobId: string;
+  headers: string[];
+  row?: Record<string, string>;
+  warnings: string[];
+  error?: string | null;
+  tokensUsed?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+  timeTaken?: number;
+}
+
 export interface AttributeSet {
   id: string;
   name: string;
   rulesMarkdown: string;
+  catalogHeaders: string[];
   createdAt: number;
   updatedAt: number;
 }

@@ -11,7 +11,8 @@ import { scrapePage } from '../lib/browserScrape';
 import { usableScrapedMarkdown } from '../lib/scrapeEvidence';
 import { ProviderError } from '../lib/chatCompletion';
 import { completeQa, getProviderCredentials, getProviderSettings } from './provider';
-import { mapCatalogRow, saveScrapedEvidence, saveScrapeFailure } from './catalog';
+import { ApiError, mapCatalogRow, saveScrapedEvidence, saveScrapeFailure, validateCatalogJob } from './catalog';
+import { CATALOG_PASS_THROUGH_HEADERS, catalogPassThroughValue, hasCompletedCatalog, prepareCatalogInput, parseCatalogResponse } from '../lib/catalogGeneration';
 
 // ponytail: global mutation lock and one worker fit this deployment; partition by job if throughput requires it.
 export const JOB_MUTATION_LOCK = 73462190;
@@ -67,6 +68,8 @@ export async function initializeJobRuns(pool: Pool) {
 
 const publicRun = (row: any) => ({
   id: row.id, jobId: row.job_id, actorId: row.actor_id, actorName: row.actor_name,
+  jobType: row.configuration?.jobType || 'qa',
+  catalogHeaders: row.configuration?.catalogMapping?.headers,
   mode: row.mode, status: row.status, createdAt: row.created_at, startedAt: row.started_at,
   finishedAt: row.finished_at, error: row.error,
 });
@@ -117,20 +120,34 @@ export function registerJobRunRoutes(app: Express, pool: Pool) {
         const rowsBySku = new Map(catalog.map(row => [row.sku, row]));
         if (!Array.isArray(job.skus) || job.skus.some((sku: string) => !rowsBySku.has(sku))) throw new JobError('A job SKU no longer exists', 409);
         if (input.mode === 'single' && !job.skus.includes(input.sku)) throw new JobError('The SKU is not in this job');
+        const jobType = job.job_type || 'qa';
+        const catalogMapping = jobType === 'catalog' ? await validateCatalogJob(client!, catalog, job.attribute_set) : undefined;
         getProviderCredentials();
         const settings = await getProviderSettings(client!);
         const { rows: [memory] } = await client!.query("SELECT memory FROM qa_agent_settings WHERE id='default'");
-        const { rows: sets } = await client!.query('SELECT id,name,rules_markdown AS "rulesMarkdown" FROM attribute_sets');
+        const { rows: sets } = await client!.query('SELECT id,name,rules_markdown AS "rulesMarkdown",catalog_headers AS "catalogHeaders" FROM attribute_sets');
         if (!memory?.memory) throw new JobError('QA memory is unavailable', 503);
-        const configuration = { settings, qaAgentMemory: memory.memory, attributeSets: sets };
+        const configuration = { settings, qaAgentMemory: memory.memory, attributeSets: sets, jobType, catalogMapping };
+        const priorCatalog = jobType === 'catalog' ? (await client!.query(`SELECT DISTINCT ON (i.sku) i.sku,i.result,r.configuration
+          FROM job_run_items i JOIN job_runs r ON r.id=i.run_id
+          WHERE r.job_id=$1 ORDER BY i.sku,r.created_at DESC,r.id DESC`, [job.id])).rows : [];
+        const priorBySku = new Map(priorCatalog.map(previous => [previous.sku, previous]));
         const runId = randomUUID();
         await client!.query('INSERT INTO job_runs(id,job_id,request_id,actor_id,actor_name,mode,selected_sku,configuration) VALUES($1,$2,$3,$4,$5,$6,$7,$8)',
           [runId, job.id, input.requestId, res.locals.user.id, res.locals.user.username, input.mode, input.sku ?? null, JSON.stringify(configuration)]);
         for (const [position, sku] of job.skus.entries()) {
           const row = rowsBySku.get(sku)!;
           const snapshot = mapCatalogRow(row);
-          const selected = input.mode === 'all' || (input.mode === 'single' ? sku === input.sku : !hasCompletedQa(snapshot));
-          const priorResult = !selected && hasCompletedQa(snapshot) ? snapshot : null;
+          const previous = priorBySku.get(sku);
+          const catalogResult = previous?.result && previous.configuration.catalogMapping?.rulesMarkdown === catalogMapping?.rulesMarkdown &&
+            previous.configuration.catalogMapping?.attributeSet === catalogMapping?.attributeSet &&
+            JSON.stringify(previous.configuration.catalogMapping?.headers) === JSON.stringify(catalogMapping?.headers) &&
+            CATALOG_PASS_THROUGH_HEADERS.every(header => previous.result.catalog_state?.row?.[header] === catalogPassThroughValue(snapshot, header)) &&
+            previous.result.catalog_state?.jobId === job.id && previous.result.catalog_state?.revision === row.revision &&
+            hasCompletedCatalog(previous.result) ? previous.result : null;
+          const completed = jobType === 'catalog' ? Boolean(catalogResult) : hasCompletedQa(snapshot);
+          const selected = input.mode === 'all' || (input.mode === 'single' ? sku === input.sku : !completed);
+          const priorResult = !selected && completed ? jobType === 'catalog' ? catalogResult : snapshot : null;
           await client!.query('INSERT INTO job_run_items(run_id,sku,position,revision,snapshot,status,result) VALUES($1,$2,$3,$4,$5,$6,$7)',
             [runId, sku, position, row.revision, JSON.stringify(unreviewedRunSnapshot(snapshot, false)), selected ? 'queued' : 'skipped', priorResult ? JSON.stringify(priorResult) : null]);
         }
@@ -139,7 +156,7 @@ export function registerJobRunRoutes(app: Express, pool: Pool) {
       });
       res.status(202).json(await readRun(client, id));
     } catch (error) {
-      const known = error instanceof JobError || error instanceof ProviderError;
+      const known = error instanceof JobError || error instanceof ProviderError || error instanceof ApiError;
       if (!known) {
         const code = (error as { code?: string })?.code;
         console.error('Job start database operation failed.', typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : 'unavailable');
@@ -197,6 +214,11 @@ async function persistItem(client: PoolClient, run: any, owner: string, item: an
     await client.query("UPDATE job_run_items SET status=$3,result=$4,error=$5,finished_at=now() WHERE run_id=$1 AND sku=$2 AND status='running'",
       [run.id, item.sku, result.error ? 'failed' : 'completed', JSON.stringify(result), result.error ?? null]);
     // A result remains in history even when newer evidence prevents updating the live catalog.
+    if (run.configuration.jobType === 'catalog') {
+      await client.query('UPDATE sku_data SET catalog_state=$3 WHERE sku=$1 AND revision=$2',
+        [item.sku, item.revision, JSON.stringify(result.catalog_state)]);
+      return;
+    }
     await client.query(`UPDATE sku_data SET status=$3,qa_result=COALESCE($4::jsonb,qa_result),export_data=COALESCE($5::jsonb,export_data),last_job_id=$6,
       tokens_used=$7,time_taken=$8,error=$9,qa_revision=CASE WHEN $4::jsonb IS NOT NULL THEN $2 ELSE qa_revision END
       WHERE sku=$1 AND revision=$2`, [item.sku, item.revision, result.status,
@@ -216,7 +238,7 @@ async function finishRun(client: PoolClient, run: any, owner: string) {
     const error = cancelled ? 'Run cancelled; committed results were preserved.' : failed ? 'Some SKUs failed to process.' : null;
     await client.query('UPDATE job_runs SET status=$2,error=$3,finished_at=now(),owner_token=NULL WHERE id=$1', [run.id, status, error]);
     const effective = items.map(item => item.result || unreviewedRunSnapshot(item.snapshot));
-    const jobStatus = failed ? 'failed' : effective.every(hasCompletedQa) ? 'completed' : 'pending';
+    const jobStatus = failed ? 'failed' : effective.every(run.configuration.jobType === 'catalog' ? hasCompletedCatalog : hasCompletedQa) ? 'completed' : 'pending';
     const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
     for (const item of items.filter(item => item.status !== 'skipped')) for (const key of Object.keys(usage)) usage[key] += cleanUsage(item.result?.tokensUsed)[key];
     await client.query(`UPDATE jobs SET status=$2,error=$3,time_taken=LEAST(2147483647,COALESCE(time_taken,0)::bigint+$4::bigint),
@@ -229,6 +251,7 @@ async function finishRun(client: PoolClient, run: any, owner: string) {
 
 async function executeRun(client: PoolClient, pool: Pool, run: any, owner: string, ownership: AbortSignal, scrape: typeof scrapePage) {
   const settings = normalizeSettings(run.configuration.settings);
+  const isCatalog = run.configuration.jobType === 'catalog';
   while (!ownership.aborted) {
     const item = await transaction(client, async () => {
       const current = await assertOwner(client, run.id, owner, true);
@@ -255,6 +278,7 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
     const execution = AbortSignal.any([ownership, cancelled.signal, AbortSignal.timeout(remaining)]);
     let snapshot: SkuData = unreviewedRunSnapshot(item.snapshot);
     let result: SkuData;
+    let catalogTokens: SkuData['tokensUsed'];
     try {
       if (Date.now() >= start + SKU_BUDGET_MS) throw new Error('SKU exceeded its five-minute execution budget');
       if (snapshot.source.url && !usableScrapedMarkdown(snapshot)) {
@@ -292,8 +316,11 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
           if (retrievalFailure && !snapshot.source.sap?.trim()) throw retrievalFailure;
         } else if (!snapshot.source.sap?.trim()) throw new Error(snapshot.scrape_error || 'Scraping was interrupted. Rerun this SKU to collect evidence.');
       }
-      const input = prepareQaInput(snapshot, run.configuration.attributeSets, run.configuration.qaAgentMemory, settings.maxPageContentLength);
+      const input = isCatalog
+        ? prepareCatalogInput(snapshot, run.configuration.catalogMapping, settings.maxPageContentLength)
+        : prepareQaInput(snapshot, run.configuration.attributeSets, run.configuration.qaAgentMemory, settings.maxPageContentLength);
       const response = await completeQa(buildQaRequest(settings, input).payload, execution, {
+        taskLabel: isCatalog ? 'Catalog' : 'QA',
         attempts: item.attempts,
         lastError: item.error,
         beforeAttempt: async attempt => {
@@ -308,16 +335,28 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
           await transaction(client, async () => {
             await assertOwner(client, run.id, owner);
             await client.query('UPDATE job_run_items SET error=$3 WHERE run_id=$1 AND sku=$2',
-              [run.id, item.sku, `QA attempt ${attempt}: ${error.message}`]);
+              [run.id, item.sku, `${isCatalog ? 'Catalog' : 'QA'} attempt ${attempt}: ${error.message}`]);
           });
         },
       });
-      result = withResult(snapshot, parseQaResponse(response, input), response.usage, Date.now() - start, run.job_id);
+      if (isCatalog) catalogTokens = cleanUsage(response.usage) as SkuData['tokensUsed'];
+      if (isCatalog) {
+        const catalog = parseCatalogResponse(response, input as ReturnType<typeof prepareCatalogInput>);
+        const timeTaken = Date.now() - start;
+        result = { ...snapshot, status: 'completed', error: null, tokensUsed: catalogTokens, timeTaken,
+          catalog_state: { ...catalog, headers: run.configuration.catalogMapping.headers, status: 'completed',
+            revision: item.revision, jobId: run.job_id, tokensUsed: catalogTokens, timeTaken } };
+      } else {
+        result = withResult(snapshot, parseQaResponse(response, input as ReturnType<typeof prepareQaInput>), response.usage, Date.now() - start, run.job_id);
+      }
     } catch (error) {
       if (ownership.aborted) { clearInterval(monitor); throw error; }
       if (cancelled.signal.aborted) { clearInterval(monitor); continue; }
       result = { ...snapshot, status: 'failed', qa_result: undefined, export_data: undefined,
+        ...(isCatalog && catalogTokens ? { tokensUsed: catalogTokens } : {}),
         error: execution.aborted ? 'SKU exceeded its five-minute execution budget' : errorText(error), timeTaken: Date.now() - start };
+      if (isCatalog) result.catalog_state = { status: 'failed', headers: run.configuration.catalogMapping.headers,
+        warnings: [], revision: item.revision, jobId: run.job_id, error: result.error, timeTaken: result.timeTaken, tokensUsed: catalogTokens };
     }
     try {
       // Keep the paid response in memory while retrying only its database commit.

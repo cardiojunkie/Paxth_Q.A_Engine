@@ -16,6 +16,7 @@ import {registerScrapeRoutes} from './scraper';
 import {ProviderError} from '../lib/chatCompletion';
 import {validateScrapeInput, ScrapeError, type ScrapePreview} from '../lib/browserScrape';
 import {DEFAULT_SETTINGS,editableSettings} from '../lib/providerSettings';
+import {CATALOG_INPUT_HEADERS,CATALOG_PASS_THROUGH_HEADERS} from '../lib/catalogGeneration';
 
 assert.ok(process.env.TEST_DATABASE_URL,'Set TEST_DATABASE_URL to a disposable PostgreSQL instance. Production DATABASE_URL is never used.');
 const namespace=`security_${randomUUID().replaceAll('-','')}`;
@@ -54,6 +55,15 @@ const provider=createServer(async(req,res)=>{
     res.end(JSON.stringify({error:{message:'Temporary provider outage: test-secret-only sk-private-test Bearer private-header\nRetry later.'}}));return;
   }
   res.setHeader('Content-Type','application/json');
+  let catalogInput:any;
+  try { catalogInput = JSON.parse(payload.messages.find((message:any)=>message.role==='user').content); } catch { /* Connectivity tests send plain text. */ }
+  if (catalogInput?.template) {
+    const row = { ...catalogInput.template, name: 'TestBrand USB Hub', attributes__fallback: 'No',
+      ...Object.fromEntries(CATALOG_PASS_THROUGH_HEADERS.map(header=>[header,'MODEL MUST NOT CHANGE THIS'])) };
+    const result = providerMode === 'catalog-mixed' && catalogInput.sku === 'cat-b'
+      ? { row: { sku: 'cat-b' }, warnings: [] } : { row, warnings: [] };
+    res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify(result)}}],usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}}));return;
+  }
   if(payload.search_domain_filter) {
     res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify({status:'ok',markdown:'# Retrieved product\nBrand: TestBrand'})}}],citations:providerMode==='no-citations'?[]:payload.search_domain_filter}));return;
   }
@@ -174,6 +184,7 @@ try {
   assert.equal((await request('/api/catalog/nope','PUT',{source:{sap:'x'},expectedRevision:0},user)).status,404);
   assert.equal((await request('/api/jobs','POST',{id:'bad',name:'Bad',skus:{a:true}},user)).status,400);
   const job=await request('/api/jobs','POST',{id:'job',name:'Job',skus:['a','b'],attribute_set:'TestSet'},user);assert.equal(job.status,201);
+  assert.equal(job.body[0].jobType,'qa','Existing clients default to QA jobs');
   const credentials={baseUrl:process.env.LLM_BASE_URL,key:process.env.LLM_API_KEY,legacyKey:process.env.AICREDITS_API_KEY};
   delete process.env.LLM_BASE_URL;delete process.env.LLM_API_KEY;delete process.env.AICREDITS_API_KEY;
   await request('/api/catalog','POST',[{...sku('scrape-check'),source:{url:'https://8.8.8.8/product?variant=42'}}],user);
@@ -466,6 +477,143 @@ try {
   await waitFor(async()=>(await request(`/api/job-runs/${snapshotOnly.body.id}`,'GET',undefined,user)).body.status==='completed','snapshot-only history completion');
   await stopWorker();stopWorker=undefined;
   assert.equal((await pool.query("SELECT status FROM jobs WHERE id='job'")).rows[0].status,'pending','Unverified skipped snapshots cannot complete a job');
+
+  // Catalog jobs use independent results and the mapping snapshotted at admission.
+  const catalogUpload={...sku('mandatory-catalog-input'),raw_row:{...Object.fromEntries(CATALOG_INPUT_HEADERS.map(header=>[header,''])),
+    sku:'mandatory-catalog-input',base_code:'00001',attributes__lulu_ean:'0001234567890',attributes__sap:'Brand: Canonical',
+    attributes__url:'https://example.com/canonical',attributes__attribute_set:'TestSet',attribute__shipping_attribute:'001'},
+    source:{sap:'Wrong context',url:'https://example.com/wrong'},attribute_set:'Wrong category'};
+  const incompleteUpload={...catalogUpload,sku:'missing-catalog-header',raw_row:{...catalogUpload.raw_row}};
+  delete (incompleteUpload.raw_row as Record<string,unknown>).base_code;
+  assert.equal((await request('/api/catalog?mode=catalog','POST',[catalogUpload,incompleteUpload],user)).status,400);
+  assert.equal((await pool.query("SELECT 1 FROM sku_data WHERE sku=ANY($1)",[['mandatory-catalog-input','missing-catalog-header']])).rows.length,0,'Invalid catalog headers reject the whole batch');
+  assert.equal((await request('/api/catalog?mode=catalog','POST',[catalogUpload],user)).status,200);
+  assert.deepEqual((await pool.query("SELECT raw_row FROM sku_data WHERE sku='mandatory-catalog-input'")).rows[0].raw_row,catalogUpload.raw_row,'Catalog uploads retain supplied text and blank cells');
+  const canonicalUpload=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='mandatory-catalog-input');
+  assert.equal(canonicalUpload.source.sap,'Brand: Canonical');assert.equal(canonicalUpload.source.url,'https://example.com/canonical');
+  assert.equal(canonicalUpload.attribute_set,'TestSet','Canonical category comes from the required uploaded column');
+  const catalogHeaders=['sku','base_code','attribute_set','attributes__lulu_ean','attributes__Shipping_Attribute',
+    'attributes__Shipment_Type','attributes__Common_Item_Whippy','attributes__fallback','name','attributes__color',
+    'attributes__shipping_weight','attributes__brand','attributes__lulu_product_type'];
+  const catalogRules='name: use the sourced brand and model, for example TestBrand USB Hub.\nattributes__fallback: default No. Leave unsourced color blank.';
+  const catSku=(id:string)=>({...sku(id),raw_row:{sku:id,base_code:'00001',attributes__lulu_ean:'0001234567890'},
+    upload_attributes:{lulu_ean:'0001234567890',Shipping_Attribute:'001',Shipment_Type:'Normal',Common_Item_Whippy:'No'}});
+  const legacyCatSku={...catSku('cat-a'),raw_row:{...catSku('cat-a').raw_row,attributes__product_type:' 000Legacy Hub '}};
+  assert.equal((await request('/api/catalog','POST',[legacyCatSku,catSku('cat-b')],user)).status,200);
+  const catalogJob={id:'catalog-job',name:'Catalog',skus:['cat-a','cat-b'],attribute_set:'TestSet',jobType:'catalog'};
+  assert.equal((await request('/api/jobs','POST',catalogJob,user)).status,400,'Catalog jobs require separately configured output headers');
+  assert.equal((await request('/api/jobs','POST',{...catalogJob,jobType:'unknown'},user)).status,400);
+  const saveCatalogRules=async(rules:string,headers?:string[])=>request(`/api/attribute-sets/${testSet.id}`,'PUT',
+    {name:'TestSet',rulesMarkdown:rules,...(headers!==undefined?{catalogHeaders:headers}:{})},admin);
+  assert.equal((await request(`/api/attribute-sets/${testSet.id}`,'PUT',{name:'TestSet',rulesMarkdown:catalogRules,catalogHeaders},user)).status,403,'Output-header edits keep administrator permissions');
+  await saveCatalogRules(catalogRules,catalogHeaders);
+  assert.equal((await request('/api/jobs','POST',catalogJob,user)).body[0].jobType,'catalog');
+  assert.equal((await request('/api/jobs/catalog-job','PUT',{jobType:'qa'},user)).status,400,'Job types are immutable');
+  assert.equal((await request('/api/catalog','POST',[{...catSku('forged-catalog'),catalog_state:{status:'completed'}}],user)).status,400);
+  await pool.query("UPDATE sku_data SET status='completed',qa_result=$1,qa_revision=revision,export_data=$1,tokens_used=$2 WHERE sku='cat-a'",
+    [JSON.stringify(trustedB.qa_result),JSON.stringify({prompt_tokens:10,completion_tokens:5,total_tokens:15})]);
+  const unchangedQa=async()=> (await pool.query("SELECT sku,raw_row,upload_attributes,status,qa_result,qa_revision,export_data,tokens_used,time_taken,error,last_job_id FROM sku_data WHERE sku=ANY($1) ORDER BY sku",[['cat-a','cat-b']])).rows;
+  const beforeCatalog=await unchangedQa();
+  const startCatalog=(mode='unfinished',selectedSku?:string,id='catalog-job')=>request(`/api/jobs/${id}/runs`,'POST',
+    {requestId:randomUUID(),mode,...(selectedSku?{sku:selectedSku}:{})},user);
+  const firstCatalog=await startCatalog();assert.equal(firstCatalog.status,202);
+  assert.equal(firstCatalog.body.jobType,'catalog');assert.deepEqual(firstCatalog.body.catalogHeaders,catalogHeaders);
+  await saveCatalogRules(catalogRules.replace('USB Hub','Changed Mapping Example'),[...catalogHeaders].reverse());
+  const catalogOffset=providerRequests.length;
+  providerMode='success';stopWorker=startJobWorker(pool,scrape);
+  const catalogRun=async(id:string)=>(await request(`/api/job-runs/${id}`,'GET',undefined,user)).body;
+  await waitFor(async()=>(await catalogRun(firstCatalog.body.id)).status==='completed','catalog generation');
+  await stopWorker();stopWorker=undefined;
+  const generatedCatalog=await catalogRun(firstCatalog.body.id);
+  assert.deepEqual(generatedCatalog.catalogHeaders,catalogHeaders,'Header edits do not change admitted runs');
+  assert.ok(providerRequests[catalogOffset].messages[0].content.includes(catalogRules),'Mapping updates do not change admitted runs');
+  assert.deepEqual(await unchangedQa(),beforeCatalog,'Catalog commits never overwrite QA state or original upload data');
+  assert.equal((await pool.query("SELECT status FROM jobs WHERE id='catalog-job'")).rows[0].status,'completed');
+  for(const item of generatedCatalog.items) {
+    assert.equal(item.result.catalog_state.row.attributes__lulu_ean,'0001234567890');
+    assert.equal(item.result.catalog_state.row.attributes__Shipping_Attribute,'001');
+    assert.equal(item.result.catalog_state.row.base_code,'00001');
+    assert.equal(item.result.catalog_state.row.attributes__fallback,'No');
+    assert.equal(item.result.catalog_state.row.attributes__color,'');
+    assert.equal(item.result.catalog_state.row.sku,item.sku);
+    for(const header of ['attributes__shipping_weight','attributes__brand']) assert.equal(item.result.catalog_state.row[header],'','Blank pass-through values remain blank despite model changes');
+    assert.equal(item.result.catalog_state.row.attributes__lulu_product_type,item.sku==='cat-a'?' 000Legacy Hub ':'','Renamed product types preserve legacy values and blanks despite model changes');
+    assert.ok(item.result.catalog_state.warnings.some((warning:string)=>warning.includes('attributes__color')));
+    assert.equal(item.result.qa_result,undefined);
+  }
+  await saveCatalogRules(catalogRules,catalogHeaders);
+  const skippedCatalog=await startCatalog();assert.ok(skippedCatalog.body.items.every((item:any)=>item.status==='skipped'));
+  const skippedCalls=calls;stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(skippedCatalog.body.id)).status==='completed','catalog completed-row reuse');
+  await stopWorker();stopWorker=undefined;assert.equal(calls,skippedCalls);
+  assert.equal((await pool.query("SELECT tokens_used FROM jobs WHERE id='catalog-job'")).rows[0].tokens_used.total_tokens,30,'Skipped results are not charged again');
+  await pool.query("UPDATE job_run_items SET result=jsonb_set(result,'{catalog_state,row,attributes__brand}',$2::jsonb) WHERE run_id=$1 AND sku='cat-a'",
+    [skippedCatalog.body.id,JSON.stringify('Legacy generated brand')]);
+  const legacyPassThrough=await startCatalog();assert.deepEqual(legacyPassThrough.body.items.map((item:any)=>item.status),['queued','skipped'],'Older rows that changed pass-through values must be regenerated');
+  providerMode='success';stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(legacyPassThrough.body.id)).status==='completed','catalog legacy pass-through correction');
+  await stopWorker();stopWorker=undefined;
+  await saveCatalogRules(catalogRules,[...catalogHeaders].reverse());
+  const reorderedCatalog=await startCatalog();assert.ok(reorderedCatalog.body.items.every((item:any)=>item.status==='queued'),'Header-only changes invalidate completed result reuse');
+  providerMode='success';stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(reorderedCatalog.body.id)).status==='completed','catalog reordered header generation');
+  await stopWorker();stopWorker=undefined;
+  assert.deepEqual((await catalogRun(reorderedCatalog.body.id)).catalogHeaders,[...catalogHeaders].reverse());
+  assert.deepEqual((await catalogRun(firstCatalog.body.id)).catalogHeaders,catalogHeaders,'Historical exports retain original header order');
+  await saveCatalogRules(catalogRules,catalogHeaders);
+  providerMode='catalog-mixed';const mixedCatalog=await startCatalog('all');stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(mixedCatalog.body.id)).status==='failed','catalog invalid response');
+  await stopWorker();stopWorker=undefined;
+  assert.equal((await catalogRun(mixedCatalog.body.id)).items[1].result.catalog_state.status,'failed');
+  assert.equal((await catalogRun(mixedCatalog.body.id)).items[1].result.catalog_state.tokensUsed.total_tokens,15,'Invalid generated answers still record provider usage');
+  const resumeCatalog=await startCatalog();assert.deepEqual(resumeCatalog.body.items.map((item:any)=>item.status),['skipped','queued']);
+  providerMode='success';stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(resumeCatalog.body.id)).status==='completed','catalog failed-row retry');
+  await stopWorker();stopWorker=undefined;
+
+  // New catalog jobs cannot reuse another job's mirror. Cancellation keeps committed rows.
+  assert.equal((await request('/api/jobs','POST',{...catalogJob,id:'catalog-other'},user)).status,201);
+  const freshCatalog=await startCatalog('unfinished',undefined,'catalog-other');
+  assert.ok(freshCatalog.body.items.every((item:any)=>item.status==='queued'));
+  providerMode='success';stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(freshCatalog.body.id)).status==='completed','independent catalog job execution');
+  await stopWorker();stopWorker=undefined;
+  const otherCatalog=await startCatalog('all',undefined,'catalog-other');
+  providerMode='wait';stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>{
+    const detail=await catalogRun(otherCatalog.body.id);
+    return detail.items[0].status==='completed' && detail.items[1].attempts===1;
+  },'catalog partial completion before cancellation');
+  assert.equal((await request(`/api/job-runs/${otherCatalog.body.id}/cancel`,'POST',{},user)).status,200);
+  await waitFor(async()=>(await catalogRun(otherCatalog.body.id)).status==='cancelled','catalog cancellation');
+  await stopWorker();stopWorker=undefined;
+  assert.equal((await catalogRun(otherCatalog.body.id)).items[0].result.catalog_state.status,'completed');
+  const afterCancel=await startCatalog('unfinished',undefined,'catalog-other');
+  assert.deepEqual(afterCancel.body.items.map((item:any)=>item.status),['skipped','queued']);
+  providerMode='success';stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(afterCancel.body.id)).status==='completed','catalog resume after cancellation');
+  await stopWorker();stopWorker=undefined;
+
+  // New evidence fences the live mirror while preserving the old run's export.
+  providerMode='wait';const driftCatalog=await startCatalog('single','cat-a');const driftOffset=providerRequests.length;
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>providerRequests.length>driftOffset,'catalog in-flight evidence edit');
+  await edit('cat-a',{source:{sap:'Brand: TestBrand; updated product facts'}});
+  await waitFor(async()=>(await catalogRun(driftCatalog.body.id)).status==='completed','catalog historical result save');
+  await stopWorker();stopWorker=undefined;
+  assert.equal((await request('/api/catalog','GET',undefined,user)).body.find((item:any)=>item.sku==='cat-a').catalog_state,null);
+  assert.equal((await catalogRun(driftCatalog.body.id)).items[0].result.catalog_state.revision,0);
+  await saveCatalogRules(catalogRules.replace('USB Hub','Changed Mapping Example'));
+  const changedMapping=await startCatalog();assert.ok(changedMapping.body.items.every((item:any)=>item.status==='queued'),'Changed mappings invalidate reuse');
+  providerMode='success';stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(changedMapping.body.id)).status==='completed','catalog changed mapping regeneration');
+  await stopWorker();stopWorker=undefined;
+  await saveCatalogRules('');
+  assert.equal((await startCatalog()).status,400,'Existing catalog jobs require nonempty mapping rules at every run');
+  await saveCatalogRules(catalogRules,[]);
+  assert.equal((await startCatalog()).status,400,'Existing catalog jobs require configured output headers at every run');
+  for(const id of ['catalog-job','catalog-other']) assert.equal((await request(`/api/jobs/${id}`,'DELETE',undefined,admin)).status,200);
+
   await initializeDatabase(pool); // Existing populated records remain readable after restart migrations.
   // Clear remains all-or-nothing even if catalog deletion fails after deleting jobs.
   await pool.query("CREATE FUNCTION fail_clear() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected clear failure'; END $$; CREATE TRIGGER fail_clear BEFORE DELETE ON sku_data FOR EACH ROW EXECUTE FUNCTION fail_clear()");
@@ -485,7 +633,7 @@ try {
   await initializeDatabase(pool);await verifySchema(pool);
   assert.equal((await pool.query('SELECT * FROM site_selectors')).rowCount,2);
   assert.equal((await pool.query("SELECT website FROM site_selectors WHERE id='one'")).rows[0].website,'Example.com');
-  console.log('Security/database checks passed: sessions, roles, atomic saves, recovery, ownership, cancellation, budgets, model snapshots, retrieval, and preserved legacy data.');
+  console.log('Security/database checks passed: sessions, roles, atomic saves, recovery, ownership, cancellation, budgets, model snapshots, retrieval, catalog generation/resume/isolation, and preserved legacy data.');
 } finally {
   await stopWorker?.();await stopSecond?.();server.closeAllConnections();provider.closeAllConnections();
   await Promise.all([new Promise<void>(resolve=>server.close(()=>resolve())),new Promise<void>(resolve=>provider.close(()=>resolve()))]);

@@ -126,6 +126,7 @@ export function prepareQaInput(sku: SkuData, attributeSets: AttributeSet[], memo
   const template = Object.fromEntries((headers.length ? headers : Object.keys(row))
     .filter(header => !/^(source__|qa_|corrected:|error \d+$)/i.test(header.trim()) &&
       !/^(sap|url|attribute[ _]set|job_error|export_data|last_job_id)$/i.test(header.trim()))
+    .filter(header => !['attributes__sap', 'attributes__url'].includes(header))
     .map(header => [header, row[header] ?? ""]));
 
   return {

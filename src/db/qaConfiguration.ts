@@ -4,6 +4,7 @@ import { and, eq, sql } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import { attributeSets, qaAgentSettings } from "./schema";
 import { DEFAULT_QA_AGENT_MEMORY } from "../lib/qaAgent";
+import { migrateCatalogProductTypeHeader, parseCatalogHeaders, validateCatalogHeaders } from "../lib/catalogGeneration";
 
 const DEFAULT_SETS = [
   "TestSet", "WarrantySet", "Grocery Single Pack", "Grocery Multi Pack", "H&L-C&D-Cookware",
@@ -64,6 +65,21 @@ export async function initializeQaConfiguration(db: NodePgDatabase<typeof import
       id TEXT PRIMARY KEY, name TEXT NOT NULL, rules_markdown TEXT NOT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(), updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )`);
+    await tx.execute(sql`ALTER TABLE attribute_sets ADD COLUMN IF NOT EXISTS catalog_headers JSONB`);
+    const legacy = await tx.execute(sql`SELECT id,rules_markdown,catalog_headers FROM attribute_sets
+      WHERE catalog_headers IS NULL OR (jsonb_typeof(catalog_headers)='array' AND catalog_headers ? 'attributes__product_type') FOR UPDATE`);
+    for (const set of legacy.rows) {
+      let headers: string[] = [];
+      if (set.catalog_headers === null) {
+        try { headers = parseCatalogHeaders(String(set.rules_markdown)); }
+        catch { /* Incompatible legacy lists need explicit output-header setup. */ }
+      } else {
+        headers = migrateCatalogProductTypeHeader(set.catalog_headers as string[]);
+      }
+      await tx.execute(sql`UPDATE attribute_sets SET catalog_headers=${JSON.stringify(headers)}::jsonb WHERE id=${set.id}`);
+    }
+    await tx.execute(sql`ALTER TABLE attribute_sets ALTER COLUMN catalog_headers SET DEFAULT '[]'::jsonb,
+      ALTER COLUMN catalog_headers SET NOT NULL`);
     await tx.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS attribute_sets_normalized_name_idx ON attribute_sets (lower(btrim(name)))`);
     const inserted = await tx.insert(qaAgentSettings).values({ id: "default", memory: DEFAULT_QA_AGENT_MEMORY })
       .onConflictDoNothing().returning();
@@ -137,9 +153,11 @@ export function registerQaConfigurationRoutes(app: Express, db: NodePgDatabase<t
   app.post("/api/attribute-sets", async (req, res) => {
     if (!db) return res.status(503).json({ error: "DB not connected" });
     if (!validSet(req.body)) return res.status(400).json({ error: "A name and text mapping rules are required" });
+    try { validateCatalogHeaders(req.body.catalogHeaders === undefined ? [] : req.body.catalogHeaders); }
+    catch (error) { return res.status(400).json({ error: (error as Error).message }); }
     try {
       const [saved] = await db.insert(attributeSets).values({
-        id: randomUUID(), name: req.body.name.trim(), rulesMarkdown: req.body.rulesMarkdown,
+        id: randomUUID(), name: req.body.name.trim(), rulesMarkdown: req.body.rulesMarkdown, catalogHeaders: req.body.catalogHeaders ?? [],
       }).onConflictDoNothing().returning();
       if (!saved) return res.status(409).json({ error: "An attribute set with this name already exists" });
       res.status(201).json(mapSet(saved));
@@ -151,9 +169,12 @@ export function registerQaConfigurationRoutes(app: Express, db: NodePgDatabase<t
   app.put("/api/attribute-sets/:id", async (req, res) => {
     if (!db) return res.status(503).json({ error: "DB not connected" });
     if (!validSet(req.body)) return res.status(400).json({ error: "A name and text mapping rules are required" });
+    try { validateCatalogHeaders(req.body.catalogHeaders === undefined ? [] : req.body.catalogHeaders); }
+    catch (error) { return res.status(400).json({ error: (error as Error).message }); }
     try {
       const [saved] = await db.update(attributeSets).set({
         name: req.body.name.trim(), rulesMarkdown: req.body.rulesMarkdown, updatedAt: new Date(),
+        ...(req.body.catalogHeaders !== undefined ? { catalogHeaders: req.body.catalogHeaders } : {}),
       }).where(eq(attributeSets.id, req.params.id)).returning();
       if (!saved) return res.status(404).json({ error: "Attribute set no longer exists. Reload the list." });
       res.json(mapSet(saved));

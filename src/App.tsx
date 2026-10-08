@@ -21,7 +21,7 @@ import { api } from './lib/api';
 type ModuleType = 'dashboard' | 'scraper' | 'attribute-sets' | 'jobs' | 'llm-settings' | 'users';
 
 function MainLayout() {
-  const { user, sessionLoading } = useAppContext();
+  const { user, sessionLoading, workspaceMode, setWorkspaceMode } = useAppContext();
   const [activeModule, setActiveModule] = useState<ModuleType>('dashboard');
   const [dbStatus, setDbStatus] = useState<'checking' | 'connected' | 'disconnected' | 'error'>('checking');
 
@@ -68,7 +68,7 @@ function MainLayout() {
 
   return (
     <div className="h-screen w-full bg-[#FDFCFB] flex flex-col font-sans text-[#1A1A1A] overflow-hidden">
-      <nav className="h-20 border-b border-[#E5E2DE] px-8 sm:px-10 flex items-center justify-between shrink-0 bg-white">
+      <nav className="relative z-[60] h-20 border-b border-[#E5E2DE] px-8 sm:px-10 flex items-center justify-between shrink-0 bg-white">
         <div className="flex flex-col justify-center">
           <span className="font-serif italic text-2xl tracking-tight leading-none">Project 22</span>
           <div className="flex items-center gap-1.5 mt-1">
@@ -107,6 +107,13 @@ function MainLayout() {
           
           <div className="w-[1px] h-6 bg-[#E5E2DE]"></div>
           
+          <div role="group" aria-label="Workspace mode" className="flex rounded-sm border border-[#E5E2DE] p-1 bg-[#F5F2EF]">
+            {(['qa', 'catalog'] as const).map(mode => <button key={mode} aria-pressed={workspaceMode === mode}
+              onClick={() => setWorkspaceMode(mode)}
+              className={cn('px-3 py-1.5 text-[11px] uppercase tracking-wider rounded-sm', workspaceMode === mode ? 'bg-[#1A1A1A] text-white' : 'text-[#8C8882] hover:text-[#1A1A1A]')}>
+              {mode === 'qa' ? 'QA' : 'Catalog'}
+            </button>)}
+          </div>
           <NotificationsMenu />
           <UserNav />
         </div>

@@ -5,6 +5,7 @@ import type { Pool } from 'pg';
 import { ApiError, mapCatalogRow, registerCatalogRoutes, validateCatalogImport } from './catalog';
 import { hasCompletedQa, LEGACY_REVIEW_ERROR, selectJobSkus, unreviewedRunSnapshot } from '../lib/jobRunState';
 import type { SkuData } from '../hooks/useCatalogData';
+import { CATALOG_INPUT_HEADERS, missingCatalogInputHeaders } from '../lib/catalogGeneration';
 
 const product = {
   sku: 'product', source: { sap: 'Brand: Original' }, status: 'ready',
@@ -13,6 +14,23 @@ const product = {
 const review = { qa_status: 'pass', issues: [] };
 const message = 'raw_row.qa_result is reserved for server-generated QA; remove it before importing.';
 validateCatalogImport([product]);
+validateCatalogImport([product], 'qa');
+assert.deepEqual(CATALOG_INPUT_HEADERS, [
+  'sku', 'base_code', 'attributes__lulu_ean', 'attributes__shipping_weight', 'attributes__brand',
+  'attributes__sap', 'attributes__url', 'attribute__shipping_attribute',
+  'attribute__shipment_type', 'attribute__common_item_whippy', 'attribute__fallback',
+  'attributes__region', 'attributes__attribute_set', 'attributes__lulu_product_type',
+]);
+assert.deepEqual(missingCatalogInputHeaders([...[...CATALOG_INPUT_HEADERS].reverse(), 'extra']), []);
+const catalogProduct = { ...product, raw_row: { ...Object.fromEntries(CATALOG_INPUT_HEADERS.map(header => [header, ''])), sku: 'product', extra: '00001' } };
+validateCatalogImport([catalogProduct], 'catalog');
+const obsoleteProductType = { ...catalogProduct, raw_row: { ...catalogProduct.raw_row, attributes__product_type: 'Accessory' } };
+delete (obsoleteProductType.raw_row as Record<string, unknown>).attributes__lulu_product_type;
+assert.throws(() => validateCatalogImport([obsoleteProductType], 'catalog'), /attributes__lulu_product_type/);
+assert.throws(() => validateCatalogImport([{ ...catalogProduct, sku: 'another-product' }], 'catalog'), /must match/);
+assert.deepEqual(missingCatalogInputHeaders(CATALOG_INPUT_HEADERS.map(header => header === 'attributes__sap' ? 'source__sap' : header === 'attributes__url' ? 'source__url' : header === 'attributes__attribute_set' ? 'source__attribute_set' : header)), ['attributes__sap', 'attributes__url', 'attributes__attribute_set']);
+for (const invalidMode of ['invalid', null, ['catalog']]) assert.throws(() => validateCatalogImport([product], invalidMode), { status: 400 });
+assert.deepEqual(missingCatalogInputHeaders(CATALOG_INPUT_HEADERS.map(header => header === 'attributes__brand' ? 'attributes__Brand' : header)), ['attributes__brand']);
 assert.throws(() => validateCatalogImport([{ ...product, raw_row: { ...product.raw_row, qa_result: undefined } }]), { status: 400, message });
 
 let connections = 0;
@@ -25,9 +43,13 @@ const server = createServer(app);
 await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
 try {
   const address = server.address() as { port: number };
-  const post = (items: unknown[]) => fetch(`http://127.0.0.1:${address.port}/api/catalog`, {
+  const post = (items: unknown[], mode?: string) => fetch(`http://127.0.0.1:${address.port}/api/catalog${mode ? `?mode=${mode}` : ''}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(items),
   });
+  const obsoleteResponse = await post([catalogProduct, obsoleteProductType], 'catalog');
+  assert.equal(obsoleteResponse.status, 400);
+  assert.match((await obsoleteResponse.json()).error, /attributes__lulu_product_type/);
+  assert.equal(connections, 0, 'Obsolete headers reject the entire batch before a transaction');
   for (const qa_result of [null, '', 'completed', 0, false, review]) {
     const forged = { ...product, raw_row: { ...product.raw_row, qa_result } };
     for (const batch of [[forged], [product, forged]]) {
@@ -42,6 +64,18 @@ try {
   for (const status of ['completed', 'failed', 'running']) {
     assert.equal((await post([{ ...product, status }])).status, 400);
   }
+  for (const header of CATALOG_INPUT_HEADERS) {
+    const raw_row: Record<string, unknown> = { ...catalogProduct.raw_row };
+    delete raw_row[header];
+    const invalid = { ...catalogProduct, raw_row, source: { ...product.source, headerOrder: [...CATALOG_INPUT_HEADERS] } };
+    assert.deepEqual(missingCatalogInputHeaders(Object.keys(raw_row)), [header]);
+    for (const batch of [[invalid], [catalogProduct, invalid]]) {
+      const response = await post(batch, 'catalog');
+      assert.equal(response.status, 400);
+      assert.deepEqual(await response.json(), { error: `Catalog upload is missing required headers: ${header}. Header names are case-sensitive.` });
+    }
+  }
+  assert.equal((await post([catalogProduct], 'invalid')).status, 400);
   assert.equal(connections, 0, 'Whole-batch validation happens before any database access');
 } finally {
   server.closeAllConnections();
@@ -86,4 +120,4 @@ assert.equal(stale.qa_stale, true);
 assert.equal(stale.qa_result, null);assert.equal(stale.export_data, null);assert.equal(stale.tokensUsed, null);
 assert.equal(stale.status, 'ready');assert.equal(hasCompletedQa(stale), false);
 assert.deepEqual(prior.qa_result, review, 'Stale stored reviews are retained without being exported as current');
-console.log('Catalog trust checks passed: HTTP rejection, batch validation, canonical results, and unverified history.');
+console.log('Catalog trust checks passed: mandatory upload headers, mode validation, HTTP rejection, batch validation, canonical results, and unverified history.');

@@ -38,7 +38,7 @@ export const unprocessedStatus = (sku: Pick<SkuData, "source" | "scraped_markdow
 
 /** Run snapshots contain evidence, never an authoritative review. */
 export function unreviewedRunSnapshot(snapshot: SkuData, markUnverified = true): SkuData {
-  const { qa_result, export_data, tokensUsed, timeTaken, last_job_id, ...evidence } = snapshot;
+  const { qa_result, export_data, tokensUsed, timeTaken, last_job_id, catalog_state, ...evidence } = snapshot;
   const unverified = Boolean(qa_result || export_data) || Object.hasOwn(snapshot.raw_row || {}, "qa_result") || snapshot.status === "completed";
   return {
     ...evidence, raw_row: withoutRawQaResult(snapshot.raw_row || {}),

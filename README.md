@@ -1,6 +1,6 @@
 # Paxth Q.A. Engine
 
-Paxth Q.A. Engine helps catalog editors review ecommerce product spreadsheets against supplied SAP information, product-page evidence, and category-specific rules. The interface calls the application **Project 22**.
+Paxth Q.A. Engine helps catalog editors review ecommerce product spreadsheets and create catalog upload files using supplied SAP information, product-page evidence, and category-specific rules. The interface calls the application **Project 22**.
 
 Upload a spreadsheet, prepare the evidence, create a job, run the review, and export an Excel workbook with findings and suggested corrections. A language model produces the review; a person should verify its findings before changing the product catalog.
 
@@ -13,6 +13,7 @@ Upload a spreadsheet, prepare the evidence, create a job, run the review, and ex
 - [Local setup](#local-setup)
 - [Configuration](#configuration)
 - [Your first review](#your-first-review)
+- [Creating a catalog](#creating-a-catalog)
 - [Spreadsheet format](#spreadsheet-format)
 - [Mapping rules and shared instructions](#mapping-rules-and-shared-instructions)
 - [Browser retrieval](#browser-retrieval)
@@ -187,7 +188,7 @@ Production cookies are Secure, so a production browser session needs HTTPS. An H
 
 ### Shared QA settings
 
-Admins edit these in **LLM Settings**. They persist in PostgreSQL and apply to new runs.
+Admins edit these in **LLM Settings**. They persist in PostgreSQL and apply to new runs. Catalog generation shares the model, temperature, token limit, and evidence limit; QA instructions apply only to QA.
 
 | Setting | Fresh-install default | Accepted range/behavior |
 | --- | --- | --- |
@@ -214,6 +215,31 @@ The exact default model receives `reasoning_effort: "low"`. Existing saved setti
 9. Verify the replacements before applying them to the source catalog.
 
 A URL can make an imported SKU appear `ready` before evidence is collected. That label alone does not prove the SKU has enough information for QA.
+
+## Creating a catalog
+
+Use the **QA / Catalog** toggle beside Notifications. A fresh page load defaults to QA. Both modes share uploaded SKUs, evidence, category rules, and model settings; each mode shows its own jobs, counters, filters, and results. Switching modes does not cancel accepted server runs.
+
+1. In **Attribute Sets**, select a category. Use **Mapping Rules** for the shared Markdown instructions/examples, and **Catalog Output Headers** for one exact output column per line in export order. Save both together. Output headers apply only to Catalog; QA continues using its original uploaded template.
+2. Switch to **Catalog**. Beside **Upload New File**, choose **Download Input Template** for `Catalog_Input_Template.xlsx`: one **Catalog Input** worksheet with the 14 required headers, text-formatted columns, and no sample products. Fill rows below the headers, then upload the file. The download is available before any SKUs or attribute sets are configured; its fixed input headers are separate from each attribute set's output headers. You can also upload a `.xlsx`, `.xls`, or `.csv` file containing every required input header, with these exact case-sensitive names:
+
+   ```text
+   sku,base_code,attributes__lulu_ean,attributes__shipping_weight,attributes__brand,attributes__sap,attributes__url,attribute__shipping_attribute,attribute__shipment_type,attribute__common_item_whippy,attribute__fallback,attributes__region,attributes__attribute_set,attributes__lulu_product_type
+   ```
+
+   Missing headers reject the whole upload and list the missing names. Input columns may appear in any order, and extra columns are allowed. Headers are mandatory; individual cells may be blank subject to the existing SKU/evidence requirements. `attributes__attribute_set` selects the category mapping, `attributes__sap` supplies factual context, and `attributes__url` supplies the scraper URL. Older `source__*` columns cannot substitute for or override these columns in Catalog mode. QA uploads retain their existing format. API clients use `POST /api/catalog?mode=catalog` for this validation; omitted mode defaults to QA.
+
+3. Select SKUs sharing one non-empty attribute set, then choose **Create Catalog Job**. Every SKU needs SAP, usable saved page evidence, or a URL. Invalid/missing catalog mappings block job creation and execution with an error.
+4. In **Jobs**, choose **Run Catalog**. The server builds the separately configured output template. SKU, base code, EAN, shipping weight, brand, and product type pass through unchanged, including blank cells. Other empty cells are generated using SAP/page evidence and explicit mapping defaults. SAP takes factual precedence; mapping examples are formatting guidance, not product facts.
+5. Inspect generated cells and warnings in **View Results**, then export the final `.xlsx` upload file. Unknown facts remain blank with warnings; malformed or incomplete model responses fail that SKU. Exports include only validated rows, report omitted unfinished/failed SKUs, and contain exactly the mapped columns without QA or warning columns.
+
+Catalog imports retain displayed Excel text and CSV identifiers, including leading zeroes and the exact capitalization of attribute names. Keep identifiers as text in source files: formatting or precision already lost in a numeric spreadsheet cell cannot be reconstructed.
+
+The four `attribute__` shipping columns and `attributes__region` are retained unchanged for a future shipping-profile export. That separate exporter is not implemented yet.
+
+Generated content never replaces the original upload or becomes QA input automatically. Catalog results live separately in `catalog_state` and durable run history. Shared evidence edits/scrapes still advance the evidence revision and invalidate older current results. Historical exports remain available without another model call.
+
+Catalog unfinished runs reuse completed results from the same job only when the evidence revision, mapping rules, and ordered output headers still match. Header-only changes require regeneration. New catalog jobs generate their own results. Cancellation preserves committed rows; resume retries unfinished/failed rows. Combined exports require the same attribute set and exact saved header order, and deduplicate SKUs in selected-job order.
 
 ## Spreadsheet format
 
@@ -259,6 +285,8 @@ raw_row.qa_result is reserved for server-generated QA; remove it before importin
 
 Top-level QA results, export metadata, token usage, and last-job metadata are also rejected. Imports may use only unprocessed states (`pending`, `ready`, `cannot_qa`). The server validates every row before opening the write transaction.
 
+`catalog_state` is also reserved for server-generated catalog results. Imports reject it both at the top level and in the original raw row; generated content cannot impersonate a completed catalog execution.
+
 ## Mapping rules and shared instructions
 
 An attribute set stores a category name and Markdown rules. Define exact column names, required/optional values, accepted formats/units, missing-evidence handling, source conflicts, severity, and when a complete correction is supported.
@@ -290,6 +318,39 @@ Shared QA instructions provide standing guidance. Category rules take precedence
 Missing, blank, or ambiguous rules produce a general review with a warning. New runs snapshot configuration; editing rules does not retroactively change a running review or old result.
 
 Legacy **Import browser rules** fills missing/blank shared rules without overwriting nonblank ones. Browser-owned accounts and provider credentials are retired and discarded.
+
+### Catalog output headers and shared mapping rules
+
+Use **Catalog Output Headers** to list one exact output column per line. Names must be unique and non-empty, without surrounding whitespace or control characters. The list must include all six pass-through columns shown below, in any order. Add further output columns as needed; their listed order is the export order. An empty list is allowed for QA-only sets, but blocks Catalog job creation and execution. The fixed 14-column import contract above is independent of this output list.
+
+```text
+sku
+base_code
+attributes__lulu_ean
+attributes__shipping_weight
+attributes__brand
+attributes__lulu_product_type
+name
+attributes__product_description
+attributes__color
+```
+
+Use **Mapping Rules** for the Markdown shared by QA and Catalog. A header section is not required. Example instructions:
+
+```markdown
+# Example USB Hub Catalog
+
+## Cell rules
+
+- The six pass-through values always remain unchanged, including blanks.
+- `name`: use source-supported brand and model. Example format: `ExampleBrand Model X USB Hub`.
+- `attributes__product_description`: write a readable paragraph using only verified features. Example format: `This USB hub provides [verified port layout] for [verified compatible devices].`
+- `attributes__color`: use only the source-supported color for this SKU; leave blank if unknown. Example format: `Black`.
+```
+
+This is a format example, not an approved production template. Add all required business columns and their filling instructions before running catalog jobs. On upgrade, compatible legacy Markdown header lists are copied once into the separate stored list; incompatible lists leave it empty for manual setup. Markdown and saved runs are preserved, and clearing headers later does not repopulate them. Legacy browser-rule imports never replace separately configured output headers. Catalog generation uses a dedicated application prompt; shared QA agent memory remains specific to QA.
+
+`attributes__lulu_product_type` is the mandatory product-type header for Catalog uploads, downloaded input templates, and output-header lists. Older `attributes__product_type` headers cannot substitute in new Catalog uploads and must be removed from newly saved output lists. Startup renames that header in existing saved output lists, preserving order; if both names exist, the canonical header keeps its position. Earlier SKU uploads retain their original rows, and Catalog carries their old product-type value into the renamed column when no canonical value exists. Admitted runs and historical exports retain their saved header snapshots; rerun to generate output with the new header.
 
 ## Browser retrieval
 
@@ -426,11 +487,11 @@ Login throttling is process-local: 10 attempts per socket-address/username key a
 
 | Table/data | Purpose |
 | --- | --- |
-| `sku_data` | Upload, original row, evidence/provenance/error, revision, QA revision and latest result |
-| `jobs` | Definitions, JSON SKU membership, aggregate totals |
+| `sku_data` | Upload, original row, evidence/provenance/error, revision, QA revision/result, and independent `catalog_state` |
+| `jobs` | Definitions, QA/catalog job type, JSON SKU membership, aggregate totals |
 | `job_runs` | Execution history, actor, idempotency key, configuration snapshot |
 | `job_run_items` | Per-SKU snapshot, attempts, scrape checkpoint, historical result |
-| `attribute_sets` | Category names and Markdown rules |
+| `attribute_sets` | Category names, shared Markdown rules, and ordered Catalog output headers |
 | `qa_agent_settings` | Shared instructions |
 | `provider_settings` | Editable QA settings, excluding credentials |
 | `users` | Accounts, password hashes, retired scraper credential/control columns |
@@ -484,15 +545,15 @@ Except `/healthz` and login, these routes require an application session. Login 
 | `/api/catalog` | GET, POST, DELETE | Full list; import array; delete `{ skus }` or `{ all: true }` |
 | `/api/catalog/:sku` | PUT | Edit evidence with `expectedRevision`; QA fields are server-controlled |
 | `/api/data` | DELETE | Admin clear jobs/catalog |
-| `/api/jobs` | GET, POST, DELETE | Full list; create one/array; delete `{ ids }` or `{ all: true }` |
-| `/api/jobs/:id` | PUT, DELETE | Edit name/SKUs/category while idle; admin deletion |
+| `/api/jobs` | GET, POST, DELETE | Full list with `jobType`; create one/array with optional `jobType: "qa" \| "catalog"` (default `qa`); delete `{ ids }` or `{ all: true }` |
+| `/api/jobs/:id` | PUT, DELETE | Edit name/SKUs/category while idle; job type is immutable; admin deletion |
 | `/api/jobs/:id/runs` | GET, POST | History; queue `{ requestId, mode, sku? }` |
 | `/api/job-runs/:id` | GET | Metadata and all item snapshots/results |
 | `/api/job-runs/:id/cancel` | POST | Creator/admin cancellation |
-| `/api/qa-configuration` | GET | Consistent snapshot of memory/rules |
+| `/api/qa-configuration` | GET | Consistent snapshot of memory/rules and attribute-set `catalogHeaders` |
 | `/api/qa-agent-memory` | PUT | Admin `{ qaAgentMemory }` |
-| `/api/attribute-sets` | POST | Admin `{ name, rulesMarkdown }` |
-| `/api/attribute-sets/:id` | PUT, DELETE | Admin rule changes/removal |
+| `/api/attribute-sets` | POST | Admin `{ name, rulesMarkdown, catalogHeaders? }`; omitted headers default to `[]` |
+| `/api/attribute-sets/:id` | PUT, DELETE | Admin rule/header changes or removal; omitted headers on update preserve the saved list |
 | `/api/attribute-sets/import` | POST | Admin rule array; preserve nonblank existing rules |
 | `/api/provider-settings` | GET, PUT | Shared editable settings; admin write |
 | `/api/chat` | POST | Admin test; optional `modelName`, `purpose` |
@@ -567,6 +628,8 @@ The historically named browser script also checks QA settings, SKU-connected Mar
 | `npm run test:auth` | Origin/auth boundaries |
 | `npm run test:provider` | Provider admission/retries |
 | `npm run test:catalog` | Import trust boundary and canonical result/history projections |
+| `npm run test:catalog-generation` | Catalog headers, copied cells, model validation, independent results, and exact workbook exports |
+| `npm run test:catalog-browser` | QA/Catalog switch, text-preserving CSV/XLSX imports, job controls, warnings, and upload exports |
 | `npm run test:job-state` | Job state and Excel feedback |
 | `npm run test:job-runner` | Transaction retries/rollback |
 | `npm run test:llm-response` | Parsing/output budgets |
