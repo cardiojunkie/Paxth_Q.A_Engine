@@ -79,8 +79,17 @@ try {
   assert.ok(!('scrapperModelName' in persisted));assert.ok(!('navigationModelInitialized' in persisted));
   const legacy = (await root.query(`SELECT scrapegraph_api_key,scrapegraph_settings FROM ${namespace}.users`)).rows[0];
   assert.equal(legacy.scrapegraph_api_key, 'retired-only');assert.deepEqual(legacy.scrapegraph_settings,{retired:true});
-  await request('/api/catalog','POST',[{sku:'smoke',attribute_set:'Smoke',source:{sap:'Brand: TestBrand'},raw_row:{sku:'smoke',attributes__brand:'TestBrand'},upload_attributes:{brand:'TestBrand'},status:'ready'}]);
   const scrapeUrl = process.env.SCRAPER_TEST_URL || 'https://example.com/';
+  await request('/api/scrape/preview','POST',{url:scrapeUrl},false,401);
+  const previewCounts=()=>root.query(`SELECT (SELECT count(*) FROM ${namespace}.sku_data) AS catalog,
+    (SELECT count(*) FROM ${namespace}.jobs) AS jobs, (SELECT count(*) FROM ${namespace}.job_runs) AS runs`);
+  const beforePreview=(await previewCounts()).rows;
+  const preview=(await request('/api/scrape/preview','POST',{url:scrapeUrl})).data;
+  assert.equal(preview.status,'collected');assert.ok(preview.markdown.length>50);
+  assert.equal(preview.requestedUrl,scrapeUrl);assert.ok(preview.finalUrl);assert.ok(preview.capturedAt);
+  assert.equal(preview.report.characters,preview.markdown.length);
+  assert.deepEqual((await previewCounts()).rows,beforePreview,'Standalone URL retrieval writes no catalog, jobs or runs');
+  await request('/api/catalog','POST',[{sku:'smoke',attribute_set:'Smoke',source:{sap:'Brand: TestBrand'},raw_row:{sku:'smoke',attributes__brand:'TestBrand'},upload_attributes:{brand:'TestBrand'},status:'ready'}]);
   const imported = await request('/api/catalog','POST',[{sku:'scrape-smoke',attribute_set:'Smoke',source:{url:scrapeUrl},raw_row:{sku:'scrape-smoke'},upload_attributes:{},status:'ready'}]);
   const revision = imported.data.inserted[0].revision;
   await request('/api/catalog','POST',[{sku:'url-job-smoke',attribute_set:'Smoke',source:{url:scrapeUrl},raw_row:{sku:'url-job-smoke'},upload_attributes:{},status:'ready'}]);
@@ -120,7 +129,7 @@ try {
     console.log('Production-container smoke passed with one CPU / 1536 MiB: migration preservation, SKU evidence persistence/revisions, QA, login and readiness.');
   } else {
     assert.ok(peakKiB < 1536*1024, `Observed process RSS ${peakKiB/1024} MiB exceeds the deployment limit`);
-    console.log(`Production-bundle smoke passed: migration preservation, SKU evidence persistence/revisions, concurrent QA and login, ${Date.now()-started} ms, peak process RSS ${(peakKiB/1024).toFixed(1)} MiB. PostgreSQL and an external DISPLAY server are excluded.`);
+    console.log(`Production-bundle smoke passed: standalone URL preview without catalog writes, migration preservation, SKU evidence persistence/revisions, concurrent QA and login, ${Date.now()-started} ms, peak process RSS ${(peakKiB/1024).toFixed(1)} MiB. PostgreSQL and an external DISPLAY server are excluded.`);
   }
 } finally {
   clearInterval(meter);

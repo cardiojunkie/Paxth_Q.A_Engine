@@ -32,7 +32,7 @@ Upload a spreadsheet, prepare the evidence, create a job, run the review, and ex
 | Screen | Purpose | Access |
 | --- | --- | --- |
 | Dashboard | Import spreadsheets; search/select products; edit evidence; scrape URLs; create jobs; export a summary | Signed-in users; deletions require admin |
-| Scraper | Select a SKU; scrape its saved URL; save and preview evidence; cancel retrieval | Signed-in users |
+| Scraper | Test any public URL without a SKU; inspect/copy/download temporary results and diagnostics; save collected evidence to a selected SKU; cancel retrieval | Signed-in users |
 | Attribute Sets | Read category rules; create, edit, delete, or import rules | Shared reading; changes require admin |
 | Jobs | Queue reviews; follow progress; cancel eligible runs; inspect history; export detailed findings | Signed-in users; deletion requires admin |
 | LLM Settings | Configure the shared model, limits, temperature, and instructions; test model connectivity | Admin |
@@ -297,9 +297,11 @@ Retrieval uses one local Python worker and Chromium session per URL. **CloakBrow
 
 Install Python/system dependencies and run `npm run setup:scraper` before native development or deployment. Docker installs them during its build. See [worker setup and verification](docs/browser-scraper.md).
 
-Use Dashboard's **Scrape URLs**, or select an existing SKU in **Scraper**. Both save evidence against that SKU through `POST /api/catalog/:sku/scrape` with `{expectedRevision}`; the server obtains the URL from the saved row. Success means the database commit completed. Source URL edits are saved before scraping. A newer edit, competing scrape, or deletion rejects a stale save. Bulk progress distinguishes saved, failed, conflicted, and skipped SKUs and supports cancellation.
+The Scraper screen defaults to **Test URL** and works with an empty catalog. Enter a public URL to inspect rendered content, raw Markdown, duration, characters, interactions, unresolved controls, and warnings. Copy Markdown or download Markdown/JSON. Results are temporary, with no saved history. Authenticated `POST /api/scrape/preview` accepts only `{url}`, writes no catalog/job records, and makes no model calls. It returns collected/partial Markdown, requested/final URLs, capture time, and diagnostics; hard failures return sanitized errors/codes and available diagnostics without Markdown.
 
-Saved provenance records browser/manual/legacy evidence, requested/final URLs where known, and capture time. Failed attempts preserve prior evidence and set a separate scrape error. Manual Markdown works without a URL. Browser evidence from an older source URL remains viewable but is excluded from QA. Existing evidence/history and retired database data are preserved; URL-only retrieval, AI navigation, and personal scraper settings are retired.
+Use Dashboard's **Scrape URLs**, or select an existing SKU in Scraper's **Save to SKU** mode, to save evidence through `POST /api/catalog/:sku/scrape` with `{expectedRevision}`; the server obtains the URL from the saved row. Success means the database commit completed. Source URL edits are saved before scraping. A newer edit, competing scrape, or deletion rejects a stale save. Bulk progress distinguishes saved, failed, conflicted, and skipped SKUs and supports cancellation.
+
+Saved provenance records browser/manual/legacy evidence, requested/final URLs where known, and capture time. Failed or partial attempts preserve prior evidence and set a separate scrape error; partial captures stay out of automatic SKU QA. Manual Markdown works without a URL. Browser evidence from an older source URL remains viewable but is excluded from QA. Existing evidence/history and retired database data are preserved; the old `/api/scrape` endpoint, AI navigation, and personal scraper settings are retired.
 
 | Retrieval limit | Value |
 | --- | --- |
@@ -310,7 +312,7 @@ Saved provenance records browser/manual/legacy evidence, requested/final URLs wh
 
 A DNS-pinning loopback egress proxy validates every connection, including redirects and subresources, and prevents private-network access and DNS rebinding. Service workers and WebSockets are blocked. Navigation and product/offer parameter changes, forms, purchases, and variant controls are restricted.
 
-Unrelated controls are ignored. Unsupported potentially relevant hidden panels or exhausted collection budgets return `INCOMPLETE_CONTENT`; remaining challenges return `PAGE_BLOCKED`. Public-page access still depends on the site and IP reputation. Use SAP/manual evidence when retrieval fails. Paid proxies, CAPTCHA services, and OCR are not included.
+Readiness checks wait for stable rendered content and relevant loading requests; dialog content is collected before background controls. Visible details outside `main` are retained. Unsupported relevant panels or exhausted collection budgets return a **Partial** preview and `INCOMPLETE_CONTENT` for SKU/QA callers. The UI also reports **Content collected**, **Blocked**, or **Failed**. Private-target failures discard text; blocked ancillary resources and frame/shadow-root limitations receive advisories. A page result does not certify an entire website as fully scrapeable. Public-page access still depends on the site and IP reputation. Use SAP/manual evidence when retrieval fails. Paid proxies, CAPTCHA services, and OCR are not included.
 
 ## Jobs, recovery, and cancellation
 
@@ -452,6 +454,7 @@ src/
   server/
     auth.ts                  Accounts, sessions, origin checks, permissions
     catalog.ts               Catalog and job-definition routes
+    scraper.ts               Temporary standalone URL preview route
     database.ts              Schema setup and shared write transactions
     provider.ts              QA dispatch, settings and connectivity routes
     jobRunner.ts             Durable runs and worker
@@ -494,6 +497,7 @@ Except `/healthz` and login, these routes require an application session. Login 
 | `/api/provider-settings` | GET, PUT | Shared editable settings; admin write |
 | `/api/chat` | POST | Admin test; optional `modelName`, `purpose` |
 | `/api/catalog/:sku/scrape` | POST | `{ expectedRevision }` → saved SKU row; server uses saved URL |
+| `/api/scrape/preview` | POST | `{ url }` → temporary collected/partial Markdown, URLs, capture time and diagnostics; no SKU required |
 
 `/api/chat` tests QA connectivity with optional `modelName` and `purpose: "qa"`. Navigation purposes, `/api/scrape`, and personal scraper-settings routes are retired.
 
@@ -567,10 +571,10 @@ The historically named browser script also checks QA settings, SKU-connected Mar
 | `npm run test:job-runner` | Transaction retries/rollback |
 | `npm run test:llm-response` | Parsing/output budgets |
 | `npm run test:qa-agent` | Settings and QA contracts |
-| `npm run test:scraper` | Worker protocol, queue, DNS proxy, cancellation and SKU request contracts |
+| `npm run test:scraper` | Worker protocol, queue, DNS proxy, cancellation, SKU requests and standalone preview/auth contracts |
 | `npm run test:scrape-worker` | Python selection, Markdown and deterministic interactions |
 | `npm run test:scrape-browser` | Real CloakBrowser/Scrapling/Markdownify fixtures |
-| `npm run test:scrape-production` | Production SKU persistence/revisions, URL-only QA, legacy migration, login and memory smoke |
+| `npm run test:scrape-production` | Production standalone URL previews, SKU persistence/revisions, URL-only QA, legacy migration, login and memory smoke |
 | `npm run test:security-db` | Disposable-database auth/jobs |
 | `npm run test:qa-config-db` | Disposable-database configuration |
 | `npm run test:sap-editor` | Mocked browser checks |
@@ -668,6 +672,8 @@ Use the runbook matching the actual host. Do not apply Docker commands to a nati
 8. Record the deployed commit and retain a compatible rollback release.
 
 For the QA integrity fix, reload browser clients after promotion so they use the new result readers. Before restoring normal access, confirm that a forged nested-QA import is rejected without partial saves, a normal import succeeds, an `unfinished` run selects an unverified legacy row, and a genuine saved review exports correctly. Keep the database backup and previous release. Legacy reruns require an explicit operator action; the release does not schedule them automatically.
+
+For URL testing, release the server and frontend assets together, then reload clients. This upgrade has no schema migration. Verify collected/partial previews with an empty catalog, diagnostics/downloads, cancellation, and a SKU partial failure that preserves prior evidence before checking saved evidence → QA → export.
 
 With the supplied Docker naming, retain the old image **before** rebuilding:
 

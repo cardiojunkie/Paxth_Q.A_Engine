@@ -3,11 +3,13 @@ import path from 'node:path';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { readFileSync } from 'node:fs';
-import { ScrapeError, startScrapeProxy, validateScrapeInput } from './scrapeNetwork';
+import { ScrapeError, startScrapeProxy, validateScrapeInput, type ScrapeReport } from './scrapeNetwork';
 export { ScrapeError, isPublicAddress, validateScrapeInput } from './scrapeNetwork';
+export type { ScrapeReport } from './scrapeNetwork';
 
 export const MAX_SCRAPE_CHARACTERS = 200_000;
 export type ScrapedPage = { markdown: string; requestedUrl: string; finalUrl: string };
+export type ScrapePreview = ScrapedPage & { status: 'collected' | 'partial'; capturedAt: string; report: ScrapeReport };
 let active = false;
 const waiting: Array<{ start: () => void }> = [];
 
@@ -56,6 +58,21 @@ const STARTUP_ERRORS: Record<string, string> = {
   DISPLAY_UNAVAILABLE: 'The browser cannot connect to DISPLAY. Unset DISPLAY to use Xvfb, or start the configured X server.',
   PYTHON_DEPENDENCIES_MISSING: 'Python worker packages are missing. Run npm run setup:scraper with the same SCRAPER_PYTHON used by the application.',
 };
+
+// The protocol may carry page-derived labels; expose only the bounded report fields.
+function workerReport(value: any): ScrapeReport {
+  const count = (number: unknown, maximum = Number.MAX_SAFE_INTEGER) => typeof number === 'number' && Number.isFinite(number)
+    ? Math.min(maximum, Math.max(0, Math.round(number))) : 0;
+  return {
+    durationMs: count(value?.durationMs), characters: count(value?.characters, MAX_SCRAPE_CHARACTERS),
+    clicks: count(value?.clicks, 20), scrolls: count(value?.scrolls, 20),
+    warnings: Array.isArray(value?.warnings) ? value.warnings.slice(0, 20)
+      .filter((warning: any) => typeof warning?.code === 'string' && /^[A-Z_]{1,64}$/.test(warning.code) && typeof warning.message === 'string')
+      .map((warning: any) => ({ code: warning.code, message: warning.message.slice(0, 300) })) : [],
+    unresolvedControls: Array.isArray(value?.unresolvedControls) ? value.unresolvedControls.filter((label: unknown) => typeof label === 'string')
+      .slice(0, 20).map((label: string) => label.slice(0, 120)) : [],
+  };
+}
 
 export async function runScrapeWorker(input: unknown, signal: AbortSignal, worker = path.resolve('scraper/browser_scrape.py')): Promise<any> {
   signal.throwIfAborted();
@@ -121,7 +138,9 @@ export async function runScrapeWorker(input: unknown, signal: AbortSignal, worke
     if (result?.error) {
       const code = Object.hasOwn(WORKER_ERRORS, result.code) ? result.code : 'INCOMPLETE_CONTENT';
       const [status, message] = WORKER_ERRORS[code];
-      throw new ScrapeError(code === 'BROWSER_UNAVAILABLE' && Object.hasOwn(STARTUP_ERRORS, result.reason) ? STARTUP_ERRORS[result.reason] : message, status, code);
+      const report = result.report ? workerReport(result.report) : undefined;
+      if (report) report.characters = 0;
+      throw new ScrapeError(code === 'BROWSER_UNAVAILABLE' && Object.hasOwn(STARTUP_ERRORS, result.reason) ? STARTUP_ERRORS[result.reason] : message, status, code, report);
     }
     return result;
   } finally {
@@ -133,7 +152,8 @@ export async function runScrapeWorker(input: unknown, signal: AbortSignal, worke
   }
 }
 
-export async function scrapePage(rawUrl: string, signal: AbortSignal, createProxy = startScrapeProxy): Promise<ScrapedPage> {
+export async function collectPage(rawUrl: string, signal: AbortSignal, createProxy = startScrapeProxy): Promise<ScrapePreview> {
+  const started = performance.now();
   const { url } = validateScrapeInput({ url: rawUrl });
   const release = await acquireScrapeSlot(signal).catch(error => {
     if (signal.aborted) throw new ScrapeError('URL retrieval was cancelled.', 499, 'CANCELLED');
@@ -141,10 +161,15 @@ export async function scrapePage(rawUrl: string, signal: AbortSignal, createProx
   });
   const execution = AbortSignal.any([signal, AbortSignal.timeout(120_000)]);
   let proxy: Awaited<ReturnType<typeof startScrapeProxy>> | undefined;
+  let report = workerReport(undefined);
   try {
     execution.throwIfAborted();
     proxy = await createProxy(undefined, undefined, execution);
+    proxy.setTarget(url);
     const result = await runScrapeWorker({ url, proxy: proxy.server }, execution);
+    if (proxy.targetError?.code === 'PRIVATE_ADDRESS') throw proxy.targetError;
+    report = workerReport(result?.report);
+    if (!['collected', 'partial'].includes(result?.status)) throw new ScrapeError('Browser worker returned an invalid collection status.', 503, 'BROWSER_UNAVAILABLE');
     if (typeof result?.markdown !== 'string' || !result.markdown.trim()) throw new ScrapeError(WORKER_ERRORS.EMPTY_PAGE[1], 502, 'EMPTY_PAGE');
     const finalUrl = validateScrapeInput({ url: result.finalUrl }).url;
     const requested = new URL(url), final = new URL(finalUrl);
@@ -156,13 +181,23 @@ export async function scrapePage(rawUrl: string, signal: AbortSignal, createProx
     }
     const markdown = `${result.markdown.trim()}\n\nSource: <${url}>${finalUrl !== url ? `\nRetrieved URL: <${finalUrl}>` : ''}`;
     if (markdown.length > MAX_SCRAPE_CHARACTERS) throw new ScrapeError(WORKER_ERRORS.CONTENT_TOO_LARGE[1], 413, 'CONTENT_TOO_LARGE');
-    return { markdown, requestedUrl: url, finalUrl };
+    report.durationMs = Math.round(performance.now() - started);
+    report.characters = markdown.length;
+    if (proxy.blockedCount) report.warnings.push({ code: 'BLOCKED_SUBRESOURCES', message: 'Some ancillary page connections were blocked or failed; their content was not inspected.' });
+    return { status: result.status, markdown, requestedUrl: url, finalUrl, capturedAt: new Date().toISOString(), report };
   } catch (error) {
-    if (execution.aborted) throw new ScrapeError(signal.aborted ? 'URL retrieval was cancelled.' : WORKER_ERRORS.TIMEOUT[1], signal.aborted ? 499 : 504, signal.aborted ? 'CANCELLED' : 'TIMEOUT');
-    if (error instanceof ScrapeError) throw error;
-    throw new ScrapeError('The browser service could not complete retrieval.', 502, 'RETRIEVAL_FAILED');
+    let failure = error instanceof ScrapeError ? error : new ScrapeError('The browser service could not complete retrieval.', 502, 'RETRIEVAL_FAILED');
+    if (proxy?.targetError && (['PRIVATE_ADDRESS', 'TIMEOUT'].includes(proxy.targetError.code) || failure.code === 'PAGE_UNAVAILABLE')) failure = proxy.targetError;
+    if (execution.aborted) failure = new ScrapeError(signal.aborted ? 'URL retrieval was cancelled.' : WORKER_ERRORS.TIMEOUT[1], signal.aborted ? 499 : 504, signal.aborted ? 'CANCELLED' : 'TIMEOUT');
+    failure.report = { ...(failure.report || report), durationMs: Math.round(performance.now() - started), characters: 0 };
+    throw failure;
   } finally {
-    await proxy?.close();
-    release();
+    try { await proxy?.close(); } finally { release(); }
   }
+}
+
+export async function scrapePage(rawUrl: string, signal: AbortSignal, createProxy = startScrapeProxy): Promise<ScrapedPage> {
+  const result = await collectPage(rawUrl, signal, createProxy);
+  if (result.status === 'partial') throw new ScrapeError(WORKER_ERRORS.INCOMPLETE_CONTENT[1], 502, 'INCOMPLETE_CONTENT', result.report);
+  return { markdown: result.markdown, requestedUrl: result.requestedUrl, finalUrl: result.finalUrl };
 }

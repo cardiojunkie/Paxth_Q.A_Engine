@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { createServer } from "vite";
+import type { ScrapePreview } from '../lib/browserScrape';
 import type { SkuData } from "../hooks/useCatalogData";
 import { DEFAULT_SETTINGS } from "../lib/providerSettings";
 import { prepareQaInput } from "../lib/qaAgent";
@@ -45,6 +47,15 @@ let scrapeMarkdown = 'Automatically scraped content';
 let lastScrapeRevision: number;
 let scrapeMode: 'success' | 'blocked' | 'wait' = 'success';
 let finishScrape: (() => void) | undefined;
+let emptyCatalog = false;
+let previewMode: 'collected' | 'partial' | 'blocked' | 'failed' | 'wait' = 'collected';
+let previewRequests = 0;
+let finishPreview: (() => void) | undefined;
+let lastPreview: ScrapePreview;
+const imageUrl = 'http://127.0.0.1:3219/private-image.svg';
+const imageMarkdown = `![Product photo](${imageUrl})`;
+const previewMarkdown = `# Preview product\n\nWeight: **500 g**\n\n${imageMarkdown}`;
+let imageRequests = 0;
 const chatRequests: any[] = [];
 const settingsWrites: any[] = [];
 const createdJobs: any[] = [];
@@ -70,6 +81,7 @@ try {
   await server.listen();
   browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_EXECUTABLE, args: ["--no-sandbox"] });
   const page = await browser.newPage();
+  await page.route(imageUrl, route => { imageRequests++; return route.fulfill({status:204}); });
   page.setDefaultTimeout(15000);
   page.setDefaultNavigationTimeout(60000);
   await page.addInitScript(() => {
@@ -105,6 +117,22 @@ try {
       return route.fulfill({ json: queuedRun ? [queuedRun] : [] });
     }
     if (path === '/api/job-runs/accepted-browser-run') return route.fulfill({ json: queuedRun });
+    if (path === '/api/scrape/preview') {
+      previewRequests++;
+      assert.equal(request.method(),'POST');
+      assert.deepEqual(Object.keys(request.postDataJSON()),['url']);
+      const requestedUrl = request.postDataJSON().url;
+      const report = { durationMs: 1500, characters: previewMarkdown.length, clicks: 2, scrolls: 3,
+        warnings: previewMode === 'partial' ? [{ code: 'UNRESOLVED_CONTROL', message: 'Specifications could not be revealed.' }] : [],
+        unresolvedControls: previewMode === 'partial' ? ['Specifications'] : [] };
+      if (previewMode === 'blocked' || previewMode === 'failed') return route.fulfill({status:502,json:{error:previewMode === 'blocked' ? 'The website blocked browser access.' : 'The page could not be loaded.',code:previewMode === 'blocked' ? 'PAGE_BLOCKED' : 'NAVIGATION_FAILED',report}});
+      if (previewMode === 'wait') {
+        await new Promise<void>(resolve=>{finishPreview=resolve;});
+        return route.fulfill({json:{status:'collected',markdown:'# Stale preview',requestedUrl,finalUrl:requestedUrl,capturedAt:'2026-10-07T00:00:00Z',report}}).catch(()=>{});
+      }
+      lastPreview = {status:previewMode,markdown:previewMarkdown,requestedUrl,finalUrl:'https://example.com/final',capturedAt:'2026-10-07T00:00:00Z',report};
+      return route.fulfill({json:lastPreview});
+    }
     if (request.method() === 'POST' && path.startsWith('/api/catalog/') && path.endsWith('/scrape')) {
       scrapeRequests++;
       assert.ok(holdScrape, 'Editing evidence must not trigger a scrape');
@@ -150,7 +178,7 @@ try {
         return route.fulfill({json:olderRows});
       }
       if (failNextCatalogRefresh) { failNextCatalogRefresh = false; catalogRefreshFailures++; return route.fulfill({ status: 503, json: { error: 'Catalog refresh temporarily unavailable' } }); }
-      return route.fulfill({ json: catalog });
+      return route.fulfill({ json: emptyCatalog ? [] : catalog });
     }
     if (path === "/api/jobs") {
       if (request.method() === 'POST') { createdJobs.push(...request.postDataJSON()); return route.fulfill({json:request.postDataJSON()}); }
@@ -414,8 +442,91 @@ try {
   assert.equal(await content.inputValue(), 'Automatically scraped content');
   await page.getByText('Evidence: browser', {exact:false}).waitFor();
   await page.keyboard.press('Escape');
+  emptyCatalog = true;
+  await page.reload();
   await page.getByRole('button', { name: 'Scraper', exact: true }).click();
   assert.equal(await page.getByRole('heading', {name:'Scraper',exact:true}).count(),1);
+  assert.equal(await page.getByRole('button',{name:'Test URL',exact:true}).getAttribute('aria-pressed'),'true');
+  assert.equal(await page.getByLabel('SKU',{exact:true}).count(),0,'Standalone testing does not require a catalog');
+  const websiteUrl = page.getByLabel('Website URL',{exact:true});
+  const scrapeUrl = page.getByRole('button',{name:'Scrape URL',exact:true});
+  const previewWrites = writes.length;
+  const previewJobs = createdJobs.length;
+  const previewChats = chatRequests.length;
+  const savedCatalog = structuredClone(catalog);
+  assert.equal(await scrapeUrl.isDisabled(),true);
+  await websiteUrl.fill('https://example.com/test');
+  await scrapeUrl.click();
+  await page.getByRole('heading',{name:'Content collected',exact:true}).waitFor();
+  assert.equal(await page.getByLabel('Raw Markdown',{exact:true}).inputValue(),lastPreview.markdown);
+  assert.equal(await page.locator('.prose strong').innerText(),'500 g','Markdown is rendered');
+  await page.locator('.prose').getByText('Product photo',{exact:true}).waitFor();
+  assert.equal(await page.locator('.prose img').count(),0,'Preview images render as alt text without automatic fetching');
+  assert.equal(imageRequests,0,'Preview Markdown cannot request a private image from the user’s browser');
+  assert.ok(lastPreview.markdown.includes(imageMarkdown),'Raw Markdown retains the original image reference');
+  await page.getByText(`1.5 seconds · ${previewMarkdown.length} characters · 2 clicks · 3 scrolls`,{exact:true}).waitFor();
+  await page.context().grantPermissions(['clipboard-read','clipboard-write']);
+  await page.getByRole('button',{name:'Copy Markdown',exact:true}).click();
+  await page.getByRole('button',{name:'Copied',exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),lastPreview.markdown);
+  const markdownDownload = page.waitForEvent('download');
+  await page.getByRole('button',{name:'Download Markdown',exact:true}).click();
+  const markdownFile = await markdownDownload;
+  assert.equal(markdownFile.suggestedFilename(),'scrape-preview.md');
+  assert.equal(await readFile((await markdownFile.path())!,'utf8'),lastPreview.markdown);
+  const reportDownload = page.waitForEvent('download');
+  await page.getByRole('button',{name:'Download report',exact:true}).click();
+  assert.deepEqual(JSON.parse(await readFile((await (await reportDownload).path())!,'utf8')),lastPreview);
+  await websiteUrl.fill('https://example.com/partial');
+  assert.equal(await page.getByLabel('Raw Markdown',{exact:true}).count(),0,'Editing the URL clears the previous result');
+  previewMode = 'partial';
+  await scrapeUrl.click();
+  await page.getByRole('heading',{name:'Partial',exact:true}).waitFor();
+  await page.getByText('Unresolved controls: Specifications',{exact:true}).waitFor();
+  await page.getByText('Some content could not be collected. This preview is not saved as SKU evidence.',{exact:true}).waitFor();
+  assert.equal(await page.getByLabel('Raw Markdown',{exact:true}).inputValue(),lastPreview.markdown);
+  for (const failureMode of ['blocked','failed'] as const) {
+    previewMode = failureMode;
+    await scrapeUrl.click();
+    await page.getByRole('heading',{name:failureMode==='blocked'?'Blocked':'Failed',exact:true}).waitFor();
+    await page.getByRole('alert').waitFor();
+    assert.equal(await page.getByLabel('Raw Markdown',{exact:true}).count(),0,'Hard failure discards preview content');
+  }
+  previewMode = 'wait';
+  await scrapeUrl.click();
+  await page.getByRole('button',{name:'Cancel scraping',exact:true}).waitFor();
+  assert.equal(await websiteUrl.isDisabled(),true);
+  await page.waitForTimeout(100);
+  await page.getByRole('button',{name:'Cancel scraping',exact:true}).click();
+  await page.getByText('Scraping was cancelled.',{exact:true}).waitFor();
+  assert.equal(await websiteUrl.isEnabled(),true);
+  const finishCancelledPreview = finishPreview;
+  previewMode = 'collected';
+  await websiteUrl.fill('https://example.com/retry');
+  await scrapeUrl.click();
+  await page.getByRole('heading',{name:'Content collected',exact:true}).waitFor();
+  finishCancelledPreview?.();
+  await page.waitForTimeout(100);
+  assert.equal(await page.getByLabel('Raw Markdown',{exact:true}).inputValue(),lastPreview.markdown,'Cancelled responses cannot replace a newer preview');
+  previewMode = 'wait';
+  finishPreview = undefined;
+  await scrapeUrl.click();
+  await page.getByRole('button',{name:'Cancel scraping',exact:true}).waitFor();
+  await page.waitForTimeout(100);
+  await page.getByRole('button',{name:'Dashboard',exact:true}).click();
+  finishPreview?.();
+  await page.getByRole('button',{name:'Scraper',exact:true}).click();
+  assert.equal(await websiteUrl.inputValue(),'','Navigating away discards temporary results');
+  assert.equal(await page.getByLabel('Raw Markdown',{exact:true}).count(),0);
+  assert.equal(previewRequests,7);
+  assert.equal(writes.length,previewWrites,'Preview never writes catalog data');
+  assert.equal(createdJobs.length,previewJobs,'Preview never creates jobs');
+  assert.equal(chatRequests.length,previewChats,'Preview never invokes models');
+  assert.deepEqual(catalog,savedCatalog,'Preview leaves saved evidence untouched');
+  emptyCatalog = false;
+  await page.reload();
+  await page.getByRole('button',{name:'Scraper',exact:true}).click();
+  await page.getByRole('button',{name:'Save to SKU',exact:true}).click();
   const chooser = page.getByLabel('SKU', {exact:true});
   const retrieve = page.getByRole('button',{name:'Scrape and save',exact:true});
   assert.equal(await retrieve.count(),0,'A saved SKU must be selected');
@@ -453,6 +564,7 @@ try {
   assert.equal(catalog[0].scrape_metadata?.requestedUrl,'https://example.com/new-product');
   await page.reload();
   await page.getByRole('button',{name:'Scraper',exact:true}).click();
+  await page.getByRole('button',{name:'Save to SKU',exact:true}).click();
   await chooser.selectOption('pending');
   assert.equal(await page.getByLabel('Markdown preview').inputValue(),'Automatically scraped content','Saved scrape survives refresh');
 
@@ -462,10 +574,14 @@ try {
   await page.getByRole('button', {name:'Jobs',exact:true}).click();
   await catalogHeld;
   await page.getByRole('button', {name:'Scraper',exact:true}).click();
+  await page.getByRole('button',{name:'Save to SKU',exact:true}).click();
   await chooser.selectOption('pending');
-  scrapeMarkdown = 'Newer saved product evidence';
+  scrapeMarkdown = `Newer saved product evidence\n\n${imageMarkdown}`;
   await rescrape.click();
-  await page.locator('.prose').getByText(scrapeMarkdown,{exact:true}).waitFor();
+  await page.locator('.prose').getByText('Newer saved product evidence',{exact:true}).waitFor();
+  await page.locator('.prose').getByText('Product photo',{exact:true}).waitFor();
+  assert.equal(await page.locator('.prose img').count(),0,'Saved SKU Markdown also renders images as alt text');
+  assert.equal(imageRequests,0,'Saved SKU Markdown cannot request private images');
   const savedRevision = catalog[0].revision;
   const olderResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/catalog');
   releaseCatalogRefresh();
@@ -563,7 +679,7 @@ try {
   for (const text of ['Forged review summary', 'Forged finding', 'Forged replacement', 'No issues detected for this SKU!']) {
     assert.equal(await page.getByText(text, { exact: true }).count(), 0);
   }
-  console.log('Browser checks passed: revision-protected saves, SKU-attached scraping, cancellation, QA settings, and historical review exclusion.');
+  console.log('Browser checks passed: standalone URL previews, diagnostics, copy/downloads, revision-protected SKU saves, cancellation, QA settings, and historical review exclusion.');
 } finally {
   releaseCatalogRefresh();
   releaseSave();

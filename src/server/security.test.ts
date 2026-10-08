@@ -12,8 +12,9 @@ import {initializeAuth,registerAuth,hashPassword,hashSessionToken} from './auth'
 import {initializeProvider,registerProviderRoutes} from './provider';
 import {initializeJobRuns,registerJobRunRoutes,startJobWorker} from './jobRunner';
 import {ApiError,registerCatalogRoutes} from './catalog';
+import {registerScrapeRoutes} from './scraper';
 import {ProviderError} from '../lib/chatCompletion';
-import {validateScrapeInput, ScrapeError} from '../lib/browserScrape';
+import {validateScrapeInput, ScrapeError, type ScrapePreview} from '../lib/browserScrape';
 import {DEFAULT_SETTINGS,editableSettings} from '../lib/providerSettings';
 
 assert.ok(process.env.TEST_DATABASE_URL,'Set TEST_DATABASE_URL to a disposable PostgreSQL instance. Production DATABASE_URL is never used.');
@@ -27,13 +28,20 @@ let stopSecond:(()=>Promise<void>)|undefined;
 let calls=0, providerMode='success';
 const providerRequests:any[]=[];
 const scrapeRequests:string[]=[];
-let scrapeBlocked=false;
+let scrapeBlocked=false, scrapePartial=false;
 let duringScrape: (()=>Promise<void>) | undefined;
-const scrape=async(rawUrl:string, signal:AbortSignal)=>{
+const collect=async(rawUrl:string, signal:AbortSignal):Promise<ScrapePreview>=>{
   const {url}=validateScrapeInput({url:rawUrl});signal.throwIfAborted();scrapeRequests.push(url);
   await duringScrape?.();signal.throwIfAborted();
   if(scrapeBlocked)throw new ScrapeError('The website blocked browser access.',502,'PAGE_BLOCKED');
-  return {markdown:'# Retrieved product\nBrand: TestBrand\n\nSource: <'+url+'>',requestedUrl:url,finalUrl:url};
+  const markdown='# Retrieved product\nBrand: TestBrand\n\nSource: <'+url+'>';
+  return {status:scrapePartial?'partial':'collected',markdown,requestedUrl:url,finalUrl:url,capturedAt:new Date().toISOString(),
+    report:{durationMs:10,characters:markdown.length,clicks:1,scrolls:2,warnings:scrapePartial?[{code:'UNRESOLVED_CONTROLS',message:'Specifications did not open.'}]:[],unresolvedControls:scrapePartial?['Specifications']:[]}};
+};
+const scrape=async(rawUrl:string, signal:AbortSignal)=>{
+  const result=await collect(rawUrl,signal);
+  if(result.status==='partial')throw new ScrapeError('The page could not be extracted completely.',502,'INCOMPLETE_CONTENT',result.report);
+  return result;
 };
 const provider=createServer(async(req,res)=>{
   let raw='';for await(const chunk of req) raw+=chunk;
@@ -68,7 +76,7 @@ try {
   const app=express();app.use(express.json());
   server.on('request',app);await listen(server);
   const origin=`http://127.0.0.1:${(server.address() as any).port}`;process.env.APP_ORIGIN=origin;
-  registerAuth(app,pool);registerCatalogRoutes(app,pool,scrape);registerProviderRoutes(app,pool);
+  registerAuth(app,pool);registerCatalogRoutes(app,pool,scrape);registerProviderRoutes(app,pool);registerScrapeRoutes(app,collect);
   registerJobRunRoutes(app,pool);registerQaConfigurationRoutes(app,drizzle(pool,{schema}));
   app.use('/api', (_req,res)=>res.status(404).json({error:'Not found'}));
   app.use((err:any,_req:any,res:any,_next:any)=>res.status(err instanceof ApiError||err instanceof ProviderError?err.status:err.code==='23505'?409:503).json({error:err.message}));
@@ -89,6 +97,14 @@ try {
   assert.equal((await request('/api/users','POST',{username:' temporary ',password,role:'user'},admin)).status,409);
   const user=(await request('/api/auth/login','POST',{username:'Operator',password})).cookie!.split(';')[0];
   const other=(await request('/api/auth/login','POST',{username:'Other',password})).cookie!.split(';')[0];
+  assert.equal((await request('/api/scrape/preview','POST',{url:'https://8.8.8.8/product'})).status,401);
+  assert.equal((await request('/api/scrape/preview','POST',{url:'https://8.8.8.8/product'},user,'https://evil.example')).status,403);
+  const previewBefore=await pool.query('SELECT (SELECT count(*) FROM sku_data) AS catalog, (SELECT count(*) FROM jobs) AS jobs, (SELECT count(*) FROM job_runs) AS runs');
+  const previewCalls=calls;
+  const preview=await request('/api/scrape/preview','POST',{url:'https://8.8.8.8/product'},user);
+  assert.equal(preview.status,200);assert.equal(preview.body.status,'collected');assert.match(preview.body.markdown,/Retrieved product/);
+  assert.deepEqual((await pool.query('SELECT (SELECT count(*) FROM sku_data) AS catalog, (SELECT count(*) FROM jobs) AS jobs, (SELECT count(*) FROM job_runs) AS runs')).rows,previewBefore.rows,'Standalone testing works with an empty catalog and writes no catalog/jobs/runs');
+  assert.equal(calls,previewCalls,'Standalone testing makes no provider calls');
   const edit=async(id:string,updates:Record<string,unknown>)=>request(`/api/catalog/${id}`,'PUT',{
     ...updates,expectedRevision:(await pool.query('SELECT revision FROM sku_data WHERE sku=$1',[id])).rows[0]?.revision ?? 0,
   },user);
@@ -175,6 +191,16 @@ try {
   const afterFailure=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='scrape-check');
   assert.equal(afterFailure.scraped_markdown,scraped.body.scraped_markdown);assert.equal(afterFailure.revision,1);
   assert.deepEqual(afterFailure.scrape_metadata,scraped.body.scrape_metadata);assert.match(afterFailure.scrape_error,/blocked/);
+  scrapePartial=true;
+  const partialPreview=await request('/api/scrape/preview','POST',{url:'https://8.8.8.8/product?variant=42'},user);
+  assert.equal(partialPreview.status,200);assert.equal(partialPreview.body.status,'partial');
+  assert.deepEqual(partialPreview.body.report.unresolvedControls,['Specifications']);assert.match(partialPreview.body.markdown,/Retrieved product/);
+  const partialSave=await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:1},user);
+  assert.equal(partialSave.status,502);assert.equal(partialSave.body.code,'INCOMPLETE_CONTENT');
+  const afterPartial=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='scrape-check');
+  assert.equal(afterPartial.scraped_markdown,scraped.body.scraped_markdown);assert.equal(afterPartial.revision,1);
+  assert.deepEqual(afterPartial.scrape_metadata,scraped.body.scrape_metadata);assert.equal(calls,0);
+  scrapePartial=false;
   await pool.query("CREATE FUNCTION fail_scrape_save() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.sku='scrape-check' AND NEW.scrape_status='success' THEN RAISE EXCEPTION 'injected scrape commit failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_scrape_save BEFORE UPDATE ON sku_data FOR EACH ROW EXECUTE FUNCTION fail_scrape_save()");
   assert.equal((await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:1},user)).status,503,'A failed evidence commit is never reported as saved');
   assert.equal((await pool.query("SELECT revision FROM sku_data WHERE sku='scrape-check'")).rows[0].revision,1);

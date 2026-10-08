@@ -24,6 +24,9 @@ async function check(expected?: string, allowLoopback = false) {
     assert.equal((await login(expected ?? local)).status, 400, 'A matching origin reaches login validation');
     assert.equal((await login('https://evil.example')).status, 403, 'Untrusted origins stay blocked');
     assert.equal((await login(expected ?? local, 'cross-site')).status, 403, 'Cross-site requests stay blocked');
+    assert.equal((await send('POST', '/api/scrape/preview', expected ?? local)).status, 401, 'URL testing requires a session');
+    assert.equal((await send('POST', '/api/scrape/preview', 'https://evil.example')).status, 403, 'URL testing requires a matching origin');
+    assert.equal((await send('POST', '/api/scrape/preview', expected ?? local, 'cross-site')).status, 403, 'Cross-site URL testing stays blocked');
     if (expected) assert.equal((await login(local)).status, allowLoopback ? 400 : 403, 'Explicit origin stays authoritative; automatic development supports loopback');
     if (allowLoopback) {
       const port = new URL(local).port;
@@ -34,6 +37,7 @@ async function check(expected?: string, allowLoopback = false) {
       assert.equal((await login('https://evil.example', 'same-origin', 'evil.example')).status, 403, 'Matching an unrelated Host does not bypass the check');
       assert.equal((await login('http://localhost:9999')).status, 403, 'Loopback Origin must match the request Host and port');
       assert.equal((await send('POST', '/api/catalog/example/scrape', `http://localhost:${port}`, 'same-origin', `localhost:${port}`)).status, 401, 'Rewritten scrape request reaches session validation');
+      assert.equal((await send('POST', '/api/scrape/preview', `http://localhost:${port}`, 'same-origin', `localhost:${port}`)).status, 401, 'Rewritten URL preview reaches session validation');
     }
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 }
@@ -55,4 +59,4 @@ try {
 } finally {
   for (const name of names) { if (saved[name] === undefined) delete process.env[name]; else process.env[name] = saved[name]; }
 }
-console.log('Authentication origin checks passed: local, Codespaces rewrites, SKU scraping, explicit overrides, production and cross-site protection.');
+console.log('Authentication origin checks passed: local, Codespaces rewrites, SKU scraping, URL testing, explicit overrides, production and cross-site protection.');

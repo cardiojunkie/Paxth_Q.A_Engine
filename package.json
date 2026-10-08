@@ -18,7 +18,7 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "test:scraper": "tsx src/lib/browserScrape.test.ts && tsx src/lib/scrapeRequest.test.ts",
+    "test:scraper": "tsx src/lib/browserScrape.test.ts && tsx src/lib/scrapeRequest.test.ts && tsx src/server/scraper.test.ts",
     "admin:bootstrap": "tsx scripts/bootstrap-admin.ts",
     "test:provider": "tsx src/server/provider.test.ts",
     "test:auth": "tsx src/server/auth.test.ts",

@@ -10,6 +10,7 @@ import { ApiError, registerCatalogRoutes } from "./src/server/catalog.js";
 import { initializeAuth, registerAuth } from "./src/server/auth.js";
 import { initializeProvider, registerProviderRoutes } from "./src/server/provider.js";
 import { initializeJobRuns, registerJobRunRoutes, startJobWorker } from "./src/server/jobRunner.js";
+import { registerScrapeRoutes } from "./src/server/scraper.js";
 
 async function startServer() {
   if (!pool || !db) throw new Error("DATABASE_URL is required");
@@ -35,6 +36,7 @@ async function startServer() {
   });
   registerQaConfigurationRoutes(app,db);
   registerCatalogRoutes(app,pool);
+  registerScrapeRoutes(app);
   registerProviderRoutes(app,pool);
   registerJobRunRoutes(app,pool);
   app.use('/api', (_req,res) => { res.status(404).json({error:'Endpoint not found'}); });

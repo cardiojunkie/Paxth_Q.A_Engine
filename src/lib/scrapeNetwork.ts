@@ -3,8 +3,12 @@ import { Agent, createServer, request as httpRequest } from 'node:http';
 import { BlockList, isIP, createConnection, type Socket } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 
+export type ScrapeReport = {
+  durationMs: number; characters: number; clicks: number; scrolls: number;
+  warnings: Array<{ code: string; message: string }>; unresolvedControls: string[];
+};
 export class ScrapeError extends Error {
-  constructor(message: string, public status = 502, public code = 'RETRIEVAL_FAILED') { super(message); }
+  constructor(message: string, public status = 502, public code = 'RETRIEVAL_FAILED', public report?: ScrapeReport) { super(message); }
 }
 
 const reserved = new BlockList();
@@ -65,6 +69,8 @@ export async function startScrapeProxy(resolve = lookup, connect = createConnect
   const sockets = new Set<Socket>();
   let closed = false;
   let blocked: ScrapeError | undefined;
+  let targetHost = '', targetError: ScrapeError | undefined, blockedCount = 0;
+  const hostname = (value: string) => new URL(value).hostname.replace(/^www\./, '').toLowerCase();
   const track = (socket: Socket) => {
     sockets.add(socket);
     socket.on('error', () => {});
@@ -85,7 +91,14 @@ export async function startScrapeProxy(resolve = lookup, connect = createConnect
     });
     return socket;
   };
-  const record = (error: unknown) => { if (error instanceof ScrapeError) blocked = error; };
+  const record = (error: unknown, target: string) => {
+    blocked = error instanceof ScrapeError ? error : new ScrapeError('The public page connection failed.', 502,
+      ['ENOTFOUND', 'EAI_AGAIN'].includes((error as NodeJS.ErrnoException)?.code || '') ? 'DNS_LOOKUP_FAILED' : 'CONNECTION_FAILED');
+    blockedCount++;
+    try {
+      if (hostname(target) === targetHost && targetError?.code !== 'PRIVATE_ADDRESS') targetError = blocked;
+    } catch { /* Invalid proxy targets have no matching hostname. */ }
+  };
   const server = createServer(async (req, res) => {
     let socket: Socket | undefined;
     try {
@@ -105,7 +118,7 @@ export async function startScrapeProxy(resolve = lookup, connect = createConnect
       res.once('close', () => { upstream.destroy(); agent.destroy(); });
       req.pipe(upstream);
     } catch (error) {
-      socket?.destroy(); record(error);
+      socket?.destroy(); record(error, req.url || '');
       if (!res.headersSent) res.writeHead(error instanceof ScrapeError ? 403 : 502);
       res.end('Page connection rejected.');
     }
@@ -123,7 +136,7 @@ export async function startScrapeProxy(resolve = lookup, connect = createConnect
       client.once('close', () => remote?.destroy());
       remote.once('close', () => client.destroy());
     } catch (error) {
-      remote?.destroy(); record(error);
+      remote?.destroy(); record(error, 'https://' + req.url);
       client.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
     }
   });
@@ -133,6 +146,9 @@ export async function startScrapeProxy(resolve = lookup, connect = createConnect
   return {
     server: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
     get blocked() { return blocked; },
+    setTarget(url: string) { targetHost = hostname(url); },
+    get targetError() { return targetError; },
+    get blockedCount() { return blockedCount; },
     close: async () => {
       closed = true;
       for (const socket of sockets) socket.destroy();

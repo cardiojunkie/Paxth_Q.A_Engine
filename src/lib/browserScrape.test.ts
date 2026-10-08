@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createServer, request } from 'node:http';
 import { createConnection } from 'node:net';
-import { acquireScrapeSlot, runScrapeWorker, validateScrapeInput, isPublicAddress, scrapePage } from './browserScrape';
+import { acquireScrapeSlot, runScrapeWorker, validateScrapeInput, isPublicAddress, scrapePage, collectPage } from './browserScrape';
 import { resolvePublicAddress, startScrapeProxy, ScrapeError } from './scrapeNetwork';
 
 const signal = new AbortController().signal;
@@ -41,11 +41,13 @@ const proxied=(url:string)=>new Promise<number>((resolve,reject)=>{
   req.once('error',reject);req.end();
 });
 try {
+  proxy.setTarget('http://public.example/product');
   assert.equal(await proxied('http://public.example/product'),200);
   assert.equal(await proxied('http://public.example/product'),403,'A new connection revalidates DNS');
   assert.equal(await proxied('http://169.254.169.254/latest/meta-data'),403);
   assert.deepEqual(dialed,['8.8.8.8'],'Only validated numeric IPs reach TCP dialing');
   assert.equal(hits,1);
+  assert.equal(proxy.targetError?.code, 'PRIVATE_ADDRESS', 'Target DNS failures retain their specific cause');
 } finally {await proxy.close();await new Promise<void>(resolve=>fixture.close(()=>resolve()));}
 
 // A tiny protocol worker verifies process handling without requiring Python or Chromium.
@@ -53,21 +55,37 @@ const folder=await mkdtemp(path.join(tmpdir(),'paxth-worker-check-'));
 const python=process.env.SCRAPER_PYTHON,headless=process.env.SCRAPER_HEADLESS;
 process.env.SCRAPER_PYTHON=process.execPath;process.env.SCRAPER_HEADLESS='true';
 const worker=path.join(folder,'worker.mjs');
-await writeFile(worker,`import fs from 'node:fs';import {spawn} from 'node:child_process';
+await writeFile(worker,`#!/usr/bin/env node
+import fs from 'node:fs';import {spawn} from 'node:child_process';
 const input=JSON.parse(fs.readFileSync(0,'utf8'));
 if(input.mode==='crash')process.exit(1);
 else if(input.mode==='large')process.stdout.write('x'.repeat(4*1024*1024+1));
 else if(input.mode==='error')console.log(JSON.stringify({error:true,code:'PAGE_BLOCKED',details:'private-secret'}));
 else if(input.mode==='startup-error')console.log(JSON.stringify({error:true,code:'BROWSER_UNAVAILABLE',reason:input.reason,details:'private-secret'}));
 else if(input.mode==='wait') {const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',detached:true});fs.writeFileSync(input.pid,String(child.pid));setInterval(()=>{},1000);}
+else if(input.url) console.log(JSON.stringify({status:input.url.includes('/partial')?'partial':'collected',markdown:'# Product',finalUrl:input.url,
+  report:{durationMs:1,characters:9,clicks:2,scrolls:1,warnings:input.url.includes('/partial')?[{code:'UNSUPPORTED_CONTROLS',message:'Unresolved content'}]:[],unresolvedControls:input.url.includes('/partial')?['Specifications']:[],details:'private-secret'}}));
 else {const bytes=Buffer.from(JSON.stringify({markdown:'Unicode: café 😀 漢字'}));for(const byte of bytes)process.stdout.write(Buffer.from([byte]));}
-`);
+`, { mode: 0o700 });
 try {
   const startupCancellation=new AbortController();
   const starting=runScrapeWorker({mode:'wait',pid:path.join(folder,'startup-pid')},startupCancellation.signal,worker);
   startupCancellation.abort();
   await assert.rejects(starting,{name:'AbortError'});
   assert.equal((await runScrapeWorker({},signal,worker)).markdown,'Unicode: café 😀 漢字');
+  process.env.SCRAPER_PYTHON = worker;
+  const preview = await collectPage('https://example.com/partial', signal);
+  assert.equal(preview.status, 'partial');
+  assert.match(preview.markdown, /# Product/);
+  assert.equal(preview.report.characters, preview.markdown.length);
+  assert.deepEqual(preview.report.unresolvedControls, ['Specifications']);
+  assert.doesNotMatch(JSON.stringify(preview), /private-secret/);
+  await assert.rejects(scrapePage('https://example.com/partial', signal), hasCode('INCOMPLETE_CONTENT'));
+  assert.deepEqual(await scrapePage('https://example.com/product', signal), {
+    markdown: '# Product\n\nSource: <https://example.com/product>', requestedUrl: 'https://example.com/product', finalUrl: 'https://example.com/product',
+  });
+  (await acquireScrapeSlot(signal))(); // Collection and strict rejection both release admission.
+  process.env.SCRAPER_PYTHON = process.execPath;
   await assert.rejects(runScrapeWorker({mode:'startup-error',reason:'SYSTEM_DEPENDENCIES_MISSING'},signal,worker),error=>{
     assert.ok(hasCode('BROWSER_UNAVAILABLE')(error));assert.match((error as Error).message,/system libraries or fonts are missing/);return true;
   });
