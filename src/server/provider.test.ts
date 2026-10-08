@@ -90,10 +90,10 @@ try {
   release();await Promise.all(requests);
   assert.throws(()=>validateSettings({...editableSettings(DEFAULT_SETTINGS),apiKey:'browser-key'}),/Invalid/);
   assert.throws(()=>validateSettings({...editableSettings(DEFAULT_SETTINGS),maxTokens:Infinity}),/Invalid/);
-  for(const scrapperModelName of ['', ' ', 42, 'x'.repeat(257)]) assert.throws(()=>validateSettings({...editableSettings(DEFAULT_SETTINGS),scrapperModelName}),/Invalid/);
-  assert.equal(validateSettings({...editableSettings(DEFAULT_SETTINGS),scrapperModelName:' custom/sonar '}).scrapperModelName,'custom/sonar');
-  const legacy:any={...editableSettings(DEFAULT_SETTINGS)};delete legacy.scrapperModelName;
-  assert.equal(validateSettings(legacy).scrapperModelName,'perplexity/sonar');
+  for (const retired of ['scrapperModelName', 'navigationModelInitialized', 'scraperTimeout']) {
+    assert.throws(() => validateSettings({ ...editableSettings(DEFAULT_SETTINGS), [retired]: 'retired' }), /Invalid/);
+  }
+  assert.equal(validateSettings({ ...editableSettings(DEFAULT_SETTINGS), modelName: ' custom/qa ' }).modelName, 'custom/qa');
   const sanitized=await providerResponseError(Response.json({error:{message:'Invalid test-only Bearer secret sk-other-secret'}},{status:401}), 'test-only');
   assert.equal(sanitized.status,502);assert.doesNotMatch(sanitized.message,/test-only|Bearer secret|sk-other-secret/);
   const app=express();app.use(express.json());
@@ -124,25 +124,23 @@ try {
     assert.equal((await request({})).body.purpose,'qa');
     assert.equal(payloads[1].model,DEFAULT_SETTINGS.modelName);
     settingsUnavailable=true;
-    const draftScrapper=await request({purpose:'scrapper',modelName:'draft/sonar'});
-    assert.deepEqual(draftScrapper.body,{success:true,purpose:'scrapper',modelName:'draft/sonar'});
-    assert.equal(payloads.at(-1).model,'draft/sonar');
-    assert.deepEqual(payloads.at(-1).messages,payloads[0].messages);
-    assert.ok(!('search_domain_filter' in payloads.at(-1)),'Scrapper connectivity does not require browsing');
-    assert.equal(settingsReads,1,'Explicit model tests still work during a settings outage');
+    assert.equal((await request({ purpose: 'qa', modelName: 'draft/qa' })).status, 200);
+    assert.equal(settingsReads, 1, 'Explicit model tests still work during a settings outage');
+    assert.equal((await request({ purpose: 'scrapper', modelName: 'retired/navigation' })).status, 400);
+    assert.equal(settingsReads, 1, 'Retired purposes are rejected before settings or provider requests');
     settingsUnavailable=false;
-    assert.equal((await request({purpose:'scrapper'})).status,200);
-    assert.equal(payloads.at(-1).model,DEFAULT_SETTINGS.scrapperModelName);
-    assert.equal((await request({purpose:'other'})).status,400);
-    assert.equal((await request({purpose:'scrapper',apiKey:'bad'})).status,400);
-    role='user';assert.equal((await request({purpose:'scrapper',modelName:'draft/sonar'})).status,403);role='admin';
+    assert.equal((await request({ purpose: 'qa' })).status, 200);
+    assert.equal(payloads.at(-1).model, DEFAULT_SETTINGS.modelName);
+    assert.equal((await request({ purpose: 'other' })).status, 400);
+    assert.equal((await request({ apiKey: 'bad' })).status, 400);
+    role='user';assert.equal((await request({modelName:'draft/qa'})).status,403);role='admin';
     globalThis.fetch=async()=>Response.json({choices:[{message:{content:''}}]});
     assert.match((await request({purpose:'qa'})).body.error,/empty/);
     globalThis.fetch=async()=>Response.json({error:{message:'Wrong key test-only'}},{status:401});
     const upstream=await request({});assert.equal(upstream.status,502);assert.doesNotMatch(upstream.body.error,/test-only/);
     for(const message of [{refusal:'Unavailable'},{content:'Partial'}]) {
       globalThis.fetch=async()=>Response.json({choices:[{finish_reason:message.refusal?'stop':'length',message}]});
-      assert.equal((await request({purpose:'scrapper',modelName:'draft/sonar'})).status,502);
+      assert.equal((await request({purpose:'qa',modelName:'draft/qa'})).status,502);
     }
     globalThis.fetch=async()=>new Response('<html>Gateway failure</html>');
     assert.match((await request({modelName:'draft/qa'})).body.error,/invalid JSON/);

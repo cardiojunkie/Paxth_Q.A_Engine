@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from "react";
 import { Play, Clock, StopCircle, CheckCircle, AlertCircle, Download, Eye, Trash2, X, AlertTriangle, FileSpreadsheet, ChevronDown, ChevronUp } from "lucide-react";
 import { useAppContext, Job } from "../context/AppContext";
 import type { SkuData } from "../hooks/useCatalogData";
-import { getCommonAttributeSet, getCommonHeaderOrder, hasCompletedQa } from "../lib/jobRunState";
+import { getCommonAttributeSet, getCommonHeaderOrder, hasCompletedQa, unreviewedRunSnapshot } from "../lib/jobRunState";
 import { populateQaWorksheet } from "../lib/qaExcelExport";
 import { api } from "../lib/api";
 import { cn } from "../lib/utils";
@@ -15,15 +15,19 @@ type Run = {
   items?: Array<{ sku: string; status: string; attempts: number; error?: string; snapshot: SkuData; result?: SkuData }>;
 };
 const active = (run: Run) => ["queued", "running", "cancelling"].includes(run.status);
+const hasHistory = (runs: Run[] = []) => runs.some(run => ["completed", "failed", "cancelled"].includes(run.status));
 const request = <T,>(url: string, body?: unknown) => api<T>(url, body === undefined ? {cache:'no-store'} : {method:'POST',body:JSON.stringify(body)});
-const runSkus = (run: Run) => (run.items || []).map(item => item.result || {
-  ...item.snapshot,
-  ...(["queued", "running", "cancelled", "failed"].includes(item.status) ? {
-    status: item.status === "running" ? "running" : item.status === "queued" ? "pending" : "failed",
-    qa_result: undefined, raw_row: { ...item.snapshot.raw_row, qa_result: undefined },
-    error: item.error || (item.status === "cancelled" ? "Cancelled" : null),
-  } : {}),
-} as SkuData);
+const runSkus = (run: Run) => (run.items || []).map(item => {
+  if (item.result) return item.result;
+  const snapshot = unreviewedRunSnapshot(item.snapshot);
+  return {
+    ...snapshot,
+    ...(["queued", "running", "cancelled", "failed"].includes(item.status) ? {
+      status: item.status === "running" ? "running" : item.status === "queued" ? "pending" : "failed",
+      error: item.error || (item.status === "cancelled" ? "Cancelled" : snapshot.error),
+    } : {}),
+  } as SkuData;
+});
 
 export function JobsModule() {
   const { skuDataList, jobs, removeJob, addNotification, refreshData, user } = useAppContext();
@@ -116,7 +120,7 @@ export function JobsModule() {
   };
   const loadJobSkus = async (job: Job, runId?: string) => {
     const history = await request<Run[]>(`/api/jobs/${encodeURIComponent(job.id)}/runs`);
-    const id = runId || history[0]?.id;
+    const id = runId || history.find(run => !active(run))?.id || history[0]?.id;
     if (id) return runSkus(await request<Run>(`/api/job-runs/${id}`));
     const skus = job.skus.map(id => skuDataList.find(sku => sku.sku === id));
     if (skus.some(sku => !sku)) throw new Error("Some legacy job SKUs no longer exist in the catalog.");
@@ -126,12 +130,12 @@ export function JobsModule() {
   const exportJobExcel = async (jobOrJobs: Job | Job[], issuesOnly: boolean = false) => {
     try {
       const jobsToExport = (Array.isArray(jobOrJobs) ? jobOrJobs : [jobOrJobs])
-        .filter((job) => !Array.isArray(jobOrJobs) || job.status === "completed");
+        .filter((job) => !Array.isArray(jobOrJobs) || job.status === "completed" || hasHistory(histories[job.id]));
       if (jobsToExport.length === 0) {
         addNotification({
           type: "warning",
-          title: "No Completed Jobs",
-          message: "Select at least one completed job to export."
+          title: "No Exportable Jobs",
+          message: "Select a job with completed QA or saved run history to export."
         });
         return;
       }
@@ -152,7 +156,7 @@ export function JobsModule() {
       let jobSkus = allJobSkus;
       if (issuesOnly) {
         jobSkus = jobSkus.filter(sku => {
-          const qa = sku.qa_result || (sku.raw_row && sku.raw_row.qa_result);
+          const qa = sku.qa_result;
           return qa && (qa.qa_status === 'fail' || qa.qa_status === 'warning');
         });
       }
@@ -204,12 +208,12 @@ export function JobsModule() {
   };
 
   const exportSelectedJobs = () => {
-    const completedJobs = jobs.filter((job) => selectedJobs.has(job.id) && job.status === "completed");
+    const completedJobs = jobs.filter((job) => selectedJobs.has(job.id) && (job.status === "completed" || hasHistory(histories[job.id])));
     if (completedJobs.length === 0) {
       addNotification({
         type: "warning",
-        title: "No Completed Jobs",
-        message: "Select at least one completed job to export."
+        title: "No Exportable Jobs",
+        message: "Select a job with completed QA or saved run history to export."
       });
       return;
     }
@@ -302,6 +306,8 @@ export function JobsModule() {
               const jobSkus = getJobSkusList(job);
               const completedCount = jobSkus.filter(hasCompletedQa).length;
               const unresolvedCount = jobSkus.length - completedCount;
+              const lastRunStatus = histories[job.id]?.[0]?.status;
+              const badgeStatus = lastRunStatus || job.status;
 
               return (
                 <div key={job.id} className="bg-white border border-[#E5E2DE] rounded-sm p-5 flex items-center shadow-sm hover:border-[#1A1A1A]/30 transition-all gap-4">
@@ -325,21 +331,21 @@ export function JobsModule() {
                       <h4 className="font-serif text-lg text-[#1A1A1A]">{job.name}</h4>
                       <span className={cn(
                           "px-2 py-0.5 text-[10px] uppercase tracking-widest rounded-sm inline-flex items-center gap-1 font-semibold",
-                          job.status === 'pending' && "bg-gray-100 text-gray-800",
-                          job.status === 'completed' && "bg-emerald-50 text-emerald-800 border border-emerald-200",
-                          job.status === 'failed' && "bg-red-50 text-red-800 border border-red-200",
-                          job.status === 'running' && "bg-amber-50 text-amber-800 border border-amber-200"
+                          badgeStatus === 'pending' && "bg-gray-100 text-gray-800",
+                          badgeStatus === 'completed' && "bg-emerald-50 text-emerald-800 border border-emerald-200",
+                          badgeStatus === 'failed' && "bg-red-50 text-red-800 border border-red-200",
+                          badgeStatus === 'running' && "bg-amber-50 text-amber-800 border border-amber-200"
                         )}>
-                          {job.status === 'running' && <span className="w-1.5 h-1.5 rounded-full bg-amber-600 animate-pulse"></span>}
-                          {job.status === 'completed' && <CheckCircle className="w-3 h-3 text-emerald-600" />}
-                          {job.status}
+                          {badgeStatus === 'running' && <span className="w-1.5 h-1.5 rounded-full bg-amber-600 animate-pulse"></span>}
+                          {badgeStatus === 'completed' && <CheckCircle className="w-3 h-3 text-emerald-600" />}
+                          {lastRunStatus ? `Last run: ${lastRunStatus}` : job.status}
                       </span>
                     </div>
                     <div className="flex items-center gap-4 text-[11px] font-mono text-[#8C8882] mt-1">
                       <span className="flex items-center gap-1"><Clock className="w-3 h-3" /> {new Date(job.createdAt).toLocaleString()}</span>
                       <span>SKUs: {job.skus.length}</span>
                       {completedCount > 0 && (
-                        <span className="text-emerald-700 font-semibold">{completedCount}/{job.skus.length} Processed</span>
+                        <span className="text-emerald-700 font-semibold">Current QA: {completedCount}/{job.skus.length}</span>
                       )}
                       {job.tokensUsed && (
                         <span className="text-purple-700 font-semibold">Tokens: {job.tokensUsed.total_tokens.toLocaleString()}</span>
@@ -366,7 +372,7 @@ export function JobsModule() {
                       View Results
                     </button>
 
-                    {completedCount > 0 && (
+                    {(completedCount > 0 || hasHistory(histories[job.id])) && (
                       <>
                         <button
                           onClick={() => exportJobExcel(job)}
@@ -489,7 +495,7 @@ export function JobsModule() {
               </div>
 
               {getJobSkusList(selectedJobToView).map((sku) => {
-                const qa = sku.qa_result || sku.raw_row?.qa_result;
+                const qa = sku.qa_result;
                 const issues = qa?.issues || [];
                 const isExpanded = expandedSku === sku.sku;
                 const displayStatus = sku.error ? "failed" : qa?.qa_status || sku.status;

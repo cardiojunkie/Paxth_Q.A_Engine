@@ -1,11 +1,9 @@
-import type { Express, Response } from 'express';
+import type { Express } from 'express';
 import type { Pool, PoolClient } from 'pg';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fetchChatCompletion, ProviderError, providerResponseError } from '../lib/chatCompletion';
 import { DEFAULT_SETTINGS, editableSettings, normalizeSettings, type AppSettings } from '../lib/providerSettings';
 import { extractLLMResponseContent } from '../lib/llmResponse';
-import { scrapeWithAgent, ScrapeError, checkScrapeCredits, validateScrapeInput, validateScrapeKey, validateScrapeSettings, type ScrapeConfiguration } from '../lib/scrapeAgent';
-import { DEFAULT_SCRAPE_SETTINGS } from '../lib/scrapeRequest';
 import { transaction } from './database';
 
 export function getProviderCredentials() {
@@ -25,6 +23,9 @@ export function getProviderCredentials() {
 export async function initializeProvider(pool: Pool) {
   await pool.query(`CREATE TABLE IF NOT EXISTS provider_settings (id text PRIMARY KEY CHECK(id='default'), settings jsonb NOT NULL);
     INSERT INTO provider_settings VALUES ('default','{}') ON CONFLICT DO NOTHING`);
+  // Scraping is credential-independent; remove retired navigation settings on every startup.
+  await pool.query(`UPDATE provider_settings SET settings = settings - 'scrapperModelName' - 'navigationModelInitialized' - 'scraperTimeout'
+    WHERE id='default' AND settings ?| ARRAY['scrapperModelName','navigationModelInitialized','scraperTimeout']`);
 }
 export async function getProviderSettings(pool: Pool | PoolClient): Promise<AppSettings> {
   const { rows: [row] } = await pool.query("SELECT p.settings, q.memory FROM provider_settings p JOIN qa_agent_settings q ON q.id=p.id WHERE p.id='default'");
@@ -36,26 +37,11 @@ export async function getProviderSettings(pool: Pool | PoolClient): Promise<AppS
 export function validateSettings(value: any) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !Object.keys(editableSettings(DEFAULT_SETTINGS)).includes(key)) ||
     typeof value.modelName !== 'string' || !value.modelName.trim() || value.modelName.length > 256 ||
-    (value.scrapperModelName !== undefined && (typeof value.scrapperModelName !== 'string' || !value.scrapperModelName.trim() || value.scrapperModelName.length > 256)) ||
     typeof value.temperature !== 'number' || !Number.isFinite(value.temperature) || value.temperature < 0 || value.temperature > 1 ||
     !Number.isSafeInteger(value.maxTokens) || value.maxTokens < 1 || value.maxTokens > 65536 ||
     !Number.isSafeInteger(value.maxPageContentLength) || value.maxPageContentLength < 1 || value.maxPageContentLength > 200000 ||
     typeof value.qaAgentMemory !== 'string' || value.qaAgentMemory.length > 200000) throw new ProviderError('Invalid model settings or unsupported fields', 400);
   return editableSettings(normalizeSettings(value));
-}
-export async function getScraperConfiguration(pool: Pool | PoolClient, userId: string): Promise<ScrapeConfiguration> {
-  const { rows: [row] } = await pool.query('SELECT scrapegraph_api_key AS "apiKey", scrapegraph_settings AS settings FROM users WHERE id=$1', [userId]);
-  if (!row) throw new ScrapeError('The scraper account is unavailable. Sign in again or start a new job run.', 503, 'API_KEY_REQUIRED');
-  return { apiKey: row.apiKey, ...validateScrapeSettings({ ...DEFAULT_SCRAPE_SETTINGS, ...row.settings }) };
-}
-function publicScraperSettings({ apiKey, ...settings }: ScrapeConfiguration) {
-  return { ...settings, configured: !!apiKey };
-}
-function scrapeFailure(res: Response, error: unknown) {
-  if (!res.destroyed) res.status(error instanceof ScrapeError ? error.status : 503).json({
-    error: error instanceof ScrapeError ? error.message : 'Scraper service unavailable. Please retry.',
-    code: error instanceof ScrapeError ? error.code : 'RETRIEVAL_FAILED',
-  });
 }
 export async function completeQa(payload: unknown, signal: AbortSignal, options: {
   attempts?: number; beforeAttempt?: (attempt: number) => Promise<void>;
@@ -85,78 +71,24 @@ export async function completeQa(payload: unknown, signal: AbortSignal, options:
   signal.throwIfAborted();
   throw new ProviderError(exhaustedMessage);
 }
-export function registerProviderRoutes(app: Express, pool: Pool, scrape = scrapeWithAgent) {
-  app.get('/api/scraper-settings', async (_req, res) => {
-    try { res.json(publicScraperSettings(await getScraperConfiguration(pool, res.locals.user.id))); }
-    catch (error) { scrapeFailure(res, error); }
-  });
-  app.put('/api/scraper-settings', async (req, res) => {
-    try {
-      if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) ||
-          Object.keys(req.body).some(key => !['apiKey', 'mode', 'stealth', 'wait', 'scrolls'].includes(key))) {
-        throw new ScrapeError('Only an API key and scraper loading settings are accepted.', 400, 'INVALID_SETTINGS');
-      }
-      const settings = validateScrapeSettings(req.body);
-      const apiKey = req.body.apiKey === undefined || req.body.apiKey === null ? null : validateScrapeKey(req.body.apiKey);
-      const { rows: [row] } = await pool.query(`UPDATE users SET scrapegraph_settings=$2,
-        scrapegraph_api_key=CASE WHEN $3 THEN $4 ELSE scrapegraph_api_key END WHERE id=$1
-        RETURNING scrapegraph_api_key IS NOT NULL AS configured`,
-        [res.locals.user.id, JSON.stringify(settings), req.body.apiKey !== undefined, apiKey]);
-      if (!row) throw new ScrapeError('Your account is unavailable. Sign in again.', 503, 'API_KEY_REQUIRED');
-      res.json({ ...settings, configured: row.configured });
-    } catch (error) { scrapeFailure(res, error); }
-  });
-  app.post('/api/scraper-settings/test', async (req, res) => {
-    const controller = new AbortController();
-    const disconnect = () => { if (!res.writableEnded) controller.abort(); };
-    res.on('close', disconnect);
-    try {
-      if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) || Object.keys(req.body).some(key => key !== 'apiKey')) {
-        throw new ScrapeError('Key testing accepts an optional API key only.', 400, 'INVALID_SETTINGS');
-      }
-      const apiKey = req.body.apiKey === undefined ? (await getScraperConfiguration(pool, res.locals.user.id)).apiKey : validateScrapeKey(req.body.apiKey);
-      const credits = await checkScrapeCredits(apiKey, controller.signal);
-      if (!res.destroyed) res.json(credits);
-    } catch (error) { scrapeFailure(res, error); }
-    finally { res.removeListener('close', disconnect); }
-  });
+export function registerProviderRoutes(app: Express, pool: Pool) {
   app.get('/api/provider-settings', async (_req, res) => { res.json(await getProviderSettings(pool)); });
   app.put('/api/provider-settings', async (req, res) => {
     if (res.locals.user?.role !== 'admin') { res.status(403).json({ error: 'Administrator access required' }); return; }
     const settings = validateSettings(req.body);
     await transaction(pool, async client => {
-      await client.query("UPDATE provider_settings SET settings=$1 WHERE id='default'", [JSON.stringify(settings)]);
+      await client.query("UPDATE provider_settings SET settings=$1::jsonb WHERE id='default'", [JSON.stringify(settings)]);
       await client.query("UPDATE qa_agent_settings SET memory=$1,updated_at=now() WHERE id='default'", [settings.qaAgentMemory]);
     });
     res.json(await getProviderSettings(pool));
   });
-  // Every scrape entry point shares the same agent and evidence contract.
-  app.post("/api/scrape", async (req, res) => {
-    const controller = new AbortController();
-    const disconnect = () => { if (!res.writableEnded) controller.abort(); };
-    res.on("close", disconnect);
-    try {
-      if (!req.body || typeof req.body !== "object" || Array.isArray(req.body) || Object.keys(req.body).some(key => key !== "url")) throw new ScrapeError("Only a URL is accepted", 400);
-      const { url } = validateScrapeInput(req.body);
-      const markdown = await scrape(url, controller.signal, await getScraperConfiguration(pool, res.locals.user.id));
-      if (!res.destroyed) res.json({ markdown });
-    } catch (error) {
-      if (!res.destroyed) res.status(error instanceof ScrapeError || error instanceof ProviderError ? error.status : 500).json({
-        error: error instanceof ScrapeError || error instanceof ProviderError ? error.message : "Failed to retrieve URL",
-        code: error instanceof ScrapeError ? error.code : 'RETRIEVAL_FAILED',
-      });
-    } finally {
-      res.removeListener("close", disconnect);
-    }
-  });
-
   app.post('/api/chat', async (req, res) => {
     if (res.locals.user?.role !== 'admin') { res.status(403).json({ error: 'Administrator access required' }); return; }
     if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) ||
       Object.keys(req.body).some(key => !['modelName', 'purpose'].includes(key)) ||
-      (req.body.purpose !== undefined && !['qa', 'scrapper'].includes(req.body.purpose)) ||
+      (req.body.purpose !== undefined && req.body.purpose !== 'qa') ||
       (req.body.modelName !== undefined && (typeof req.body.modelName !== 'string' || !req.body.modelName.trim() || req.body.modelName.length > 256))) {
-      res.status(400).json({ error: 'Test API accepts optional modelName and purpose (qa or scrapper) only' }); return;
+      res.status(400).json({ error: 'Test API accepts optional modelName and purpose (qa) only' }); return;
     }
     const controller = new AbortController();
     const disconnect = () => { if (!res.writableEnded) controller.abort(); };
@@ -168,7 +100,7 @@ export function registerProviderRoutes(app: Express, pool: Pool, scrape = scrape
       let modelName = req.body.modelName?.trim();
       if (modelName === undefined) {
         const settings = await getProviderSettings(pool);
-        modelName = purpose === 'scrapper' ? settings.scrapperModelName : settings.modelName;
+        modelName = settings.modelName;
       }
       signal.throwIfAborted();
       const response = await fetchChatCompletion(credentials.baseUrl, credentials.apiKey, {
@@ -183,7 +115,7 @@ export function registerProviderRoutes(app: Express, pool: Pool, scrape = scrape
       signal.throwIfAborted();
       if (!res.destroyed) res.json({ success: true, purpose, modelName });
     } catch (error) {
-      const known = error instanceof ProviderError || error instanceof ScrapeError;
+      const known = error instanceof ProviderError;
       if (!res.destroyed) res.status(known ? error.status : controller.signal.aborted || (error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name)) ? 504 : 502)
         .json({ error: known ? error.message : 'Model test failed or timed out. Check the server provider configuration.' });
     } finally { res.removeListener('close', disconnect); }

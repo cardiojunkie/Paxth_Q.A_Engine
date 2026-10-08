@@ -5,12 +5,13 @@ import type { Pool, PoolClient } from 'pg';
 import type { SkuData } from '../hooks/useCatalogData';
 import { prepareQaInput } from '../lib/qaAgent';
 import { buildQaRequest, parseQaResponse } from '../lib/qaRequest';
-import { hasCompletedQa } from '../lib/jobRunState';
+import { hasCompletedQa, unreviewedRunSnapshot, withoutRawQaResult } from '../lib/jobRunState';
 import { normalizeSettings } from '../lib/providerSettings';
-import { scrapeWithAgent } from '../lib/scrapeAgent';
+import { scrapePage } from '../lib/browserScrape';
+import { usableScrapedMarkdown } from '../lib/scrapeEvidence';
 import { ProviderError } from '../lib/chatCompletion';
-import { completeQa, getProviderCredentials, getProviderSettings, getScraperConfiguration } from './provider';
-import { mapCatalogRow } from './catalog';
+import { completeQa, getProviderCredentials, getProviderSettings } from './provider';
+import { mapCatalogRow, saveScrapedEvidence, saveScrapeFailure } from './catalog';
 
 // ponytail: global mutation lock and one worker fit this deployment; partition by job if throughput requires it.
 export const JOB_MUTATION_LOCK = 73462190;
@@ -77,7 +78,8 @@ async function readRun(pool: Pool | PoolClient, id: string) {
   return { ...publicRun(run), items: rows.map(item => ({
     sku: item.sku, status: item.status, attempts: item.attempts,
     startedAt: item.started_at, finishedAt: item.finished_at, error: item.error,
-    snapshot: item.snapshot, result: item.result,
+    snapshot: unreviewedRunSnapshot(item.snapshot),
+    result: item.result ? { ...item.result, raw_row: withoutRawQaResult(item.result.raw_row || {}) } : null,
   })) };
 }
 
@@ -128,8 +130,9 @@ export function registerJobRunRoutes(app: Express, pool: Pool) {
           const row = rowsBySku.get(sku)!;
           const snapshot = mapCatalogRow(row);
           const selected = input.mode === 'all' || (input.mode === 'single' ? sku === input.sku : !hasCompletedQa(snapshot));
-          await client!.query('INSERT INTO job_run_items(run_id,sku,position,revision,snapshot,status) VALUES($1,$2,$3,$4,$5,$6)',
-            [runId, sku, position, row.revision, JSON.stringify(snapshot), selected ? 'queued' : 'skipped']);
+          const priorResult = !selected && hasCompletedQa(snapshot) ? snapshot : null;
+          await client!.query('INSERT INTO job_run_items(run_id,sku,position,revision,snapshot,status,result) VALUES($1,$2,$3,$4,$5,$6,$7)',
+            [runId, sku, position, row.revision, JSON.stringify(unreviewedRunSnapshot(snapshot, false)), selected ? 'queued' : 'skipped', priorResult ? JSON.stringify(priorResult) : null]);
         }
         await client!.query("UPDATE jobs SET status='running', error=NULL WHERE id=$1", [job.id]);
         return runId;
@@ -175,8 +178,8 @@ const cleanUsage = (usage: any) => Object.fromEntries(['prompt_tokens', 'complet
   [key, Number.isSafeInteger(usage?.[key]) && usage[key] >= 0 ? usage[key] : 0]));
 
 function withResult(snapshot: SkuData, qa: any, usage: any, elapsed: number, jobId: string): SkuData {
-  return { ...snapshot, status: qa.qa_status === 'fail' ? 'failed' : 'completed', error: null,
-    qa_result: qa, raw_row: { ...snapshot.raw_row, qa_result: qa }, last_job_id: jobId,
+  return { ...snapshot, status: qa.qa_status === 'fail' ? 'failed' : 'completed', error: null, qa_stale: false,
+    qa_result: qa, last_job_id: jobId,
     tokensUsed: cleanUsage(usage) as SkuData['tokensUsed'], timeTaken: elapsed,
     export_data: { ...qa, last_job_id: jobId, updated_at: new Date().toISOString() },
   };
@@ -194,12 +197,11 @@ async function persistItem(client: PoolClient, run: any, owner: string, item: an
     await client.query("UPDATE job_run_items SET status=$3,result=$4,error=$5,finished_at=now() WHERE run_id=$1 AND sku=$2 AND status='running'",
       [run.id, item.sku, result.error ? 'failed' : 'completed', JSON.stringify(result), result.error ?? null]);
     // A result remains in history even when newer evidence prevents updating the live catalog.
-    await client.query(`UPDATE sku_data SET status=$3,raw_row=$4,qa_result=$5,export_data=$6,last_job_id=$7,
-      tokens_used=$8,time_taken=$9,error=$10,scraped_markdown=$11,scrape_status=$12
-      WHERE sku=$1 AND revision=$2`, [item.sku, item.revision, result.status, JSON.stringify(result.raw_row),
-      JSON.stringify(result.qa_result ?? null), JSON.stringify(result.export_data ?? null), run.job_id,
-      JSON.stringify(result.tokensUsed ?? null), result.timeTaken ?? 0, result.error ?? null,
-      result.scraped_markdown ?? null, result.scrape_status ?? null]);
+    await client.query(`UPDATE sku_data SET status=$3,qa_result=COALESCE($4::jsonb,qa_result),export_data=COALESCE($5::jsonb,export_data),last_job_id=$6,
+      tokens_used=$7,time_taken=$8,error=$9,qa_revision=CASE WHEN $4::jsonb IS NOT NULL THEN $2 ELSE qa_revision END
+      WHERE sku=$1 AND revision=$2`, [item.sku, item.revision, result.status,
+      result.qa_result ? JSON.stringify(result.qa_result) : null, result.export_data ? JSON.stringify(result.export_data) : null, run.job_id,
+      result.tokensUsed ? JSON.stringify(result.tokensUsed) : null, result.timeTaken ?? 0, result.error ?? null]);
   });
 }
 
@@ -213,10 +215,10 @@ async function finishRun(client: PoolClient, run: any, owner: string) {
     const status = cancelled ? 'cancelled' : failed ? 'failed' : 'completed';
     const error = cancelled ? 'Run cancelled; committed results were preserved.' : failed ? 'Some SKUs failed to process.' : null;
     await client.query('UPDATE job_runs SET status=$2,error=$3,finished_at=now(),owner_token=NULL WHERE id=$1', [run.id, status, error]);
-    const effective = items.map(item => item.result || item.snapshot);
+    const effective = items.map(item => item.result || unreviewedRunSnapshot(item.snapshot));
     const jobStatus = failed ? 'failed' : effective.every(hasCompletedQa) ? 'completed' : 'pending';
     const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-    for (const item of items) for (const key of Object.keys(usage)) usage[key] += cleanUsage(item.result?.tokensUsed)[key];
+    for (const item of items.filter(item => item.status !== 'skipped')) for (const key of Object.keys(usage)) usage[key] += cleanUsage(item.result?.tokensUsed)[key];
     await client.query(`UPDATE jobs SET status=$2,error=$3,time_taken=LEAST(2147483647,COALESCE(time_taken,0)::bigint+$4::bigint),
       tokens_used=jsonb_build_object('prompt_tokens',COALESCE((tokens_used->>'prompt_tokens')::bigint,0)+$5::bigint,
       'completion_tokens',COALESCE((tokens_used->>'completion_tokens')::bigint,0)+$6::bigint,
@@ -225,7 +227,7 @@ async function finishRun(client: PoolClient, run: any, owner: string) {
   });
 }
 
-async function executeRun(client: PoolClient, pool: Pool, run: any, owner: string, ownership: AbortSignal, scrape: typeof scrapeWithAgent) {
+async function executeRun(client: PoolClient, pool: Pool, run: any, owner: string, ownership: AbortSignal, scrape: typeof scrapePage) {
   const settings = normalizeSettings(run.configuration.settings);
   while (!ownership.aborted) {
     const item = await transaction(client, async () => {
@@ -251,30 +253,44 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
     const start = new Date(item.started_at).getTime();
     const remaining = Math.max(1, start + SKU_BUDGET_MS - Date.now());
     const execution = AbortSignal.any([ownership, cancelled.signal, AbortSignal.timeout(remaining)]);
-    let snapshot: SkuData = item.snapshot;
+    let snapshot: SkuData = unreviewedRunSnapshot(item.snapshot);
     let result: SkuData;
     try {
       if (Date.now() >= start + SKU_BUDGET_MS) throw new Error('SKU exceeded its five-minute execution budget');
-      if (snapshot.source.url && !snapshot.scraped_markdown?.trim() && !['success', 'failed'].includes(snapshot.scrape_status)) {
+      if (snapshot.source.url && !usableScrapedMarkdown(snapshot)) {
         // One retrieval per durable item; a crash requires an explicit rerun.
         if (!item.scrape_started) {
           await transaction(client, async () => {
             await assertOwner(client, run.id, owner);
             await client.query('UPDATE job_run_items SET scrape_started=true WHERE run_id=$1 AND sku=$2', [run.id, item.sku]);
           });
-          try {
-            const markdown = await scrape(snapshot.source.url, execution, await getScraperConfiguration(pool, run.actor_id));
-            snapshot = { ...snapshot, scraped_markdown: markdown, scrape_status: 'success' };
-          } catch (error) {
+          let retrieved: Awaited<ReturnType<typeof scrapePage>> | undefined;
+          let retrievalFailure: unknown;
+          try { retrieved = await scrape(snapshot.source.url, execution); }
+          catch (error) {
             execution.throwIfAborted();
-            snapshot = { ...snapshot, scrape_status: 'failed', error: errorText(error) };
-            if (!snapshot.source.sap?.trim()) throw error;
+            retrievalFailure = error;
+            snapshot = { ...snapshot, scrape_status: 'failed', scrape_error: errorText(error) };
           }
-          await transaction(client, async () => {
+          const persisted = await transaction(client, async () => {
             await assertOwner(client, run.id, owner);
-            await client.query('UPDATE job_run_items SET snapshot=$3 WHERE run_id=$1 AND sku=$2', [run.id, item.sku, JSON.stringify(snapshot)]);
+            execution.throwIfAborted();
+            const saved = retrieved
+              ? await saveScrapedEvidence(client, item.sku, item.revision, retrieved)
+              : await saveScrapeFailure(client, item.sku, item.revision, errorText(retrievalFailure));
+            // A newer live revision keeps this evidence in run history only.
+            const nextRevision = saved && retrieved ? saved.revision : item.revision;
+            const nextSnapshot: SkuData = retrieved ? { ...snapshot, revision: nextRevision, scraped_markdown: retrieved.markdown,
+              scrape_metadata: saved?.scrape_metadata || { method: 'browser', requestedUrl: retrieved.requestedUrl, finalUrl: retrieved.finalUrl, capturedAt: new Date().toISOString() },
+              scrape_status: 'success', scrape_error: null } : snapshot;
+            await client.query('UPDATE job_run_items SET snapshot=$3,revision=$4 WHERE run_id=$1 AND sku=$2', [run.id, item.sku, JSON.stringify(nextSnapshot), nextRevision]);
+            execution.throwIfAborted();
+            return { snapshot: nextSnapshot, revision: nextRevision };
           });
-        } else if (!snapshot.source.sap?.trim()) throw new Error('Scraping was interrupted. Rerun this SKU to collect evidence.');
+          snapshot = persisted.snapshot;
+          item.revision = persisted.revision;
+          if (retrievalFailure && !snapshot.source.sap?.trim()) throw retrievalFailure;
+        } else if (!snapshot.source.sap?.trim()) throw new Error(snapshot.scrape_error || 'Scraping was interrupted. Rerun this SKU to collect evidence.');
       }
       const input = prepareQaInput(snapshot, run.configuration.attributeSets, run.configuration.qaAgentMemory, settings.maxPageContentLength);
       const response = await completeQa(buildQaRequest(settings, input).payload, execution, {
@@ -301,7 +317,7 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
       if (ownership.aborted) { clearInterval(monitor); throw error; }
       if (cancelled.signal.aborted) { clearInterval(monitor); continue; }
       result = { ...snapshot, status: 'failed', qa_result: undefined, export_data: undefined,
-        raw_row: { ...snapshot.raw_row, qa_result: undefined }, error: execution.aborted ? 'SKU exceeded its five-minute execution budget' : errorText(error), timeTaken: Date.now() - start };
+        error: execution.aborted ? 'SKU exceeded its five-minute execution budget' : errorText(error), timeTaken: Date.now() - start };
     }
     try {
       // Keep the paid response in memory while retrying only its database commit.
@@ -317,7 +333,7 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
   }
 }
 
-export function startJobWorker(pool: Pool, scrape = scrapeWithAgent): () => Promise<void> {
+export function startJobWorker(pool: Pool, scrape = scrapePage): () => Promise<void> {
   const stop = new AbortController();
   const task = (async () => {
     while (!stop.signal.aborted) {

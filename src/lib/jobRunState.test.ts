@@ -7,17 +7,21 @@ import {
   getCompletedJobSkuIds,
   getExportColumns,
   getJobRunStatus,
+  hasCompletedQa,
   selectJobSkus,
 } from "./jobRunState.ts";
 import { populateQaWorksheet } from "./qaExcelExport.ts";
 
 const skus = [
-  { sku: "done", status: "completed" },
+  { sku: "done", status: "completed", qa_result: { qa_status: "pass" } },
   { sku: "qa-fail", status: "failed", qa_result: { qa_status: "fail" } },
   { sku: "retry", status: "failed" },
 ];
 
 assert.deepEqual(selectJobSkus(skus).map((sku) => sku.sku), ["retry"]);
+assert.equal(hasCompletedQa({ sku: "no-result", status: "completed" }), false);
+assert.equal(hasCompletedQa({ sku: "warning", status: "completed", qa_result: { qa_status: "warning" } }), true);
+assert.equal(hasCompletedQa({ sku: "pending", status: "ready", qa_result: { qa_status: "pass" } }), false);
 assert.deepEqual(selectJobSkus(skus, undefined, true).map((sku) => sku.sku), ["done", "qa-fail", "retry"]);
 assert.deepEqual(selectJobSkus(skus, "done").map((sku) => sku.sku), ["done"]);
 assert.deepEqual(selectJobSkus([{ ...skus[0], error: "API error", qa_result: {} }]).map((sku) => sku.sku), ["done"]);
@@ -267,11 +271,11 @@ assert.match(note("P2"), /Suggested correction: Missing value/);
 assert.match(note("P2"), /Field: Brand\nDo not guess/);
 assert.match(note("P2"), /Field: General\nReview the product identity/);
 assert.equal(color("P2"), "FFFFCCCC");
-assert.equal(feedback.getCell("C3").value, "New brand", "Legacy stored results still export");
-assert.match(note("B3"), /Use the complete brand name/);
-assert.equal(color("B3"), "FFFFE5B4");
+assert.equal(feedback.getCell("C3").value, null, "Raw-only legacy results never supply corrections");
+assert.equal(note("B3"), "");
+assert.equal(color("B3"), undefined);
 assert.equal(feedback.getCell("F3").value, 0);
-assert.equal(feedback.getCell("P3").value, "warning");
+assert.equal(feedback.getCell("P3").value, "completed", "Execution status is not a QA verdict");
 for (const address of ["C4", "E4", "G4", "K4"]) assert.equal(feedback.getCell(address).value, null);
 for (const address of ["B4", "D4", "F4", "J4", "P4"]) {
   assert.equal(note(address), "");
@@ -342,10 +346,9 @@ assert.equal(sixOnly.getCell("E2").value, "Fixed six");
 assert.match(note("D2", sixOnly), /Fix bullet six/);
 
 const legacyOnly = loadedWorkbook.getWorksheet("Legacy only")!;
-assert.deepEqual(exportedHeaders(legacyOnly), [
-  ...qaHeaders.slice(0, 2), "Corrected: attributes__brand", ...qaHeaders.slice(2), ...metadataHeaders,
-]);
-assert.equal(legacyOnly.getCell("C2").value, "New brand");
+assert.deepEqual(exportedHeaders(legacyOnly), [...qaHeaders, ...metadataHeaders]);
+assert.equal(legacyOnly.getCell("B2").value, "Old brand");
+assert.equal(note("B2", legacyOnly), "");
 const partial = loadedWorkbook.getWorksheet("Conflicting and missing")!;
 assert.deepEqual(exportedHeaders(partial), exportedHeaders(feedback).filter((header) => header !== "Corrected: attributes__model"));
 assert.equal(partial.getCell("E2").value, null);

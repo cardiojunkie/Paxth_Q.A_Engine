@@ -33,7 +33,7 @@ async function check(expected?: string, allowLoopback = false) {
       }
       assert.equal((await login('https://evil.example', 'same-origin', 'evil.example')).status, 403, 'Matching an unrelated Host does not bypass the check');
       assert.equal((await login('http://localhost:9999')).status, 403, 'Loopback Origin must match the request Host and port');
-      assert.equal((await send('PUT', '/api/scraper-settings', `http://localhost:${port}`, 'same-origin', `localhost:${port}`)).status, 401, 'Rewritten settings save reaches session validation');
+      assert.equal((await send('POST', '/api/catalog/example/scrape', `http://localhost:${port}`, 'same-origin', `localhost:${port}`)).status, 401, 'Rewritten scrape request reaches session validation');
     }
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 }
@@ -55,4 +55,4 @@ try {
 } finally {
   for (const name of names) { if (saved[name] === undefined) delete process.env[name]; else process.env[name] = saved[name]; }
 }
-console.log('Authentication origin checks passed: local, Codespaces rewrites, settings saves, explicit overrides, production and cross-site protection.');
+console.log('Authentication origin checks passed: local, Codespaces rewrites, SKU scraping, explicit overrides, production and cross-site protection.');

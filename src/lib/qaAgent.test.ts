@@ -5,6 +5,7 @@ import { DEFAULT_QA_AGENT_MEMORY, prepareQaInput, finalizeQaResult } from "./qaA
 import { populateQaWorksheet } from "./qaExcelExport";
 import { normalizeSettings } from "../hooks/useSettings";
 import { buildQaRequest, parseQaResponse } from "./qaRequest";
+import { usableScrapedMarkdown } from './scrapeEvidence';
 
 const set = { id: "tv", name: " TV ", rulesMarkdown: "Check the model suffix.", createdAt: 0, updatedAt: 0 };
 const sku: SkuData = {
@@ -20,6 +21,12 @@ const sku: SkuData = {
   scraped_markdown: "Web evidence for model 001",
 };
 const originalSku = JSON.stringify(sku);
+const browserEvidence: SkuData = { ...sku, scrape_metadata: { method: 'browser', requestedUrl: 'https://example.com/old', finalUrl: 'https://example.com/old', capturedAt: '2026-10-07T00:00:00Z' } };
+assert.equal(usableScrapedMarkdown(browserEvidence), '');
+assert.equal(prepareQaInput(browserEvidence, [set], 'Memory', 40000).webAvailable, false);
+assert.throws(() => prepareQaInput({ ...browserEvidence, source: { url: sku.source.url } }, [set], 'Memory', 40000), /no usable SAP/);
+assert.equal(usableScrapedMarkdown({ ...browserEvidence, source: { url: 'example.com/old#details' } }), sku.scraped_markdown);
+assert.equal(usableScrapedMarkdown({ ...browserEvidence, source: {}, scrape_metadata: { method: 'manual', requestedUrl: null, finalUrl: null, capturedAt: null } }), sku.scraped_markdown);
 const input = prepareQaInput(sku, [set], "Custom instructions", 40000);
 const requestSettings = normalizeSettings({
   modelName: "deepseek/deepseek-v4.1-flash", temperature:0.3, maxTokens: 10000, maxConcurrency: 3, maxRetries: 2,

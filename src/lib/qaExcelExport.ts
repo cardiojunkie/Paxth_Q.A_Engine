@@ -26,7 +26,7 @@ export function populateQaWorksheet(
 
   // Resolve each issue once so column selection and cell notes use the same header.
   const preparedSkus = skus.map((sku) => {
-    const qa = sku.qa_result || sku.raw_row?.qa_result;
+    const qa = sku.qa_result;
     const groupedIssues = new Map<number, QaIssue[]>();
 
     for (const issue of Array.isArray(qa?.issues) ? qa.issues : []) {

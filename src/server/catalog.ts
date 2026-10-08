@@ -1,6 +1,9 @@
 import type { Express } from 'express';
 import type { Pool, PoolClient } from 'pg';
 import { transaction } from './database';
+import { LEGACY_REVIEW_ERROR, unprocessedStatus, withoutRawQaResult } from '../lib/jobRunState';
+import { scrapePage, ScrapeError, validateScrapeInput } from '../lib/browserScrape';
+import { usableScrapedMarkdown } from '../lib/scrapeEvidence';
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -17,6 +20,7 @@ export function validateCatalogImport(items: unknown): asserts items is any[] {
   requireInput(Array.isArray(items) && items.length > 0 && items.length <= 10000, 'Expected 1–10000 catalog rows');
   for (const item of items as any[]) {
     requireInput(object(item) && identifier(item.sku) && sourceValid(item.source) && object(item.raw_row) && object(item.upload_attributes), 'Each row needs a SKU, source, original row, and upload attributes');
+    requireInput(!Object.hasOwn(item.raw_row, 'qa_result'), 'raw_row.qa_result is reserved for server-generated QA; remove it before importing.');
     requireInput(item.attribute_set === undefined || typeof item.attribute_set === 'string', 'Invalid attribute set');
     requireInput(item.status === undefined || ['pending','ready','cannot_qa'].includes(item.status), 'Imports must contain unprocessed SKUs');
     requireInput(!['qa_result','export_data','tokensUsed','last_job_id'].some(key => key in item), 'QA results are written by the server');
@@ -29,13 +33,19 @@ export function validateJob(value: any) {
   requireInput(value.createdAt === undefined || typeof value.createdAt === 'string' && /^\d{4}-\d\d-\d\dT/.test(value.createdAt) && Number.isFinite(Date.parse(value.createdAt)), 'Invalid job timestamp');
 }
 
-export const mapCatalogRow = (row: any) => ({
-  sku: row.sku, upload_attributes: row.upload_attributes || {}, source: row.source || {}, raw_row: row.raw_row || {},
-  status: row.status, attribute_set: row.attribute_set || row.attribute_set_id || undefined,
-  scraped_markdown: row.scraped_markdown, scrape_status: row.scrape_status, tokensUsed: row.tokens_used,
-  timeTaken: row.time_taken, error: row.error, qa_result: row.qa_result || row.raw_row?.qa_result,
-  export_data: row.export_data, last_job_id: row.last_job_id, revision: row.revision,
-});
+export const mapCatalogRow = (row: any) => {
+  const unverified = !row.qa_result && (Object.hasOwn(row.raw_row || {}, 'qa_result') || row.status === 'completed');
+  const stale = Boolean(row.qa_result) && row.qa_revision !== row.revision;
+  const qa = stale || row.error ? null : row.qa_result;
+  return {
+    sku: row.sku, upload_attributes: row.upload_attributes || {}, source: row.source || {}, raw_row: withoutRawQaResult(row.raw_row || {}),
+    status: stale || unverified && row.status === 'completed' ? unprocessedStatus(row) : row.status, attribute_set: row.attribute_set || row.attribute_set_id || undefined,
+    scraped_markdown: row.scraped_markdown, scrape_status: row.scrape_status, scrape_metadata: row.scrape_metadata,
+    scrape_error: row.scrape_error, qa_stale: stale, tokensUsed: stale ? null : row.tokens_used,
+    timeTaken: stale ? null : row.time_taken, error: row.error || (unverified ? LEGACY_REVIEW_ERROR : null), qa_result: qa,
+    export_data: qa ? row.export_data : null, last_job_id: stale ? null : row.last_job_id, revision: row.revision,
+  };
+};
 export const mapJobRow = (row: any) => ({
   id: row.id, name: row.name, createdAt: row.created_at, attribute_set: row.attribute_set || '', skus: row.skus || [],
   status: row.status || 'pending', tokensUsed: row.tokens_used, timeTaken: row.time_taken, error: row.error,
@@ -48,7 +58,22 @@ async function ensureIdle(client: PoolClient, jobIds?: string[], skus?: string[]
   if (rows.length) throw new ApiError(409, 'Cancel active runs and wait for them to stop before deleting or changing this job');
 }
 
-export function registerCatalogRoutes(app: Express, pool: Pool) {
+/** Called within the existing mutation transaction by HTTP retrieval and durable jobs. */
+export async function saveScrapedEvidence(client: PoolClient, sku: string, revision: number, result: Awaited<ReturnType<typeof scrapePage>>, id?: number) {
+  const metadata = { method: 'browser', requestedUrl: result.requestedUrl, finalUrl: result.finalUrl, capturedAt: new Date().toISOString() };
+  const { rows: [row] } = await client.query(`UPDATE sku_data SET scraped_markdown=$3,scrape_metadata=$4,
+    scrape_status='success',scrape_error=NULL,status='ready',error=NULL,revision=revision+1
+    WHERE sku=$1 AND revision=$2 AND ($5::integer IS NULL OR id=$5) RETURNING *`, [sku, revision, result.markdown, JSON.stringify(metadata), id ?? null]);
+  return row;
+}
+
+export async function saveScrapeFailure(client: PoolClient, sku: string, revision: number, error: string, id?: number) {
+  const { rows: [row] } = await client.query(`UPDATE sku_data SET scrape_status='failed',scrape_error=$3
+    WHERE sku=$1 AND revision=$2 AND ($4::integer IS NULL OR id=$4) RETURNING *`, [sku, revision, error, id ?? null]);
+  return row;
+}
+
+export function registerCatalogRoutes(app: Express, pool: Pool, scrape = scrapePage) {
   app.get('/api/catalog', async (_req, res) => res.json((await pool.query('SELECT * FROM sku_data ORDER BY id')).rows.map(mapCatalogRow)));
   app.post('/api/catalog', async (req, res) => {
     validateCatalogImport(req.body);
@@ -65,7 +90,8 @@ export function registerCatalogRoutes(app: Express, pool: Pool) {
     res.json(result);
   });
   app.put('/api/catalog/:sku', async (req, res) => {
-    const item = req.body;
+    requireInput(object(req.body) && Number.isSafeInteger(req.body.expectedRevision) && req.body.expectedRevision >= 0, 'Supply the expected catalog revision');
+    const { expectedRevision, ...item } = req.body;
     const fields: Record<string, string> = { source:'source', upload_attributes:'upload_attributes', attribute_set:'attribute_set', scraped_markdown:'scraped_markdown', scrape_status:'scrape_status', status:'status', error:'error' };
     requireInput(object(item) && Object.keys(item).length && Object.keys(item).every(key => Object.hasOwn(fields,key)), 'Only catalog evidence fields may be edited');
     if (item.source !== undefined) requireInput(sourceValid(item.source), 'Invalid source');
@@ -74,20 +100,78 @@ export function registerCatalogRoutes(app: Express, pool: Pool) {
     if (item.scrape_status !== undefined) requireInput(['success','failed','skipped_no_url'].includes(item.scrape_status), 'Invalid scrape status');
     if (item.status !== undefined) requireInput(['pending','ready','cannot_qa'].includes(item.status), 'Execution status is controlled by the server');
     const saved = await transaction(pool, async client => {
-      const values: any[] = [req.params.sku];
+      const current = (await client.query('SELECT * FROM sku_data WHERE sku=$1 FOR UPDATE', [req.params.sku])).rows[0];
+      if (!current) throw new ApiError(404, 'SKU not found');
+      if (current.revision !== expectedRevision) throw new ApiError(409, 'SKU evidence changed. Refresh the catalog before saving.');
+      if (item.source && !current.scrape_metadata && current.scraped_markdown?.trim()) {
+        item.scrape_metadata = { method: 'legacy', requestedUrl: current.source?.url ?? null, finalUrl: null, capturedAt: null };
+      }
+      if ('scraped_markdown' in item) {
+        requireInput(!item.scraped_markdown || item.scraped_markdown.length <= 200000, 'Evidence exceeds 200,000 characters');
+        item.scrape_metadata = { method: 'manual', requestedUrl: null, finalUrl: null, capturedAt: new Date().toISOString() };
+        item.scrape_status = item.scraped_markdown?.trim() ? 'success' : 'failed';
+        item.scrape_error = null;
+      }
+      const next = { ...current, ...item };
+      item.status = unprocessedStatus(next);
+      item.error = null;
+      const columns: Record<string, string> = { ...fields, scrape_metadata: 'scrape_metadata', scrape_error: 'scrape_error' };
+      const values: any[] = [req.params.sku, expectedRevision];
       const assignments = Object.entries(item).map(([key,value]) => {
         values.push(object(value) ? JSON.stringify(value) : value);
-        return `${fields[key]}=$${values.length}`;
+        return `${columns[key]}=$${values.length}`;
       });
-      if (['source','upload_attributes','attribute_set','scraped_markdown'].some(key => key in item)) {
-        if (!('status' in item)) assignments.push("status='ready'");
-        if (!('error' in item)) assignments.push("error=CASE WHEN qa_result IS NOT NULL OR raw_row ? 'qa_result' THEN 'Evidence changed; rerun QA.' ELSE NULL END");
-      }
-      const result = await client.query(`UPDATE sku_data SET ${assignments.join(',')}, revision=revision+1 WHERE sku=$1 RETURNING *`, values);
+      const result = await client.query(`UPDATE sku_data SET ${assignments.join(',')}, revision=revision+1 WHERE sku=$1 AND revision=$2 RETURNING *`, values);
       if (!result.rows.length) throw new ApiError(404, 'SKU not found');
       return mapCatalogRow(result.rows[0]);
     });
     res.json(saved);
+  });
+  app.post('/api/catalog/:sku/scrape', async (req, res) => {
+    const controller = new AbortController();
+    const disconnect = () => { if (!res.writableEnded) controller.abort(); };
+    res.on('close', disconnect);
+    try {
+      requireInput(object(req.body) && Object.keys(req.body).length === 1 && Number.isSafeInteger(req.body.expectedRevision) && req.body.expectedRevision >= 0, 'Only expectedRevision is accepted');
+      const sku = String(req.params.sku), revision = req.body.expectedRevision;
+      const { rows: [current] } = await pool.query('SELECT * FROM sku_data WHERE sku=$1', [sku]);
+      if (!current) throw new ApiError(404, 'SKU not found');
+      if (current.revision !== revision) throw new ApiError(409, 'SKU evidence changed. Refresh the catalog before scraping.');
+      const { url } = validateScrapeInput({ url: current.source?.url });
+      let result: Awaited<ReturnType<typeof scrapePage>>;
+      try { result = await scrape(url, controller.signal); }
+      catch (error) {
+        if (controller.signal.aborted || error instanceof ScrapeError && error.code === 'CANCELLED') throw error;
+        await transaction(pool, async client => {
+          controller.signal.throwIfAborted();
+          const saved = await saveScrapeFailure(client, sku, revision, error instanceof ScrapeError ? error.message : 'Failed to retrieve product content.', current.id);
+          controller.signal.throwIfAborted();
+          if (!saved) {
+            if (!(await client.query('SELECT 1 FROM sku_data WHERE sku=$1', [sku])).rowCount) throw new ApiError(404, 'SKU was deleted during retrieval.');
+            throw new ApiError(409, 'SKU changed during retrieval. Refresh the catalog.');
+          }
+        });
+        throw error;
+      }
+      controller.signal.throwIfAborted();
+      const saved = await transaction(pool, async client => {
+        controller.signal.throwIfAborted();
+        const row = await saveScrapedEvidence(client, sku, revision, result, current.id);
+        controller.signal.throwIfAborted();
+        if (!row) {
+          if (!(await client.query('SELECT 1 FROM sku_data WHERE sku=$1', [sku])).rowCount) throw new ApiError(404, 'SKU was deleted during retrieval.');
+          throw new ApiError(409, 'SKU changed during retrieval. The result was not attached; refresh the catalog.');
+        }
+        return mapCatalogRow(row);
+      });
+      if (!res.destroyed) res.json(saved);
+    } catch (error) {
+      const known = error instanceof ScrapeError || error instanceof ApiError;
+      if (!res.destroyed) res.status(known ? error.status : controller.signal.aborted ? 499 : 503).json({
+        error: known ? error.message : controller.signal.aborted ? 'Scraping was cancelled.' : 'Scraped content could not be saved. Please retry.',
+        code: error instanceof ScrapeError ? error.code : error instanceof ApiError && error.status === 409 ? 'REVISION_CONFLICT' : 'SAVE_FAILED',
+      });
+    } finally { res.removeListener('close', disconnect); }
   });
   app.delete('/api/catalog', async (req, res) => {
     requireInput(req.body?.all === true || skuIds(req.body?.skus), 'Specify SKUs or all:true');
@@ -113,8 +197,9 @@ export function registerCatalogRoutes(app: Express, pool: Pool) {
     const saved = await transaction(pool, async client => {
       const rows: any[] = [];
       for (const item of items) {
-        const existing = await client.query('SELECT sku FROM sku_data WHERE sku=ANY($1)', [item.skus]);
+        const existing = await client.query('SELECT * FROM sku_data WHERE sku=ANY($1)', [item.skus]);
         requireInput(existing.rows.length === item.skus.length, 'Every job SKU must exist in the catalog');
+        requireInput(existing.rows.every(row => row.source?.sap?.trim() || row.source?.url?.trim() || usableScrapedMarkdown(row)), 'Every job SKU needs SAP, usable page evidence, or a source URL');
         const result = await client.query(`INSERT INTO jobs (id,name,created_at,attribute_set,skus,status)
           VALUES ($1,$2,$3,$4,$5,'pending') RETURNING *`, [item.id,item.name,new Date().toISOString(),item.attribute_set || null,JSON.stringify(item.skus)]);
         rows.push(mapJobRow(result.rows[0]));

@@ -2,11 +2,10 @@ import assert from "node:assert/strict";
 import { createServer } from "vite";
 import type { SkuData } from "../hooks/useCatalogData";
 import { DEFAULT_SETTINGS } from "../lib/providerSettings";
-import { DEFAULT_SCRAPE_SETTINGS } from "../lib/scrapeRequest";
 import { prepareQaInput } from "../lib/qaAgent";
 
 const sku = (id: string, updates: Partial<SkuData> = {}): SkuData => ({
-  sku: id, status: "ready", attribute_set: "TV", upload_attributes: {},
+  sku: id, revision: 0, status: "ready", attribute_set: "TV", upload_attributes: {},
   source: { url: "https://example.com/product", fileName: "catalog.xlsx", headerOrder: ["sku", "source__sap"] },
   raw_row: { sku: id, source__sap: "Original upload" },
   ...updates,
@@ -28,6 +27,11 @@ catalog[0].qa_result = { summary: "Previous QA" };
 catalog[0].export_data = { summary: "Previous export" };
 catalog[5].source.sap = "Keep existing SAP";
 const original = structuredClone(catalog);
+const sameData = (actual: SkuData, expected: SkuData, message?: string) => {
+  const {revision: _actual, ...actualData} = actual;
+  const {revision: _expected, ...expectedData} = expected;
+  assert.deepEqual(actualData, expectedData, message);
+};
 const writes: { sku: string; updates: Partial<SkuData> }[] = [];
 let failure: "http" | "network" | undefined;
 let holdSave = false;
@@ -37,15 +41,14 @@ let holdScrape = false;
 let releaseScrape!: () => void;
 const scrapeGate = new Promise<void>(resolve => { releaseScrape = resolve; });
 let scrapeRequests = 0;
+let scrapeMarkdown = 'Automatically scraped content';
+let lastScrapeRevision: number;
 let scrapeMode: 'success' | 'blocked' | 'wait' = 'success';
 let finishScrape: (() => void) | undefined;
 const chatRequests: any[] = [];
 const settingsWrites: any[] = [];
+const createdJobs: any[] = [];
 let savedSettings = { ...DEFAULT_SETTINGS, providerConfigured: true };
-let savedScraperSettings = { ...DEFAULT_SCRAPE_SETTINGS, configured: false };
-let scraperSaveFailure = false;
-const scraperWrites: any[] = [];
-const keyTests: any[] = [];
 let releaseChat!: () => void;
 const chatGate = new Promise<void>(resolve => { releaseChat = resolve; });
 let chatMode: 'mixed' | 'success' | 'malformed' | 'missing' = 'mixed';
@@ -53,6 +56,10 @@ let queuedRun: any;
 let failNextCatalogRefresh = false;
 let startRunRequests = 0;
 let catalogRefreshFailures = 0;
+let holdNextCatalogRefresh = false;
+let heldCatalogStarted: (() => void) | undefined;
+let releaseCatalogRefresh = () => {};
+let catalogRefreshGate = Promise.resolve();
 let sampleResponse: any;
 const jobs = [{ id: "scrape-check", name: "Scrape integration", status: "pending", skus: ["present-pending"], created_at: new Date().toISOString(), attribute_set: "TV" }];
 
@@ -64,6 +71,7 @@ try {
   browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_EXECUTABLE, args: ["--no-sandbox"] });
   const page = await browser.newPage();
   page.setDefaultTimeout(15000);
+  page.setDefaultNavigationTimeout(60000);
   await page.addInitScript(() => {
     localStorage.setItem("paxth_qa_user_session", JSON.stringify({
       username: "SAP browser check", role: "user", loginTime: new Date().toISOString(),
@@ -85,19 +93,6 @@ try {
       if (request.method() === 'PUT') { settingsWrites.push(request.postDataJSON()); savedSettings = { ...savedSettings, ...request.postDataJSON() }; }
       return route.fulfill({ json: savedSettings });
     }
-    if (path === '/api/scraper-settings') {
-      if (request.method() === 'PUT') {
-        const { apiKey, ...settings } = request.postDataJSON();
-        scraperWrites.push(request.postDataJSON());
-        if (scraperSaveFailure) return route.fulfill({ status: 503, json: { error: 'Scraper settings could not be saved.' } });
-        savedScraperSettings = { ...settings, configured: apiKey === null ? false : apiKey ? true : savedScraperSettings.configured };
-      }
-      return route.fulfill({ json: savedScraperSettings });
-    }
-    if (path === '/api/scraper-settings/test') {
-      keyTests.push(request.postDataJSON());
-      return route.fulfill({ json: { remaining: 50, used: 5, plan: 'Test' } });
-    }
     if (path === '/api/jobs/scrape-check/runs') {
       if (request.method() === 'POST') {
         startRunRequests++;
@@ -110,40 +105,64 @@ try {
       return route.fulfill({ json: queuedRun ? [queuedRun] : [] });
     }
     if (path === '/api/job-runs/accepted-browser-run') return route.fulfill({ json: queuedRun });
-    if (path === "/api/scrape") {
+    if (request.method() === 'POST' && path.startsWith('/api/catalog/') && path.endsWith('/scrape')) {
       scrapeRequests++;
-      assert.ok(holdScrape, "Editing source data must not trigger a scrape");
-      assert.deepEqual(Object.keys(request.postDataJSON()), ["url"]);
+      assert.ok(holdScrape, 'Editing evidence must not trigger a scrape');
+      assert.deepEqual(Object.keys(request.postDataJSON()), ['expectedRevision']);
+      const id = decodeURIComponent(path.slice('/api/catalog/'.length, -'/scrape'.length));
+      const item = catalog.find(item => item.sku === id)!;
+      const expectedRevision = request.postDataJSON().expectedRevision;
+      lastScrapeRevision = expectedRevision;
       await scrapeGate;
-      if(scrapeMode==='blocked')return route.fulfill({status:502,json:{error:'The website blocked browser access.',details:'Use SAP or manually supplied source content.'}});
-      if(scrapeMode==='wait')await new Promise<void>(resolve=>{finishScrape=resolve;});
-      return route.fulfill({ json: { markdown: "Automatically scraped content" } }).catch(()=>{});
+      if (holdSave) await saveGate;
+      if (scrapeMode === 'blocked') {
+        item.scrape_error = 'The website blocked browser access.';
+        return route.fulfill({status:502,json:{error:item.scrape_error}});
+      }
+      if (scrapeMode === 'wait') {
+        await new Promise<void>(resolve=>{finishScrape=resolve;});
+        return route.abort().catch(()=>{});
+      }
+      if (item.revision !== expectedRevision) return route.fulfill({status:409,json:{error:'SKU changed. Refresh before scraping.'}});
+      Object.assign(item, { revision: expectedRevision + 1, scraped_markdown: scrapeMarkdown, scrape_status: 'success', scrape_error: null,
+        scrape_metadata: {method:'browser',requestedUrl:item.source.url,finalUrl:item.source.url,capturedAt:'2026-10-07T00:00:00Z'} });
+      return route.fulfill({json:item}).catch(()=>{});
     }
     if (request.method() === "PUT" && path.startsWith("/api/catalog/")) {
       const id = decodeURIComponent(path.slice("/api/catalog/".length));
-      const updates = request.postDataJSON() as Partial<SkuData>;
+      const {expectedRevision, ...updates} = request.postDataJSON() as Partial<SkuData> & {expectedRevision:number};
       writes.push({ sku: id, updates });
       if (holdSave) await saveGate;
       if (failure === "network") return route.abort("failed");
       if (failure === "http") return route.fulfill({ status: 503, json: { error: "Database unavailable" } });
       const item = catalog.find(item => item.sku === id);
       assert.ok(item, `Unexpected SKU ${id}`);
-      Object.assign(item, updates);
+      if (expectedRevision !== item.revision) return route.fulfill({status:409,json:{error:"SKU changed. Your draft was not saved."}});
+      Object.assign(item, updates, {revision:expectedRevision+1});
       return route.fulfill({ json: item });
     }
     if (path === "/api/catalog") {
+      if (holdNextCatalogRefresh) {
+        holdNextCatalogRefresh = false;
+        const olderRows = structuredClone(catalog);
+        heldCatalogStarted?.();
+        await catalogRefreshGate;
+        return route.fulfill({json:olderRows});
+      }
       if (failNextCatalogRefresh) { failNextCatalogRefresh = false; catalogRefreshFailures++; return route.fulfill({ status: 503, json: { error: 'Catalog refresh temporarily unavailable' } }); }
       return route.fulfill({ json: catalog });
     }
-    if (path === "/api/jobs") return route.fulfill({ json: jobs });
+    if (path === "/api/jobs") {
+      if (request.method() === 'POST') { createdJobs.push(...request.postDataJSON()); return route.fulfill({json:request.postDataJSON()}); }
+      return route.fulfill({ json: jobs });
+    }
     if (path === "/api/jobs/scrape-check") return route.fulfill({ json: { success: true } });
     if (path === "/api/qa-configuration") return route.fulfill({ json: { qaAgentMemory: "Use supplied evidence.", attributeSets: [] } });
     if (path === "/api/chat") {
       chatRequests.push(request.postDataJSON());
       await chatGate;
       if (chatMode === 'missing') return route.fulfill({ status: 503, json: { error: 'Configure LLM_BASE_URL and LLM_API_KEY on the server.' } });
-      if (request.postDataJSON().purpose === 'qa' && chatMode === 'malformed') return route.fulfill({ json: { success: false } });
-      if (request.postDataJSON().purpose === 'scrapper' && chatMode === 'mixed') return route.fulfill({ status: 502, json: { error: 'Model request failed (HTTP 400). The model is unavailable.' } });
+      if (chatMode === 'malformed') return route.fulfill({ json: { success: false } });
       return route.fulfill({ json: { success: true } });
     }
     if (path === "/api/db-status") return route.fulfill({ json: { status: "connected" } });
@@ -212,7 +231,7 @@ try {
   assert.equal(await saving.isDisabled(), true);
   assert.equal(await text.isDisabled(), true);
   assert.equal(await dialog.getByRole("button", { name: "Cancel", exact: true }).isDisabled(), true);
-  assert.deepEqual(catalog[2], original[2], "Do not change saved data before confirmation");
+  sameData(catalog[2], original[2], "Do not change saved data before confirmation");
   await page.keyboard.press("Escape");
   assert.equal(await dialog.isVisible(), true);
   assert.equal(writes.length, 1, "Only one save request may be in flight");
@@ -220,13 +239,13 @@ try {
   holdSave = false;
   await dialog.waitFor({ state: "hidden" });
   await row("missing/2 #?").getByRole("button", { name: "View/Edit SAP" }).waitFor();
-  assert.deepEqual(catalog[2], { ...original[2], status: "ready", source: { ...original[2].source, sap: addedSap } });
+  sameData(catalog[2], { ...original[2], status: "ready", source: { ...original[2].source, sap: addedSap } });
 
   await edit("pending");
   await text.fill("Updated SAP\nCapacity: 20 L");
   await save.click();
   await dialog.waitFor({ state: "hidden" });
-  assert.deepEqual(catalog[0], { ...original[0], source: { ...original[0].source, sap: "Updated SAP\nCapacity: 20 L" } });
+  sameData(catalog[0], { ...original[0], source: { ...original[0].source, sap: "Updated SAP\nCapacity: 20 L" } });
   assert.deepEqual(Object.keys(writes[1].updates), ["source"], "Keep uploaded rows, previous QA, and scrape status intact");
   const qa = prepareQaInput(catalog[2], [], "Check supplied sources", 40000);
   assert.equal(qa.sapAvailable, true);
@@ -246,7 +265,7 @@ try {
     await dialog.getByRole("alert").waitFor();
     assert.equal(await text.inputValue(), `Keep this ${mode} draft`);
     assert.equal(await save.isEnabled(), true);
-    assert.deepEqual(catalog[1], original[1]);
+    sameData(catalog[1], original[1]);
     await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
     await edit("failed");
     assert.equal(await text.inputValue(), "", "Failed saves must not update local catalog state");
@@ -297,14 +316,14 @@ try {
   assert.equal(await content.isDisabled(), true);
   assert.equal(await dialog.getByRole("button", { name: "Cancel", exact: true }).isDisabled(), true);
   assert.equal(await dialog.getByRole("button", { name: "Close scraped data" }).isDisabled(), true);
-  assert.deepEqual(catalog[8], original[8], "Do not show pasted data as saved before confirmation");
+  sameData(catalog[8], original[8], "Do not show pasted data as saved before confirmation");
   await page.keyboard.press("Escape");
   assert.equal(await dialog.isVisible(), true);
   assert.equal(writes.length, writesBeforeData + 1, "Only one content save may be in flight");
   releaseSave();
   holdSave = false;
   await dialog.waitFor({ state: "hidden" });
-  assert.deepEqual(catalog[8], { ...original[8], status: "ready", scraped_markdown: pastedContent, scrape_status: "success" });
+  sameData(catalog[8], { ...original[8], status: "ready", scraped_markdown: pastedContent, scrape_status: "success" });
   const manualQa = prepareQaInput(catalog[8], [], "Check supplied sources", 40000);
   assert.equal(manualQa.sapAvailable, false);
   assert.equal(manualQa.webAvailable, true);
@@ -316,7 +335,7 @@ try {
   await content.fill(editedContent);
   await saveData.click();
   await dialog.waitFor({ state: "hidden" });
-  assert.deepEqual(catalog[5], { ...original[5], scraped_markdown: editedContent }, "Editing preserves SAP, uploaded data, status, and previous QA results");
+  sameData(catalog[5], { ...original[5], scraped_markdown: editedContent }, "Editing preserves SAP, uploaded data, status, and previous QA results");
 
   await page.reload();
   for (const [id, expected] of [["manual/9 #?", pastedContent], ["present", editedContent]]) {
@@ -333,7 +352,7 @@ try {
     await dialog.getByRole("alert").waitFor();
     assert.equal(await content.inputValue(), `Keep this ${mode} content draft`);
     assert.equal(await saveData.isEnabled(), true);
-    assert.deepEqual(catalog[6], original[6]);
+    sameData(catalog[6], original[6]);
     await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
     await editData("present-failed");
     assert.equal(await content.inputValue(), "Web evidence", "Failed saves must preserve local content");
@@ -345,7 +364,7 @@ try {
   await content.fill("Retried product content");
   await saveData.click();
   await dialog.waitFor({ state: "hidden" });
-  assert.deepEqual(catalog[6], { ...original[6], scraped_markdown: "Retried product content", scrape_status: "success" });
+  sameData(catalog[6], { ...original[6], scraped_markdown: "Retried product content", scrape_status: "success" });
 
   for (const blank of ["", " \n "]) {
     await editData("present");
@@ -353,101 +372,112 @@ try {
     assert.equal(await saveData.isEnabled(), true);
     await saveData.click();
     await dialog.waitFor({ state: "hidden" });
-    assert.deepEqual(catalog[5], { ...original[5], scraped_markdown: blank, scrape_status: "failed" }, "Clearing content keeps existing QA results");
+    sameData(catalog[5], { ...original[5], scraped_markdown: blank, scrape_status: "failed" }, "Clearing content keeps existing QA results");
   }
+
+  await editData('present');
+  await content.fill('Preserve this conflicted draft');
+  catalog[5].revision!++;
+  catalog[5].scraped_markdown = 'Saved by another editor';
+  await saveData.click();
+  await dialog.getByRole('alert').waitFor();
+  assert.equal(await content.inputValue(),'Preserve this conflicted draft','Conflicts preserve the open draft');
+  assert.equal(catalog[5].scraped_markdown,'Saved by another editor','A stale draft must not overwrite new evidence');
+  await dialog.getByRole('button',{name:'Cancel',exact:true}).click();
+  await editData('present');
+  assert.equal(await content.inputValue(),'Saved by another editor','Conflicts refresh saved catalog state');
+  await dialog.getByRole('button',{name:'Cancel',exact:true}).click();
+
+  await row('empty').getByRole('cell').first().click();
+  await page.getByRole('button',{name:'Create QA Job (1)',exact:true}).click();
+  assert.equal(createdJobs.length,1,'URL-only SKUs can create a QA job');
+  assert.deepEqual(createdJobs[0].skus,['empty']);
 
   holdScrape = true;
   saveGate = new Promise<void>(resolve => { releaseSave = resolve; });
   holdSave = true;
   await row("empty").getByRole("cell").first().click();
   await Promise.all([
-    page.waitForRequest(request => new URL(request.url()).pathname === "/api/scrape"),
+    page.waitForRequest(request => new URL(request.url()).pathname.endsWith('/scrape')),
     page.getByRole("button", { name: "Scrape URLs (1)", exact: true }).click(),
   ]);
   for (const item of catalog) {
     assert.equal(await row(item.sku).getByRole("button", { name: "View/Edit Data", exact: true }).isDisabled(), true);
   }
-  const scrapeSaveStarted = page.waitForRequest(request => request.method() === "PUT");
   releaseScrape();
-  await scrapeSaveStarted;
-  assert.equal(await page.getByRole("button", { name: "Scraping...", exact: true }).isVisible(), true);
-  assert.equal(await row("empty").getByRole("button", { name: "View/Edit Data", exact: true }).isDisabled(), true, "Keep editing disabled until the scrape is saved");
+  assert.equal(await page.getByRole('button', { name: 'Scraping...', exact: true }).isVisible(), true);
   releaseSave();
   holdSave = false;
-  await page.getByRole("button", { name: "Scrape URLs (1)", exact: true }).waitFor();
-  assert.equal(await row("empty").getByRole("button", { name: "View/Edit Data", exact: true }).isEnabled(), true);
-  await editData("empty");
-  assert.equal(await content.inputValue(), "Automatically scraped content");
-  await page.keyboard.press("Escape");
-  await page.getByRole("button", { name: "Scrapper agent", exact: true }).click();
-  assert.equal(await page.getByRole('heading', { name: 'Scrapper agent', exact: true }).count(), 1);
-  await page.getByText('No API key saved.', { exact: true }).waitFor();
-  assert.equal(await page.getByRole('alert').count(), 0, 'StrictMode effect cleanup must not report an aborted settings load');
-  await page.getByLabel('URL', { exact: true }).fill("https://example.com/product");
-  const retrieve = page.getByRole('button', { name: 'Retrieve URL', exact: true });
-  assert.equal(await retrieve.isDisabled(), true, 'Retrieval requires a saved personal key');
-  const keyInput = page.getByLabel('ScrapeGraph API key', { exact: true });
-  await keyInput.fill('sgai-browser-test-key');
-  await page.getByLabel('Rendering mode', { exact: true }).selectOption('js');
-  await page.getByLabel('Wait time (ms)', { exact: true }).fill('2500');
-  await page.getByLabel('Scroll count', { exact: true }).fill('5');
-  await page.getByLabel('Stealth (+5 credits per scrape)', { exact: true }).check();
-  await page.getByRole('button', { name: 'Test key / check credits', exact: true }).click();
-  await page.getByText('Entered key (unsaved): 50 credits remaining, 5 used. Plan: Test.', { exact: true }).waitFor();
-  assert.deepEqual(keyTests, [{ apiKey: 'sgai-browser-test-key' }]);
-  assert.equal(scraperWrites.length, 0, 'Testing a draft key does not save it');
-  assert.equal(await retrieve.isDisabled(), true, 'Unsaved controls cannot affect retrieval');
-  scraperSaveFailure = true;
-  await page.getByRole('button', { name: 'Save/replace key', exact: true }).click();
-  await page.getByText('Scraper settings could not be saved.', { exact: true }).waitFor();
-  assert.equal(await keyInput.inputValue(), 'sgai-browser-test-key', 'Failed saving preserves the key draft');
-  assert.equal(await page.getByLabel('Rendering mode', { exact: true }).inputValue(), 'js');
-  scraperSaveFailure = false;
-  await page.getByRole('button', { name: 'Save/replace key', exact: true }).click();
-  await page.getByText('Personal scraper settings saved.', { exact: true }).waitFor();
-  assert.equal(await keyInput.inputValue(), '', 'Saved keys are cleared from the input');
-  assert.deepEqual(scraperWrites.at(-1), { mode: 'js', stealth: true, wait: 2500, scrolls: 5, apiKey: 'sgai-browser-test-key' });
-  await page.reload();
-  await page.getByRole('button', { name: 'Scrapper agent', exact: true }).click();
-  await page.getByText('API key saved.', { exact: true }).waitFor();
-  assert.equal(await keyInput.inputValue(), '', 'Reload never reveals the saved key');
-  assert.equal(await page.getByLabel('Rendering mode', { exact: true }).inputValue(), 'js');
-  await page.getByRole('button', { name: 'Test key / check credits', exact: true }).click();
-  await page.getByText('Saved key: 50 credits remaining, 5 used. Plan: Test.', { exact: true }).waitFor();
-  assert.deepEqual(keyTests.at(-1), {});
-  await page.getByRole('button', { name: 'Remove key', exact: true }).click();
-  await page.getByText('Your API key was removed.', { exact: true }).waitFor();
-  assert.equal(scraperWrites.at(-1).apiKey, null);
-  assert.equal(await retrieve.isDisabled(), true);
-  await keyInput.fill('sgai-browser-replacement-key');
-  await page.getByRole('button', { name: 'Save/replace key', exact: true }).click();
-  await page.getByText('Personal scraper settings saved.', { exact: true }).waitFor();
-  await page.getByLabel('URL', { exact: true }).fill('https://example.com/product');
-  await page.getByRole("button", { name: "Retrieve URL", exact: true }).click();
-  await page.getByText("Automatically scraped content", { exact: true }).waitFor();
-  assert.equal(scrapeRequests, 2, 'Browser scrape callers send only URLs');
-  const preview=page.getByRole('heading',{name:'Extracted page content'});
-  assert.ok((await preview.boundingBox())!.y > (await page.getByLabel('URL',{exact:true}).boundingBox())!.y);
+  await page.getByRole('button', { name: 'Scrape URLs (1)', exact: true }).waitFor();
+  assert.equal(await row('empty').getByRole('button', { name: 'View/Edit Data', exact: true }).isEnabled(), true);
+  await editData('empty');
+  assert.equal(await content.inputValue(), 'Automatically scraped content');
+  await page.getByText('Evidence: browser', {exact:false}).waitFor();
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: 'Scraper', exact: true }).click();
+  assert.equal(await page.getByRole('heading', {name:'Scraper',exact:true}).count(),1);
+  const chooser = page.getByLabel('SKU', {exact:true});
+  const retrieve = page.getByRole('button',{name:'Scrape and save',exact:true});
+  assert.equal(await retrieve.count(),0,'A saved SKU must be selected');
+  await chooser.selectOption('pending');
+  await retrieve.click();
+  await page.locator('.prose').getByText('Automatically scraped content',{exact:true}).waitFor();
+  assert.equal(catalog[0].scraped_markdown,'Automatically scraped content');
+  assert.equal(catalog[3].scraped_markdown,'Automatically scraped content','Scraping another SKU retains the first saved scrape');
+  assert.equal(catalog[1].scraped_markdown,undefined,'Other SKUs remain unchanged');
+  assert.equal(scrapeRequests,2);
   assert.equal(await page.getByRole('link',{name:'View source page'}).getAttribute('href'),'https://example.com/product');
+  const rescrape = page.getByRole('button',{name:'Rescrape and save',exact:true});
   scrapeMode='blocked';
-  await page.getByRole('button',{name:'Retrieve URL',exact:true}).click();
+  await rescrape.click();
   await page.getByRole('alert').waitFor();
   assert.equal(await page.getByRole('alert').innerText(),'The website blocked browser access.');
-  assert.equal(await preview.count(),0,'A failed new request clears the previous result');
+  assert.equal(await page.getByLabel('Markdown preview').inputValue(),'Automatically scraped content','Failed rescrapes retain saved evidence');
   scrapeMode='wait';
-  await page.getByRole('button',{name:'Retrieve URL',exact:true}).click();
-  await page.getByRole('button',{name:'Cancel retrieval',exact:true}).waitFor();
+  await rescrape.click();
+  await page.getByRole('button',{name:'Cancel scraping',exact:true}).waitFor();
   await page.waitForTimeout(100);
-  await page.getByRole('button',{name:'Cancel retrieval',exact:true}).click();
-  await page.getByText('URL retrieval was cancelled.',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'Cancel scraping',exact:true}).click();
+  await page.getByText('Scraping was cancelled. Previously saved evidence is retained.',{exact:true}).waitFor();
   finishScrape?.();
-  assert.equal(await page.getByLabel('URL',{exact:true}).isEnabled(),true);
+  assert.equal(await page.getByLabel('Saved source URL',{exact:true}).isEnabled(),true);
   scrapeMode='success';
-  await page.getByRole('button',{name:'Retrieve URL',exact:true}).click();
-  await page.getByText('Automatically scraped content',{exact:true}).waitFor();
+  await rescrape.click();
+  await page.getByRole('button',{name:'Rescrape and save',exact:true}).waitFor();
+  await page.getByLabel('Saved source URL',{exact:true}).fill('https://example.com/new-product');
+  assert.equal(await rescrape.isDisabled(),true,'Save URL edits before scraping');
+  await page.getByRole('button',{name:'Save URL',exact:true}).click();
+  await page.getByText('The source URL changed. Rescrape or save manual content in Dashboard before QA uses this evidence.',{exact:true}).waitFor();
+  await rescrape.click();
+  await page.getByRole('button',{name:'Rescrape and save',exact:true}).waitFor();
+  assert.equal(catalog[0].scrape_metadata?.requestedUrl,'https://example.com/new-product');
+  await page.reload();
+  await page.getByRole('button',{name:'Scraper',exact:true}).click();
+  await chooser.selectOption('pending');
+  assert.equal(await page.getByLabel('Markdown preview').inputValue(),'Automatically scraped content','Saved scrape survives refresh');
+
+  holdNextCatalogRefresh = true;
+  catalogRefreshGate = new Promise<void>(resolve => { releaseCatalogRefresh = resolve; });
+  const catalogHeld = new Promise<void>(resolve => { heldCatalogStarted = resolve; });
+  await page.getByRole('button', {name:'Jobs',exact:true}).click();
+  await catalogHeld;
+  await page.getByRole('button', {name:'Scraper',exact:true}).click();
+  await chooser.selectOption('pending');
+  scrapeMarkdown = 'Newer saved product evidence';
+  await rescrape.click();
+  await page.locator('.prose').getByText(scrapeMarkdown,{exact:true}).waitFor();
+  const savedRevision = catalog[0].revision;
+  const olderResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/catalog');
+  releaseCatalogRefresh();
+  await olderResponse;
+  await page.waitForTimeout(100);
+  assert.equal(await page.getByLabel('Markdown preview').inputValue(),scrapeMarkdown,'An older catalog refresh cannot replace freshly saved evidence');
+  await rescrape.click();
+  await page.getByRole('button',{name:'Rescrape and save',exact:true}).waitFor();
+  assert.equal(lastScrapeRevision,savedRevision,'An older catalog refresh cannot roll back the saved revision');
 
   await page.getByRole('button', { name: 'LLM Settings', exact: true }).click();
-  assert.equal(await page.getByLabel('Scrapper model', {exact:true}).count(),0);
+  assert.equal(await page.getByLabel('Navigation model', {exact:true}).count(),0);
   await page.getByLabel('Q&A model', { exact: true }).fill('draft/qa');
   const testing = page.getByRole('button', { name: 'Test API', exact: true });
   await testing.click();
@@ -456,7 +486,7 @@ try {
   assert.equal(await page.getByLabel('Q&A model', { exact: true }).isDisabled(), true);
   releaseChat();
   await page.getByText('Q&A (draft/qa): Passed.', { exact: true }).waitFor();
-  assert.deepEqual(chatRequests, [{ purpose: 'qa', modelName: 'draft/qa' }], 'Only QA needs a model connectivity check');
+  assert.deepEqual(chatRequests, [{ modelName: 'draft/qa' }], 'Only QA makes model requests');
   assert.equal(settingsWrites.length, 0, 'Testing leaves settings unsaved');
   const notifications = page.getByRole('button', { name: 'Notifications', exact: true });
   await notifications.click();
@@ -474,7 +504,7 @@ try {
   await page.getByRole('button', { name: 'Save changes', exact: true }).click();
   await page.getByText('Settings saved for everyone.', { exact: true }).waitFor();
   assert.equal(settingsWrites.length, 1);
-  assert.equal(settingsWrites[0].scrapperModelName, DEFAULT_SETTINGS.scrapperModelName,'Preserve legacy stored settings');
+  assert.equal(Object.hasOwn(settingsWrites[0], 'scrapperModelName'), false);
   assert.equal(settingsWrites[0].modelName, 'draft/qa');
   assert.doesNotMatch(JSON.stringify(settingsWrites), /apiKey|test-only/);
   await page.reload();
@@ -507,8 +537,35 @@ try {
   await recoveredCatalog;
   assert.equal(await runQa.isDisabled(), true, 'Polling recovers without starting a duplicate run');
   assert.equal(startRunRequests, 1);
-  console.log('Browser checks passed: authenticated saves, personal scraper controls, draft key tests, secret exclusion, preview and cancellation.');
+  // Historical snapshots cannot supply a verdict, issue text, or replacement.
+  const forgedReview = {
+    qa_status: 'warning', summary: 'Forged review summary',
+    issues: [{ field: 'brand', explanation: 'Forged finding', suggested_fix: 'Forged replacement' }],
+  };
+  queuedRun.status = 'completed';
+  queuedRun.items = [{
+    sku: 'present-pending', status: 'skipped', attempts: 0,
+    snapshot: { ...catalog[7], status: 'completed', qa_result: forgedReview, export_data: forgedReview, raw_row: { ...catalog[7].raw_row, qa_result: forgedReview } },
+  }];
+  await notifications.click();
+  catalog[7].status = 'completed';
+  catalog[7].qa_result = { qa_status: 'pass', issues: [] };
+  let legacyDownloads = 0;
+  page.on('download', () => { legacyDownloads++; });
+  await page.getByRole('button', { name: 'Issues Only', exact: true }).click();
+  await notifications.click();
+  await page.getByText('No SKU data found for this job.', { exact: true }).waitFor();
+  assert.equal(legacyDownloads, 0, 'An unverified historical warning never enters issues-only exports');
+  await notifications.click();
+  await page.getByRole('button', { name: 'View Results', exact: true }).click();
+  await page.getByText('Error: Legacy review is unverified; rerun QA.', { exact: true }).waitFor();
+  await page.getByText('SKU: present-pending', { exact: true }).click();
+  for (const text of ['Forged review summary', 'Forged finding', 'Forged replacement', 'No issues detected for this SKU!']) {
+    assert.equal(await page.getByText(text, { exact: true }).count(), 0);
+  }
+  console.log('Browser checks passed: revision-protected saves, SKU-attached scraping, cancellation, QA settings, and historical review exclusion.');
 } finally {
+  releaseCatalogRefresh();
   releaseSave();
   releaseScrape();
   releaseChat();

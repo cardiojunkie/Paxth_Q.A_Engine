@@ -7,12 +7,13 @@ import { useAppContext, Job } from "../context/AppContext";
 import { SkuData, QAStatus } from "../hooks/useCatalogData";
 import { getCommonAttributeSet } from "../lib/jobRunState";
 import { cn } from "../lib/utils";
-import { scrapeUrl } from "../lib/scrapeRequest";
+import { usableScrapedMarkdown } from "../lib/scrapeEvidence";
+import { ApiError } from "../lib/api";
 
 type FilterType = "all" | "ready" | "cannot_qa" | "completed" | "failed";
 
 export function DashboardModule() {
-  const { user, catalogError, skuDataList, addParsedData, clearData, updateSku, removeSkus, isLoadingSkuData, jobs, addJobs, addNotification } = useAppContext();
+  const { user, catalogError, skuDataList, addParsedData, clearData, updateSku, scrapeSku, removeSkus, isLoadingSkuData, jobs, addJobs, addNotification } = useAppContext();
   const [fileName, setFileName] = useState<string | null>(localStorage.getItem('lastFileName') || null);
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -21,16 +22,20 @@ export function DashboardModule() {
   const [isScraping, setIsScraping] = useState(false);
   const [scrapeProgress, setScrapeProgress] = useState<{current: number, total: number} | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const scrapeRequest = useRef<AbortController | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; scrapeRequest.current?.abort(); };
+  }, []);
   
   // Modal State
-  const [viewedMarkdown, setViewedMarkdown] = useState<{sku: string, markdown: string} | null>(null);
+  const [viewedMarkdown, setViewedMarkdown] = useState<{sku: string, markdown: string, revision: number} | null>(null);
   const [isSavingMarkdown, setIsSavingMarkdown] = useState(false);
   const [markdownSaveError, setMarkdownSaveError] = useState("");
-  const [viewedSAP, setViewedSAP] = useState<{sku: string, sap: string} | null>(null);
+  const [viewedSAP, setViewedSAP] = useState<{sku: string, sap: string, revision: number} | null>(null);
   const [isSavingSAP, setIsSavingSAP] = useState(false);
   const [sapSaveError, setSapSaveError] = useState("");
-  const [manualScrapeQueue, setManualScrapeQueue] = useState<string[]>([]);
-  const [manualScrapeText, setManualScrapeText] = useState("");
   const [skuToDelete, setSkuToDelete] = useState<string | null>(null);
   const [showDeleteSelectedModal, setShowDeleteSelectedModal] = useState(false);
   const [showClearAllModal, setShowClearAllModal] = useState(false);
@@ -48,6 +53,7 @@ export function DashboardModule() {
   }, []);
 
   const [searchTerm, setSearchTerm] = useState("");
+  const viewedEvidence = skuDataList.find(sku => sku.sku === viewedMarkdown?.sku);
   const currentFileName = fileName || skuDataList.find(s => s.source?.fileName)?.source?.fileName || null;
 
   const filteredList = skuDataList.filter(sku => {
@@ -71,10 +77,10 @@ export function DashboardModule() {
     const saved = await updateSku(sku.sku, {
       source: { ...sku.source, sap: viewedSAP.sap },
       ...(sku.status === "cannot_qa" ? { status: "ready" } : {}),
-    });
+    }, viewedSAP.revision);
     setIsSavingSAP(false);
     if (!saved) {
-      setSapSaveError("SAP data could not be saved. Your draft is still here; please try again.");
+      setSapSaveError("SAP data could not be saved. Your draft is preserved. If the SKU changed, reopen the editor and apply your draft to the latest version.");
       return;
     }
     addNotification({ type: "success", title: "SAP Saved", message: `SAP data for ${sku.sku} saved to database.` });
@@ -96,10 +102,10 @@ export function DashboardModule() {
       scraped_markdown: viewedMarkdown.markdown,
       scrape_status: hasContent ? "success" : "failed",
       ...(hasContent && sku.status === "cannot_qa" ? { status: "ready" } : {}),
-    });
+    }, viewedMarkdown.revision);
     setIsSavingMarkdown(false);
     if (!saved) {
-      setMarkdownSaveError("Data could not be saved. Your draft is still here; please try again.");
+      setMarkdownSaveError("Data could not be saved. Your draft is preserved. If the SKU changed, reopen the editor and apply your draft to the latest version.");
       return;
     }
     addNotification({ type: "success", title: "Data Saved", message: `Product content for ${sku.sku} saved to database.` });
@@ -127,54 +133,41 @@ export function DashboardModule() {
   };
 
   const handleScrapeSelected = async () => {
-    if (selectedSkus.size === 0) return;
-    
+    if (selectedSkus.size === 0 || isScraping) return;
+    const controller = new AbortController();
+    scrapeRequest.current = controller;
     setIsScraping(true);
     const skusToProcess = skuDataList.filter(s => selectedSkus.has(s.sku));
-    const failedSkus: string[] = [];
-    const scrapeErrors: string[] = [];
-    
+    const counts = { saved: 0, failed: 0, conflicted: 0, skipped: 0 };
+    let firstError = "";
     setScrapeProgress({ current: 0, total: skusToProcess.length });
-    
     let processed = 0;
     for (const skuItem of skusToProcess) {
-      if (skuItem.source.url) {
+      if (controller.signal.aborted) break;
+      if (skuItem.source.url?.trim()) {
         try {
-          const markdown = await scrapeUrl(skuItem.source.url);
-          if (!await updateSku(skuItem.sku, { scraped_markdown: markdown, scrape_status: "success" })) {
-            setViewedMarkdown({sku:skuItem.sku, markdown});
-            setMarkdownSaveError("Scraped content could not be saved. The draft is preserved here; retry Save.");
-            throw new Error("Could not save scraped content");
-          }
-        } catch (err: any) {
-          const error = err.message || "Scraping failed";
-          await updateSku(skuItem.sku, { scrape_status: "failed", error });
-          failedSkus.push(skuItem.sku);
-          scrapeErrors.push(`${skuItem.sku}: ${error}`);
+          await scrapeSku(skuItem, controller.signal);
+          counts.saved++;
+        } catch (err) {
+          if (controller.signal.aborted) break;
+          if (err instanceof ApiError && err.status === 409) counts.conflicted++;
+          else counts.failed++;
+          firstError ||= `${skuItem.sku}: ${(err as Error).message || "Scraping failed"}`;
         }
       } else {
-        await updateSku(skuItem.sku, { scrape_status: "skipped_no_url" });
+        counts.skipped++;
       }
       processed++;
-      setScrapeProgress({ current: processed, total: skusToProcess.length });
+      if (mounted.current) setScrapeProgress({ current: processed, total: skusToProcess.length });
     }
-    
+    if (!mounted.current) return;
     setIsScraping(false);
     setScrapeProgress(null);
-    if (failedSkus.length > 0) {
-      setManualScrapeQueue(failedSkus);
-      addNotification({
-        type: "warning",
-        title: "Scraping Complete with Errors",
-        message: `${failedSkus.length} URL(s) could not be scraped automatically. ${scrapeErrors[0] || ""}`
-      });
-    } else {
-      addNotification({
-        type: "success",
-        title: "Scraping Complete",
-        message: `Successfully scraped all selected SKUs with valid URLs.`
-      });
-    }
+    addNotification({
+      type: counts.failed || counts.conflicted || controller.signal.aborted ? "warning" : "success",
+      title: controller.signal.aborted ? "Scraping Cancelled" : "Scraping Complete",
+      message: `${counts.saved} saved; ${counts.failed} failed; ${counts.conflicted} conflicted; ${counts.skipped} skipped without a URL; ${skusToProcess.length - processed} not completed. ${firstError}`,
+    });
   };
 
   const handleCreateJob = async () => {
@@ -193,24 +186,13 @@ export function DashboardModule() {
       return;
     }
     
-    const invalidSkus = skusToProcess.filter(s => !s.scraped_markdown && !s.source.sap);
+    const invalidSkus = skusToProcess.filter(s => !usableScrapedMarkdown(s) && !s.source.sap?.trim() && !s.source.url?.trim());
     
     if (invalidSkus.length > 0) {
-      const manualQueue = invalidSkus.filter(s => s.source.url).map(s => s.sku);
-      if (manualQueue.length > 0) {
-        setManualScrapeQueue(manualQueue);
-        addNotification({
-          type: "warning",
-          title: "Manual Scraping Required",
-          message: "Some SKUs failed automated scraping. Please manually provide the content."
-        });
-        return;
-      }
-
       addNotification({
         type: "error",
         title: "Cannot Create Job",
-        message: `The following SKUs are missing both scraped data and SAP data: ${invalidSkus.map(s => s.sku).join(", ")}. Please scrape them first or provide SAP data.`
+        message: `The following SKUs need saved content, SAP data, or a URL: ${invalidSkus.map(s => s.sku).join(", ")}.`
       });
       return;
     }
@@ -250,7 +232,7 @@ export function DashboardModule() {
 
       let maxIssues = 0;
       skuDataList.forEach(sku => {
-        const qa = sku.raw_row.qa_result;
+        const qa = sku.qa_stale ? undefined : sku.qa_result;
         if (qa && qa.issues && Array.isArray(qa.issues)) {
           maxIssues = Math.max(maxIssues, qa.issues.length);
         }
@@ -271,7 +253,7 @@ export function DashboardModule() {
 
       skuDataList.forEach((sku) => {
         const rowData: Record<string, any> = { ...sku.raw_row };
-        const qa = sku.raw_row.qa_result;
+        const qa = sku.qa_stale ? undefined : sku.qa_result;
         
         if (qa) {
           rowData.qa_status = qa.qa_status || sku.status;
@@ -470,7 +452,7 @@ export function DashboardModule() {
     worksheet.addRow(headers);
     
     skuDataList.forEach(sku => {
-      const qaResult = sku.raw_row?.qa_result || {};
+      const qaResult = (sku.qa_stale ? undefined : sku.qa_result) || {};
       const stats = qaResult.issue_count || 0;
       
       worksheet.addRow([
@@ -650,6 +632,7 @@ export function DashboardModule() {
                 <Database className="w-3.5 h-3.5" />
                 {isScraping ? "Scraping..." : `Scrape URLs (${selectedSkus.size})`}
               </button>
+              {isScraping && <button onClick={() => scrapeRequest.current?.abort()} className="px-3 py-1.5 text-xs border border-[#E5E2DE]">Cancel scraping</button>}
               
               <button
                 onClick={exportToExcel}
@@ -736,7 +719,7 @@ export function DashboardModule() {
                         <button
                           onClick={() => {
                             setSapSaveError("");
-                            setViewedSAP({ sku: sku.sku, sap: sku.source.sap || "" });
+                            setViewedSAP({ sku: sku.sku, sap: sku.source.sap || "", revision: sku.revision ?? 0 });
                           }}
                           className="text-blue-600 hover:underline flex items-center gap-1 text-xs"
                         >
@@ -752,6 +735,8 @@ export function DashboardModule() {
                       </td>
                       <td className="p-3">
                         <div className="flex flex-wrap items-center gap-2">
+                          {sku.scraped_markdown?.trim() && !usableScrapedMarkdown(sku) && <span className="text-amber-700 text-xs">Source URL changed</span>}
+                          {sku.scrape_error && <span className="text-rose-500 text-xs" title={sku.scrape_error}>Latest scrape failed</span>}
                           {sku.scrape_status === 'success' ? null : sku.scrape_status === 'failed' ? (
                             <span className="text-rose-500 text-xs">Failed</span>
                           ) : sku.source.url ? (
@@ -761,7 +746,7 @@ export function DashboardModule() {
                             disabled={isScraping}
                             onClick={() => {
                               setMarkdownSaveError("");
-                              setViewedMarkdown({ sku: sku.sku, markdown: sku.scraped_markdown || "" });
+                              setViewedMarkdown({ sku: sku.sku, markdown: sku.scraped_markdown || "", revision: sku.revision ?? 0 });
                             }}
                             className="text-emerald-600 hover:underline flex items-center gap-1 text-xs disabled:opacity-50 disabled:no-underline disabled:cursor-not-allowed"
                           >
@@ -938,6 +923,14 @@ export function DashboardModule() {
               </button>
             </div>
             <div className="flex-1 p-6 overflow-hidden flex flex-col bg-gray-50 gap-3">
+              {viewedEvidence?.scrape_metadata && <p className="text-xs text-[#8C8882]">
+                Evidence: {viewedEvidence.scrape_metadata.method}
+                {viewedEvidence.scrape_metadata.capturedAt && ` · ${new Date(viewedEvidence.scrape_metadata.capturedAt).toLocaleString()}`}
+                {viewedEvidence.scrape_metadata.requestedUrl && ` · ${viewedEvidence.scrape_metadata.requestedUrl}`}
+                {viewedEvidence.scrape_metadata.finalUrl && viewedEvidence.scrape_metadata.finalUrl !== viewedEvidence.scrape_metadata.requestedUrl && ` → ${viewedEvidence.scrape_metadata.finalUrl}`}
+              </p>}
+              {viewedEvidence?.scraped_markdown?.trim() && !usableScrapedMarkdown(viewedEvidence) && <p className="text-xs text-amber-700">The source URL changed. Rescrape or save manual content before using this evidence for QA.</p>}
+              {viewedEvidence?.scrape_error && <p className="text-xs text-rose-600">Latest scrape: {viewedEvidence.scrape_error}</p>}
               <label htmlFor="markdown-content" className="text-xs text-[#8C8882] font-medium">Product content (plain text or Markdown)</label>
               <textarea
                 id="markdown-content"
@@ -971,64 +964,6 @@ export function DashboardModule() {
             </div>
           </div>
         </dialog>
-      )}
-
-      {/* Manual Scrape Queue Modal */}
-      {manualScrapeQueue.length > 0 && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white w-full max-w-2xl flex flex-col rounded-sm shadow-xl relative overflow-hidden">
-            <div className="flex items-center justify-between p-4 border-b border-[#E5E2DE] bg-[#FDFCFB]">
-              <div>
-                <h3 className="font-bold text-[#1A1A1A] text-sm">Manual Content Input Required</h3>
-                <p className="text-xs text-[#8C8882]">Processing {manualScrapeQueue.length} SKU(s) missing scraped content</p>
-              </div>
-              <button onClick={() => setManualScrapeQueue([])} className="text-[#8C8882] hover:text-[#1A1A1A]">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-            <div className="p-6 space-y-4">
-              <div>
-                <span className="text-xs text-[#8C8882] uppercase tracking-wider font-semibold">Current SKU:</span>
-                <span className="ml-2 font-mono font-bold text-sm text-[#1A1A1A]">{manualScrapeQueue[0]}</span>
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-[#1A1A1A] mb-1">Paste Markdown / Web Page Content:</label>
-                <textarea
-                  id="manualScrapeTextarea"
-                  rows={8}
-                  placeholder="Paste product details or markdown content here..."
-                  className="w-full p-3 font-mono text-xs border border-[#E5E2DE] rounded-sm focus:outline-none focus:border-[#1A1A1A]"
-                />
-              </div>
-            </div>
-            <div className="p-4 border-t border-[#E5E2DE] bg-[#FDFCFB] flex justify-between items-center">
-              <button
-                onClick={() => setManualScrapeQueue(prev => prev.slice(1))}
-                className="px-4 py-2 text-xs font-bold uppercase tracking-wider text-[#8C8882] hover:text-[#1A1A1A] transition-colors"
-              >
-                Skip This SKU
-              </button>
-              <button
-                onClick={async () => {
-                  const textarea = document.getElementById("manualScrapeTextarea") as HTMLTextAreaElement;
-                  const text = textarea?.value || "";
-                  if (text.trim()) {
-                    if (!await updateSku(manualScrapeQueue[0], { scraped_markdown: text, scrape_status: "success" })) return;
-                    addNotification({
-                      type: "success",
-                      title: "Content Saved",
-                      message: `Saved content for ${manualScrapeQueue[0]}`
-                    });
-                  }
-                  setManualScrapeQueue(prev => prev.slice(1));
-                }}
-                className="px-4 py-2 bg-[#1A1A1A] text-white text-xs font-bold uppercase tracking-wider rounded-sm hover:bg-[#333333] transition-colors"
-              >
-                Save & Continue ({manualScrapeQueue.length - 1} left)
-              </button>
-            </div>
-          </div>
-        </div>
       )}
 
       {viewedSAP && (

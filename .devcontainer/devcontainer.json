@@ -19,12 +19,14 @@
   "remoteEnv": {
     "NODE_OPTIONS": "--no-experimental-global-navigator"
   },
-  "forwardPorts": [3000],
+  "forwardPorts": [
+    3000
+  ],
   "portsAttributes": {
     "3000": {
       "label": "Express + Vite Dev Server",
       "onAutoForward": "openBrowser"
     }
   },
-  "postCreateCommand": "npm ci"
+  "postCreateCommand": "npm ci && npm run setup:scraper"
 }

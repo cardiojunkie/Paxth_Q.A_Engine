@@ -38,6 +38,7 @@ interface AppContextType {
   skuDataList: Catalog['skuDataList'];
   addParsedData: Catalog['addParsedData'];
   updateSku: Catalog['updateSku'];
+  scrapeSku: Catalog['scrapeSku'];
   deleteSku: (sku: string) => Promise<boolean>;
   clearData: () => Promise<boolean>;
   removeSkus: Catalog['removeSkus'];
@@ -63,7 +64,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [usersList, setUsersList] = useState<UserAccount[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
-  const { skuDataList, addParsedData, catalogError, updateSku, removeSkus, refreshCatalog, resetCatalog, isLoading } = useCatalogData(Boolean(user));
+  const { skuDataList, addParsedData, catalogError, updateSku, scrapeSku, removeSkus, refreshCatalog, resetCatalog, isLoading } = useCatalogData(Boolean(user), user?.id);
 
   const addNotification = useCallback((notification: Omit<AppNotification, 'id' | 'timestamp' | 'read'>) => {
     setNotifications(prev => [{ ...notification, id: crypto.randomUUID(), timestamp: new Date().toISOString(), read: false }, ...prev]);
@@ -177,7 +178,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   return (
     <AppContext.Provider value={{
       user, sessionLoading, login, logout, usersList, addUserAccount, updateUserAccount, deleteUserAccount,
-      skuDataList, addParsedData, updateSku, deleteSku, clearData, removeSkus, catalogError, isLoadingSkuData: isLoading,
+      skuDataList, addParsedData, updateSku, scrapeSku, deleteSku, clearData, removeSkus, catalogError, isLoadingSkuData: isLoading,
       jobs, addJobs, updateJob, removeJob, refreshData,
       notifications, addNotification, markNotificationRead, clearNotifications,
     }}>{children}</AppContext.Provider>

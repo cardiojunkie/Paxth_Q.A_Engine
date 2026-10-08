@@ -13,8 +13,7 @@ import {initializeProvider,registerProviderRoutes} from './provider';
 import {initializeJobRuns,registerJobRunRoutes,startJobWorker} from './jobRunner';
 import {ApiError,registerCatalogRoutes} from './catalog';
 import {ProviderError} from '../lib/chatCompletion';
-import {validateScrapeInput, ScrapeError, type ScrapeConfiguration} from '../lib/scrapeAgent';
-import {DEFAULT_SCRAPE_SETTINGS} from '../lib/scrapeRequest';
+import {validateScrapeInput, ScrapeError} from '../lib/browserScrape';
 import {DEFAULT_SETTINGS,editableSettings} from '../lib/providerSettings';
 
 assert.ok(process.env.TEST_DATABASE_URL,'Set TEST_DATABASE_URL to a disposable PostgreSQL instance. Production DATABASE_URL is never used.');
@@ -28,14 +27,13 @@ let stopSecond:(()=>Promise<void>)|undefined;
 let calls=0, providerMode='success';
 const providerRequests:any[]=[];
 const scrapeRequests:string[]=[];
-const scrapeConfigurations:ScrapeConfiguration[]=[];
 let scrapeBlocked=false;
-const scrape=async(rawUrl:string, signal:AbortSignal, configuration:ScrapeConfiguration)=>{
-  if(!configuration.apiKey)throw new ScrapeError('Save your ScrapeGraph API key in Scrapper agent.',503,'API_KEY_REQUIRED');
+let duringScrape: (()=>Promise<void>) | undefined;
+const scrape=async(rawUrl:string, signal:AbortSignal)=>{
   const {url}=validateScrapeInput({url:rawUrl});signal.throwIfAborted();scrapeRequests.push(url);
-  scrapeConfigurations.push(configuration);
+  await duringScrape?.();signal.throwIfAborted();
   if(scrapeBlocked)throw new ScrapeError('The website blocked browser access.',502,'PAGE_BLOCKED');
-  return '# Retrieved product\nBrand: TestBrand\n\nSource: <'+url+'>';
+  return {markdown:'# Retrieved product\nBrand: TestBrand\n\nSource: <'+url+'>',requestedUrl:url,finalUrl:url};
 };
 const provider=createServer(async(req,res)=>{
   let raw='';for await(const chunk of req) raw+=chunk;
@@ -52,7 +50,9 @@ const provider=createServer(async(req,res)=>{
     res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify({status:'ok',markdown:'# Retrieved product\nBrand: TestBrand'})}}],citations:providerMode==='no-citations'?[]:payload.search_domain_filter}));return;
   }
   const webUsed=payload.messages.some((message:any)=>message.content.includes('Retrieved product'));
-  res.end(JSON.stringify({choices:[{message:{content:JSON.stringify({qa_status:'pass',confidence:'high',summary:'Matches source',issue_count:0,issues:[],source_notes:{sap_used:true,url_used:webUsed,source_conflicts:[]}})}}],usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}}));
+  let sapUsed=false;
+  try { sapUsed=Boolean(JSON.parse(payload.messages.find((message:any)=>message.role==='user').content).source_sap); } catch { /* Connectivity tests have no source payload. */ }
+  res.end(JSON.stringify({choices:[{message:{content:JSON.stringify({qa_status:'pass',confidence:'high',summary:'Matches source',issue_count:0,issues:[],source_notes:{sap_used:sapUsed,url_used:webUsed,source_conflicts:[]}})}}],usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}}));
 });
 const listen=(s:ReturnType<typeof createServer>)=>new Promise<void>(resolve=>s.listen(0,'127.0.0.1',resolve));
 try {
@@ -68,7 +68,9 @@ try {
   const app=express();app.use(express.json());
   server.on('request',app);await listen(server);
   const origin=`http://127.0.0.1:${(server.address() as any).port}`;process.env.APP_ORIGIN=origin;
-  registerAuth(app,pool);registerCatalogRoutes(app,pool);registerProviderRoutes(app,pool,scrape);registerJobRunRoutes(app,pool);registerQaConfigurationRoutes(app,drizzle(pool,{schema}));
+  registerAuth(app,pool);registerCatalogRoutes(app,pool,scrape);registerProviderRoutes(app,pool);
+  registerJobRunRoutes(app,pool);registerQaConfigurationRoutes(app,drizzle(pool,{schema}));
+  app.use('/api', (_req,res)=>res.status(404).json({error:'Not found'}));
   app.use((err:any,_req:any,res:any,_next:any)=>res.status(err instanceof ApiError||err instanceof ProviderError?err.status:err.code==='23505'?409:503).json({error:err.message}));
   const password='test-only-strong-password';
   const hash=await hashPassword(password);
@@ -87,48 +89,16 @@ try {
   assert.equal((await request('/api/users','POST',{username:' temporary ',password,role:'user'},admin)).status,409);
   const user=(await request('/api/auth/login','POST',{username:'Operator',password})).cookie!.split(';')[0];
   const other=(await request('/api/auth/login','POST',{username:'Other',password})).cookie!.split(';')[0];
-  const personal={...DEFAULT_SCRAPE_SETTINGS,mode:'js',wait:2500,scrolls:5};
-  assert.equal((await request('/api/scraper-settings')).status,401);
-  assert.deepEqual((await request('/api/scraper-settings','GET',undefined,user)).body,{...DEFAULT_SCRAPE_SETTINGS,configured:false});
-  assert.equal((await request('/api/scraper-settings/test','POST',{},user)).body.code,'API_KEY_REQUIRED');
-  assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product'},user)).body.code,'API_KEY_REQUIRED');
-  for(const invalid of [{userId:'other'},{wait:-1},{wait:30001},{scrolls:1.5},{stealth:'true'},{apiKey:'bad\nkey'}]) {
-    assert.equal((await request('/api/scraper-settings','PUT',{...personal,...invalid},user)).status,400);
+  const edit=async(id:string,updates:Record<string,unknown>)=>request(`/api/catalog/${id}`,'PUT',{
+    ...updates,expectedRevision:(await pool.query('SELECT revision FROM sku_data WHERE sku=$1',[id])).rows[0]?.revision ?? 0,
+  },user);
+  for(const [path,method] of [['/api/scraper-settings','GET'],['/api/scraper-settings','PUT'],['/api/scraper-settings/test','POST']]) {
+    assert.equal((await request(path,method,method==='GET'?undefined:{},user)).status,404,'Retired personal settings are inaccessible');
   }
-  assert.equal((await request('/api/scraper-settings','PUT',{...personal,apiKey:'sgai-user-secret'},user,'https://evil.example')).status,403);
-  const savedPersonal=await request('/api/scraper-settings','PUT',{...personal,apiKey:' sgai-user-secret '},user);
-  assert.deepEqual(savedPersonal.body,{...personal,configured:true});
-  assert.doesNotMatch(JSON.stringify(savedPersonal.body),/apiKey|sgai-user-secret/);
-  assert.equal((await request('/api/scraper-settings','PUT',{...DEFAULT_SCRAPE_SETTINGS,apiKey:'sgai-other-secret'},other)).status,200);
-  assert.equal((await request('/api/scraper-settings','GET',undefined,other)).body.mode,'auto');
-  assert.equal((await request('/api/scraper-settings','PUT',personal,user)).body.configured,true,'Omitting the key preserves it');
-  assert.equal((await pool.query("SELECT scrapegraph_api_key FROM users WHERE id='user'")).rows[0].scrapegraph_api_key,'sgai-user-secret');
-  const originalFetch=globalThis.fetch;
-  const testedKeys:string[]=[];
-  let creditsStatus=200;
-  globalThis.fetch=async(target,init)=>{
-    if(String(target)==='https://v2-api.scrapegraphai.com/api/credits') {
-      testedKeys.push(new Headers(init?.headers).get('SGAI-APIKEY')!);
-      return Response.json(creditsStatus===200?{remaining:50,used:5,plan:'Test'}:{error:{message:'sgai-user-secret'}},{status:creditsStatus});
-    }
-    return originalFetch(target,init);
-  };
-  try {
-    assert.deepEqual((await request('/api/scraper-settings/test','POST',{},user)).body,{remaining:50,used:5,plan:'Test'});
-    assert.equal((await request('/api/scraper-settings/test','POST',{apiKey:'sgai-draft-secret'},user)).status,200);
-    assert.deepEqual(testedKeys,['sgai-user-secret','sgai-draft-secret']);
-    assert.equal((await pool.query("SELECT scrapegraph_api_key FROM users WHERE id='user'")).rows[0].scrapegraph_api_key,'sgai-user-secret','Testing never persists a draft key');
-    creditsStatus=401;
-    const invalidKey=await request('/api/scraper-settings/test','POST',{},user);
-    assert.equal(invalidKey.status,502);assert.doesNotMatch(JSON.stringify(invalidKey.body),/sgai-user-secret/);
-    assert.equal((await request('/api/auth/me','GET',undefined,user)).status,200,'Upstream key failures preserve the session');
-  } finally {globalThis.fetch=originalFetch;}
-  assert.equal((await request('/api/scraper-settings','PUT',{...personal,apiKey:null},user)).body.configured,false);
-  assert.equal((await request('/api/scraper-settings','GET',undefined,other)).body.configured,true,'Removing a key affects only its owner');
-  assert.equal((await request('/api/scraper-settings','PUT',{...personal,apiKey:'sgai-user-secret'},user)).status,200);
+  await pool.query("ALTER TABLE users ADD COLUMN scrapegraph_api_key text; ALTER TABLE users ADD COLUMN scrapegraph_settings jsonb; UPDATE users SET scrapegraph_api_key='sgai-retired-secret',scrapegraph_settings='{\"mode\":\"js\"}' WHERE id='user'");
   await initializeAuth(pool);
-  assert.deepEqual((await request('/api/scraper-settings','GET',undefined,user)).body,{...personal,configured:true},'Repeat migrations preserve personal settings');
-  assert.doesNotMatch(JSON.stringify((await request('/api/users','GET',undefined,admin)).body),/scrapegraph|sgai-user-secret|sgai-other-secret/);
+  assert.equal((await pool.query("SELECT scrapegraph_api_key FROM users WHERE id='user'")).rows[0].scrapegraph_api_key,'sgai-retired-secret','Retired columns survive migrations');
+  assert.doesNotMatch(JSON.stringify((await request('/api/users','GET',undefined,admin)).body),/scrapegraph|sgai-retired-secret/);
   assert.equal((await request('/api/users','GET',undefined,user)).status,403);
   assert.equal((await request('/api/catalog','DELETE',{all:true},user)).status,403);
   assert.equal((await request('/api/provider-settings','PUT',{},user)).status,403);
@@ -138,34 +108,33 @@ try {
   assert.equal((await request('/api/users/admin','PUT',{role:'user'},admin)).status,409);
   const settings=await request('/api/provider-settings','GET',undefined,user);
   assert.equal(settings.status,200);assert.doesNotMatch(JSON.stringify(settings.body),/test-secret-only|apiKey/);
-  assert.equal(settings.body.scrapperModelName,'perplexity/sonar');
+  assert.ok(!('scrapperModelName' in settings.body));
   assert.equal(settings.body.baseUrl,'','The gateway destination remains server-only');
   assert.equal(settings.body.modelName,'deepseek/deepseek-v4.1-flash');
-  const configured={...editableSettings(DEFAULT_SETTINGS),modelName:'deepseek/deepseek-v4.1-flash',scrapperModelName:'test/sonar',maxTokens:10000};
+  await pool.query("UPDATE provider_settings SET settings='{\"modelName\":\"legacy/qa\",\"scrapperModelName\":\"perplexity/sonar\"}' WHERE id='default'");
+  await initializeProvider(pool);
+  assert.equal((await request('/api/provider-settings','GET',undefined,user)).body.modelName,'legacy/qa');
+  assert.equal((await request('/api/provider-settings','PUT',{...editableSettings(DEFAULT_SETTINGS),scrapperModelName:'perplexity/sonar'},admin)).status,400);
+  await initializeProvider(pool);
+  assert.ok(!('scrapperModelName' in (await pool.query("SELECT settings FROM provider_settings WHERE id='default'")).rows[0].settings));
+  const configured={...editableSettings(DEFAULT_SETTINGS),modelName:'deepseek/deepseek-v4.1-flash',maxTokens:10000};
   assert.equal((await request('/api/provider-settings','PUT',configured,admin)).status,200);
-  assert.equal((await request('/api/provider-settings','GET',undefined,user)).body.scrapperModelName,'test/sonar');
+  assert.ok(!('scrapperModelName' in (await request('/api/provider-settings','GET',undefined,user)).body));
   assert.equal((await request('/api/chat','POST',{modelName:'unsaved/qa'},admin)).status,200);
   assert.equal(providerRequests.at(-1).model,'unsaved/qa');
   assert.equal(providerRequests.at(-1).messages.length,1);
-  assert.equal((await request('/api/chat','POST',{purpose:'scrapper',modelName:'unsaved/sonar'},admin)).status,200);
-  assert.equal(providerRequests.at(-1).model,'unsaved/sonar');
-  assert.equal(providerRequests.at(-1).messages.length,1);
-  assert.equal(providerRequests.at(-1).search_domain_filter,undefined,'Both API tests send only connectivity prompts');
-  assert.equal((await request('/api/provider-settings','GET',undefined,user)).body.scrapperModelName,'test/sonar','Tests never save draft models');
+  assert.equal((await request('/api/chat','POST',{purpose:'scrapper',modelName:'unsaved/sonar'},admin)).status,400);
+  assert.equal((await request('/api/provider-settings','GET',undefined,user)).body.modelName,configured.modelName,'Tests never save draft models');
   providerMode='no-citations';
-  assert.equal((await request('/api/chat','POST',{purpose:'scrapper'},admin)).status,200,'Connectivity tests do not require retrieval citations');
+  assert.equal((await request('/api/chat','POST',{purpose:'scrapper'},admin)).status,400);
   assert.equal((await request('/api/chat','POST',{purpose:'qa'},admin)).status,200,'QA connectivity remains independent of retrieval failures');
   providerMode='success';calls=0;
-  assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product?variant=42',modelName:'injected'},user)).status,400);
-  assert.equal((await request('/api/scrape','POST',{url:'http://127.0.0.1/page'},user)).status,400);
-  const retrieved=await request('/api/scrape','POST',{url:'https://8.8.8.8/product?variant=42'},user);
-  assert.equal(retrieved.status,200);assert.deepEqual(Object.keys(retrieved.body),['markdown']);
-  assert.deepEqual(scrapeConfigurations.at(-1),{...personal,apiKey:'sgai-user-secret'});
-  assert.match(retrieved.body.markdown,/variant=42/);assert.equal(calls,0,'Scraping makes no provider calls');
+  assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product'},user)).status,404);
+  assert.equal((await request('/api/catalog/nope/scrape','POST',{expectedRevision:0,url:'https://8.8.8.8/product'},user)).status,400);
+  assert.equal((await request('/api/catalog/nope/scrape','POST',{expectedRevision:0},user)).status,404);
+  assert.equal(calls,0,'Scraping makes no provider calls');
   assert.doesNotMatch(JSON.stringify(providerRequests),/test-secret-only/);
-  scrapeBlocked=true;
-  assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product'},user)).status,502);
-  scrapeBlocked=false;providerMode='success';calls=0;
+  providerMode='success';calls=0;
   assert.equal((await request('/api/chat','POST',{baseUrl:'http://evil',apiKey:'x'},admin)).status,400);
   const mappingRules='Brand must match SAP. Review every uploaded bullet point and preserve optional blank fields.';
   const testSet=(await request('/api/qa-configuration','GET',undefined,user)).body.attributeSets.find((set:any)=>set.name==='TestSet');
@@ -173,18 +142,58 @@ try {
   const sku=(id:string)=>({sku:id,source:{sap:'Brand: TestBrand'},raw_row:{sku:id,attributes__brand:'TestBrand',attributes__bullet_point_7:'Extra supplied bullet',custom_optional:'',source__sap:'private template source'},upload_attributes:{brand:'TestBrand'},attribute_set:'TestSet',status:'ready'});
   assert.equal((await request('/api/catalog','POST',[sku('a'),{sku:'invalid'}],user)).status,400);
   assert.equal((await request('/api/catalog','GET',undefined,user)).body.length,0);
+  for(const qa_result of [null,'forged',{qa_status:'pass',issues:[]}]) {
+    const rejected=await request('/api/catalog','POST',[sku('valid-before-forged'),{...sku('forged'),raw_row:{sku:'forged',qa_result}}],user);
+    assert.equal(rejected.status,400);
+    assert.equal(rejected.body.error,'raw_row.qa_result is reserved for server-generated QA; remove it before importing.');
+    assert.equal((await pool.query('SELECT count(*)::int AS count FROM sku_data')).rows[0].count,0);
+  }
+  assert.equal((await request('/api/catalog','POST',[{...sku('forged'),qa_result:{qa_status:'pass'}}],user)).status,400);
   await pool.query("CREATE FUNCTION fail_import() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.sku='rollback' THEN RAISE EXCEPTION 'injected'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_import BEFORE INSERT ON sku_data FOR EACH ROW EXECUTE FUNCTION fail_import()");
   assert.equal((await request('/api/catalog','POST',[sku('a'),sku('rollback')],user)).status,503);
   assert.equal((await request('/api/catalog','GET',undefined,user)).body.length,0);
   await pool.query('DROP TRIGGER fail_import ON sku_data');
   const inserted=await request('/api/catalog','POST',[sku('a'),sku('b')],user);assert.equal(inserted.body.inserted.length,2);
   const duplicate=await request('/api/catalog','POST',[{...sku('a'),source:{sap:'Overwrite?'}}],user);assert.deepEqual(duplicate.body.skipped,['a']);
-  assert.equal((await request('/api/catalog/nope','PUT',{source:{sap:'x'}},user)).status,404);
+  assert.equal((await request('/api/catalog/nope','PUT',{source:{sap:'x'},expectedRevision:0},user)).status,404);
   assert.equal((await request('/api/jobs','POST',{id:'bad',name:'Bad',skus:{a:true}},user)).status,400);
   const job=await request('/api/jobs','POST',{id:'job',name:'Job',skus:['a','b'],attribute_set:'TestSet'},user);assert.equal(job.status,201);
   const credentials={baseUrl:process.env.LLM_BASE_URL,key:process.env.LLM_API_KEY,legacyKey:process.env.AICREDITS_API_KEY};
   delete process.env.LLM_BASE_URL;delete process.env.LLM_API_KEY;delete process.env.AICREDITS_API_KEY;
-  assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product'},user)).status,200,'ScrapeGraph retrieval uses its own key, independently of LLM credentials');
+  await request('/api/catalog','POST',[{...sku('scrape-check'),source:{url:'https://8.8.8.8/product?variant=42'}}],user);
+  const scraped=await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:0},user);
+  assert.equal(scraped.status,200,'Scraping works without any LLM credentials');
+  assert.equal(scraped.body.sku,'scrape-check');assert.equal(scraped.body.revision,1);
+  assert.equal(scraped.body.scrape_metadata.method,'browser');assert.match(scraped.body.scraped_markdown,/variant=42/);
+  assert.equal(calls,0);
+  assert.equal((await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:0},user)).status,409);
+  assert.equal((await request('/api/catalog/scrape-check','PUT',{source:{sap:'missing revision'}},user)).status,400);
+  assert.equal((await request('/api/catalog/scrape-check','PUT',{expectedRevision:0,source:{sap:'stale'}},user)).status,409);
+  scrapeBlocked=true;
+  const failure=await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:1},user);
+  assert.equal(failure.status,502);scrapeBlocked=false;
+  const afterFailure=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='scrape-check');
+  assert.equal(afterFailure.scraped_markdown,scraped.body.scraped_markdown);assert.equal(afterFailure.revision,1);
+  assert.deepEqual(afterFailure.scrape_metadata,scraped.body.scrape_metadata);assert.match(afterFailure.scrape_error,/blocked/);
+  await pool.query("CREATE FUNCTION fail_scrape_save() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.sku='scrape-check' AND NEW.scrape_status='success' THEN RAISE EXCEPTION 'injected scrape commit failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_scrape_save BEFORE UPDATE ON sku_data FOR EACH ROW EXECUTE FUNCTION fail_scrape_save()");
+  assert.equal((await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:1},user)).status,503,'A failed evidence commit is never reported as saved');
+  assert.equal((await pool.query("SELECT revision FROM sku_data WHERE sku='scrape-check'")).rows[0].revision,1);
+  await pool.query('DROP TRIGGER fail_scrape_save ON sku_data');
+  duringScrape=async()=>{assert.equal((await edit('scrape-check',{source:{url:'https://8.8.8.8/changed'}})).status,200);};
+  assert.equal((await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:1},user)).status,409);
+  duringScrape=undefined;
+  const changed=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='scrape-check');
+  assert.equal(changed.source.url,'https://8.8.8.8/changed');assert.equal(changed.scraped_markdown,scraped.body.scraped_markdown);
+  duringScrape=async()=>{
+    await pool.query("DELETE FROM sku_data WHERE sku='scrape-check'");
+    await request('/api/catalog','POST',[{...sku('scrape-check'),source:{url:'https://8.8.8.8/reimported'}}],user);
+  };
+  assert.equal((await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:2},user)).status,409,'Deleted/reimported SKU cannot receive evidence from an old row');
+  assert.equal((await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:0},user)).status,409,'Row identity protects deletion/reimport even when both revisions are zero');
+  duringScrape=async()=>{await pool.query("DELETE FROM sku_data WHERE sku='scrape-check'");};
+  assert.equal((await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:0},user)).status,404);
+  duringScrape=undefined;
+  await request('/api/catalog','DELETE',{skus:['scrape-check']},admin);
   const missingProvider=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'all'},user);
   assert.equal(missingProvider.status,503);
   assert.match(missingProvider.body.error,/LLM_BASE_URL.*LLM_API_KEY/,'Missing credentials return actionable configuration errors');
@@ -229,7 +238,7 @@ try {
   };
   providerMode='wait';stopWorker=startJobWorker(pool,scrape);stopSecond=startJobWorker(pool,scrape);
   await waitFor(async()=>calls>=1,'first provider call');
-  await request('/api/catalog/a','PUT',{source:{sap:'New evidence'}},user);
+  await edit('a',{source:{sap:'New evidence'}});
   await waitFor(async()=>(await request(`/api/job-runs/${run.body.id}`,'GET',undefined,user)).body.status==='completed','run completion');
   assert.equal(calls,2,'Two workers must not duplicate calls');
   const history=(await request(`/api/job-runs/${run.body.id}`,'GET',undefined,user)).body;
@@ -282,6 +291,7 @@ try {
   assert.doesNotMatch(retainedFailure,/test-secret-only|sk-private-test|private-header/);
   providerMode='wait';const beforeCancel=calls;
   const cancelled=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'all'},user);
+  assert.equal(cancelled.status,202,JSON.stringify(cancelled.body));
   await waitFor(async()=>calls>beforeCancel,'inflight cancel');
   assert.equal((await request(`/api/job-runs/${cancelled.body.id}/cancel`,'POST',{},user)).status,200);
   await waitFor(async()=>(await request(`/api/job-runs/${cancelled.body.id}`,'GET',undefined,user)).body.status==='cancelled','cancelled');
@@ -302,22 +312,19 @@ try {
   await waitFor(async()=>(await request(`/api/job-runs/${expired.body.id}`,'GET',undefined,user)).body.status==='failed','expired item deadline');
   assert.equal(calls,beforeExhaustion);
   await stopWorker();stopWorker=undefined;
-  // Browser retrieval is independent of legacy model settings; QA retains its run snapshot.
+  // Browser retrieval is independent of models; QA retains its durable settings snapshot.
   const productUrl='https://8.8.8.8/product?variant=42';
-  assert.equal((await request('/api/catalog/b','PUT',{source:{sap:'Brand: TestBrand',url:productUrl},scraped_markdown:''},user)).status,200);
+  assert.equal((await edit('b',{source:{sap:'Brand: TestBrand',url:productUrl},scraped_markdown:''})).status,200);
   const webRun=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'b'},user);
-  await request('/api/scraper-settings','PUT',{...personal,apiKey:'sgai-rotated-secret'},user);
   const snapshotConfig=(await pool.query('SELECT configuration FROM job_runs WHERE id=$1',[webRun.body.id])).rows[0].configuration;
-  assert.equal(snapshotConfig.settings.scrapperModelName,'test/sonar');assert.ok(!('selectors' in snapshotConfig));
+  assert.ok(!('scrapperModelName' in snapshotConfig.settings));assert.ok(!('selectors' in snapshotConfig));
   assert.doesNotMatch(JSON.stringify(snapshotConfig),/test-secret-only|apiKey|sgai-.*-secret/);
-  await request('/api/provider-settings','PUT',{...configured,modelName:'next/qa',scrapperModelName:'next/sonar'},admin);
+  await request('/api/provider-settings','PUT',{...configured,modelName:'next/qa'},admin);
   providerMode='success';let offset=providerRequests.length;stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await request(`/api/job-runs/${webRun.body.id}`,'GET',undefined,user)).body.status==='completed','snapshotted retrieval');
   await stopWorker();stopWorker=undefined;
   assert.deepEqual(providerRequests.slice(offset).map(payload=>payload.model),['deepseek/deepseek-v4.1-flash']);
   assert.equal(scrapeRequests.at(-1),productUrl);
-  assert.equal(scrapeConfigurations.at(-1)?.apiKey,'sgai-rotated-secret','Queued jobs load the actor\'s latest key instead of another user\'s key or a snapshot');
-  assert.equal(scrapeConfigurations.at(-1)?.mode,'js');
   const qaRequest=providerRequests[offset];
   assert.equal(qaRequest.reasoning_effort,'low');assert.equal(qaRequest.max_tokens,10000);
   assert.deepEqual(qaRequest.response_format,{type:'json_object'});assert.ok(qaRequest.messages[0].content.includes(mappingRules));
@@ -353,11 +360,91 @@ try {
   assert.match(blockedItem.error,/website blocked browser access/);
   assert.equal(blockedItem.result.scrape_status,'failed');
   assert.equal(providerRequests.length,offset,'No QA request without usable source evidence');
+  // Retrieval is committed before QA; later model failure or cancellation cannot erase it.
+  await request('/api/catalog','POST',[{...sku('url-only'),source:{url:productUrl}}],user);
+  assert.equal((await request('/api/jobs','POST',{id:'url-only-job',name:'URL-only job',skus:['url-only'],attribute_set:'TestSet'},user)).status,201);
+  providerMode='permanent';
+  const failureAfterScrape=await request('/api/jobs/url-only-job/runs','POST',{requestId:randomUUID(),mode:'all'},user);
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await request(`/api/job-runs/${failureAfterScrape.body.id}`,'GET',undefined,user)).body.status==='failed','QA failure after committed scrape');
+  await stopWorker();stopWorker=undefined;
+  const savedEvidence=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='url-only');
+  assert.match(savedEvidence.scraped_markdown,/Retrieved product/);assert.equal(savedEvidence.scrape_status,'success');
+  assert.equal(savedEvidence.revision,1);assert.equal(savedEvidence.scrape_metadata.method,'browser');
+  const savedItem=(await pool.query('SELECT revision,snapshot FROM job_run_items WHERE run_id=$1',[failureAfterScrape.body.id])).rows[0];
+  assert.equal(savedItem.revision,savedEvidence.revision);assert.equal(savedItem.snapshot.scraped_markdown,savedEvidence.scraped_markdown);
+  const cancelUrl='https://8.8.8.8/new-product';
+  await edit('url-only',{source:{url:cancelUrl}});
+  providerMode='wait';const callsBeforeCancel=calls;
+  const cancelAfterScrape=await request('/api/jobs/url-only-job/runs','POST',{requestId:randomUUID(),mode:'all'},user);
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>calls>callsBeforeCancel,'QA started after fresh scrape');
+  const beforeCancelEvidence=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='url-only');
+  assert.equal(beforeCancelEvidence.scrape_metadata.requestedUrl,cancelUrl);
+  assert.equal(beforeCancelEvidence.revision,3,'Source edit and new scrape each advance evidence revision');
+  await request(`/api/job-runs/${cancelAfterScrape.body.id}/cancel`,'POST',{},user);
+  await waitFor(async()=>(await request(`/api/job-runs/${cancelAfterScrape.body.id}`,'GET',undefined,user)).body.status==='cancelled','Cancellation after committed scrape');
+  await stopWorker();stopWorker=undefined;
+  assert.equal((await pool.query("SELECT scraped_markdown FROM sku_data WHERE sku='url-only'")).rows[0].scraped_markdown,beforeCancelEvidence.scraped_markdown);
+  providerMode='success';
+  // Imported legacy reviews are rerun; trusted skipped reviews have their own durable result.
+  const forgedQa={qa_status:'warning',issues:[{field:'brand',suggested_fix:'Forged brand'}]};
+  const legacyRaw={...sku('a').raw_row,qa_result:forgedQa};
+  await pool.query("UPDATE sku_data SET raw_row=$1,qa_result=NULL,export_data=$2,status='completed',error=NULL WHERE sku='a'",[JSON.stringify(legacyRaw),JSON.stringify(forgedQa)]);
+  const trustedB=history.items[1].result;
+  await pool.query("UPDATE sku_data SET qa_result=$1,export_data=$2,qa_revision=revision,status='completed',error=NULL WHERE sku='b'",[JSON.stringify(trustedB.qa_result),JSON.stringify(trustedB.export_data)]);
+  const unverified=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='a');
+  assert.equal(unverified.status,'ready');assert.equal(unverified.qa_result,null);
+  assert.equal(unverified.export_data,null);assert.equal(unverified.error,'Legacy review is unverified; rerun QA.');
+  assert.ok(!Object.hasOwn(unverified.raw_row,'qa_result'));
+  await edit('a',{source:sku('a').source});
+  assert.equal((await pool.query("SELECT error FROM sku_data WHERE sku='a'")).rows[0].error,null,'Raw QA never triggers evidence-edit invalidation');
+  const unfinished=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'unfinished'},user);
+  assert.equal(unfinished.status,202);
+  assert.equal(unfinished.body.items[0].status,'queued');
+  assert.equal(unfinished.body.items[1].status,'skipped');
+  assert.deepEqual(unfinished.body.items[1].result.qa_result,trustedB.qa_result);
+  assert.ok(!Object.hasOwn(unfinished.body.items[1].snapshot,'qa_result'));
+  const beforeLegacyCalls=calls;
+  const beforeLegacyUsage=(await pool.query("SELECT tokens_used FROM jobs WHERE id='job'")).rows[0].tokens_used.total_tokens;
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await request(`/api/job-runs/${unfinished.body.id}`,'GET',undefined,user)).body.status==='completed','legacy review rerun');
+  await stopWorker();stopWorker=undefined;
+  assert.equal(calls,beforeLegacyCalls+1,'Only the unverified review is sent to the mocked provider');
+  const reviewed=(await request(`/api/job-runs/${unfinished.body.id}`,'GET',undefined,user)).body;
+  assert.equal(reviewed.items[0].result.qa_result.qa_status,'pass');
+  assert.deepEqual(reviewed.items[1].result.qa_result,trustedB.qa_result);
+  const savedLegacy=(await pool.query("SELECT raw_row,qa_result FROM sku_data WHERE sku='a'")).rows[0];
+  assert.deepEqual(savedLegacy.raw_row,legacyRaw,'Reruns preserve original stored legacy data');
+  assert.equal(savedLegacy.qa_result.qa_status,'pass');
+  const afterLegacyJob=(await pool.query("SELECT status,tokens_used FROM jobs WHERE id='job'")).rows[0];
+  assert.equal(afterLegacyJob.status,'completed');
+  assert.equal(afterLegacyJob.tokens_used.total_tokens,beforeLegacyUsage+15,'Skipped prior reviews do not charge usage twice');
+  assert.ok(!Object.hasOwn((await pool.query("SELECT raw_row FROM sku_data WHERE sku='b'")).rows[0].raw_row,'qa_result'),'New worker reviews are never mirrored into raw rows');
+  await edit('a',{source:{sap:'Changed after genuine review'}});
+  const staleReview=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='a');
+  assert.equal(staleReview.qa_stale,true);assert.equal(staleReview.qa_result,null);assert.equal(staleReview.export_data,null);
+  assert.ok((await pool.query("SELECT qa_result FROM sku_data WHERE sku='a'")).rows[0].qa_result,'Invalidation preserves the stored genuine prior review');
+  assert.deepEqual((await request(`/api/job-runs/${unfinished.body.id}`,'GET',undefined,user)).body.items[0].result,reviewed.items[0].result,'Genuine history survives later catalog edits');
+  // An older skipped snapshot, even with top-level QA, is evidence only.
+  const snapshotOnly=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'a'},user);
+  const oldSnapshot={...trustedB,raw_row:{...trustedB.raw_row,qa_result:forgedQa}};
+  await pool.query("UPDATE job_run_items SET snapshot=$2,result=NULL WHERE run_id=$1 AND sku='b'",[snapshotOnly.body.id,JSON.stringify(oldSnapshot)]);
+  const oldItem=(await request(`/api/job-runs/${snapshotOnly.body.id}`,'GET',undefined,user)).body.items[1];
+  assert.equal(oldItem.result,null);assert.equal(oldItem.snapshot.status,'ready');
+  assert.equal(oldItem.snapshot.error,'Legacy review is unverified; rerun QA.');
+  for(const key of ['qa_result','export_data','tokensUsed','timeTaken','last_job_id'])assert.ok(!Object.hasOwn(oldItem.snapshot,key));
+  assert.ok(!Object.hasOwn(oldItem.snapshot.raw_row,'qa_result'));
+  assert.deepEqual((await pool.query("SELECT snapshot FROM job_run_items WHERE run_id=$1 AND sku='b'",[snapshotOnly.body.id])).rows[0].snapshot,oldSnapshot,'Reading history never rewrites legacy snapshots');
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await request(`/api/job-runs/${snapshotOnly.body.id}`,'GET',undefined,user)).body.status==='completed','snapshot-only history completion');
+  await stopWorker();stopWorker=undefined;
+  assert.equal((await pool.query("SELECT status FROM jobs WHERE id='job'")).rows[0].status,'pending','Unverified skipped snapshots cannot complete a job');
   await initializeDatabase(pool); // Existing populated records remain readable after restart migrations.
   // Clear remains all-or-nothing even if catalog deletion fails after deleting jobs.
   await pool.query("CREATE FUNCTION fail_clear() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected clear failure'; END $$; CREATE TRIGGER fail_clear BEFORE DELETE ON sku_data FOR EACH ROW EXECUTE FUNCTION fail_clear()");
   assert.equal((await request('/api/data','DELETE',undefined,admin)).status,503);
-  assert.equal((await request('/api/jobs','GET',undefined,user)).body.length,1);
+  assert.deepEqual((await request('/api/jobs','GET',undefined,user)).body.map((job:any)=>job.id).sort(),['job','url-only-job']);
   await pool.query('DROP TRIGGER fail_clear ON sku_data');
   assert.equal((await request('/api/data','DELETE',undefined,admin)).status,200);
   assert.equal((await request('/api/jobs','GET',undefined,user)).body.length,0);

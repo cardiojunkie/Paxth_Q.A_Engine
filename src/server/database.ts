@@ -34,6 +34,13 @@ export async function initializeDatabase(pool: Pool) {
       ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS export_data JSONB;
       ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS last_job_id TEXT;
       ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS scrape_metadata JSONB;
+      ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS scrape_error TEXT;
+      ALTER TABLE sku_data ADD COLUMN IF NOT EXISTS qa_revision INTEGER;
+      UPDATE sku_data SET qa_revision=revision
+        WHERE qa_revision IS NULL AND qa_result IS NOT NULL AND status IN ('completed','failed') AND error IS NULL;
+      UPDATE sku_data SET scrape_metadata=jsonb_build_object('method','legacy','requestedUrl',source->>'url','finalUrl',NULL,'capturedAt',NULL)
+        WHERE scrape_metadata IS NULL AND nullif(btrim(scraped_markdown),'') IS NOT NULL;
       CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL,
         attribute_set TEXT, skus JSONB NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'pending',
@@ -66,9 +73,8 @@ export async function verifySchema(pool: Pool) {
   for (const table of ['users','sessions','sku_data','jobs','qa_agent_settings','provider_settings','job_runs','job_run_items']) {
     await pool.query(`SELECT 1 FROM ${table} LIMIT 0`);
   }
-  await pool.query('SELECT sku,source,raw_row,upload_attributes,status,attribute_set,attribute_set_id,revision,qa_result,export_data,last_job_id,scraped_markdown,scrape_status,tokens_used,time_taken,error FROM sku_data LIMIT 0');
+  await pool.query('SELECT sku,source,raw_row,upload_attributes,status,attribute_set,attribute_set_id,revision,qa_result,qa_revision,export_data,last_job_id,scraped_markdown,scrape_status,scrape_metadata,scrape_error,tokens_used,time_taken,error FROM sku_data LIMIT 0');
   await pool.query('SELECT id,name,created_at,attribute_set,skus,status,tokens_used,time_taken,error FROM jobs LIMIT 0');
-  await pool.query('SELECT scrapegraph_api_key,scrapegraph_settings FROM users LIMIT 0');
   const checks = await pool.query(`SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'jobs'::regclass AND conname IN ('jobs_skus_array','jobs_valid_status')`);
   if (checks.rows.length !== 2 || checks.rows.some(row => !row.convalidated)) throw new Error('Required database constraints are unavailable');
 }

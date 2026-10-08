@@ -1,5 +1,6 @@
 import type { SkuData } from "../hooks/useCatalogData";
 import type { AttributeSet } from "../types";
+import { usableScrapedMarkdown } from './scrapeEvidence';
 
 export const DEFAULT_QA_AGENT_MEMORY = `You are a quality assurance agent for ecommerce product catalogues serving
 Bahrain, Kuwait, Oman, Qatar, Saudi Arabia, and the United Arab Emirates.
@@ -103,7 +104,7 @@ Required JSON structure (choose one value from each enum):
 
 export function prepareQaInput(sku: SkuData, attributeSets: AttributeSet[], memory: string, maxPageContentLength: number) {
   const sap = sku.source.sap?.trim() || "";
-  const web = sku.scraped_markdown?.trim() || "";
+  const web = usableScrapedMarkdown(sku);
   if (!sap && !web) throw new Error("Cannot QA: no usable SAP or product-page evidence. Provide SAP data or scrape/paste product content first.");
 
   const matches = attributeSets.filter(set => set.name.trim().toLowerCase() === sku.attribute_set?.trim().toLowerCase());

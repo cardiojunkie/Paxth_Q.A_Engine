@@ -22,7 +22,7 @@ export function LLMSettingsModule() {
         setTestResult({ modelName, status: 'testing' });
         let result: TestResult;
         try {
-          const response = await api<{ success?: boolean }>('/api/chat', { method: 'POST', body: JSON.stringify({ purpose: 'qa', modelName }) });
+          const response = await api<{ success?: boolean }>('/api/chat', { method: 'POST', body: JSON.stringify({ modelName }) });
           if (response?.success !== true) throw new Error('The server returned an invalid connectivity test response.');
           result = { modelName, status: 'passed' };
         } catch (error) { result = { modelName, status: 'failed', error: (error as Error).message }; }
@@ -40,7 +40,7 @@ export function LLMSettingsModule() {
   return <section className="flex-1 overflow-auto p-8 bg-[#FDFCFB]">
     <h2 className="text-2xl font-serif mb-4">LLM Settings</h2>
     <p className="mb-4">Provider credentials are configured on the server. {settings.providerConfigured ? 'Provider configured.' : 'Server provider credentials are missing.'}</p>
-    <p className="mb-4 text-sm">Test API sends a short connectivity message to the displayed Q&A model without saving changes.</p>
+    <p className="mb-4 text-sm">Test API checks the displayed Q&A model without saving changes. Scraping uses no model or provider credentials.</p>
     {(message || memoryError) && <p role="status" className="mb-4">{message || memoryError}</p>}
     {testResult && <p role="status" className="mb-2">Q&A ({testResult.modelName}): {testResult.status === 'testing' ? 'Testing…' : testResult.status === 'passed' ? 'Passed.' : `Failed: ${testResult.error}`}</p>}
     <fieldset disabled={user?.role !== 'admin' || busy || isMemoryLoading} className="max-w-3xl space-y-4 disabled:opacity-60">

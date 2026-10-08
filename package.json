@@ -18,14 +18,19 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "test:scrape-agent": "tsx src/lib/scrapeAgent.test.ts && tsx src/lib/scrapeRequest.test.ts",
+    "test:scraper": "tsx src/lib/browserScrape.test.ts && tsx src/lib/scrapeRequest.test.ts",
     "admin:bootstrap": "tsx scripts/bootstrap-admin.ts",
     "test:provider": "tsx src/server/provider.test.ts",
     "test:auth": "tsx src/server/auth.test.ts",
     "test:security-db": "tsx src/server/security.test.ts",
-    "test": "npm run lint && npm run test:auth && npm run test:provider && npm run test:job-state && npm run test:job-runner && npm run test:llm-response && npm run test:qa-agent && npm run test:scrape-agent",
+    "test:catalog": "tsx src/server/catalog.test.ts",
+    "test": "npm run lint && npm run test:auth && npm run test:provider && npm run test:catalog && npm run test:job-state && npm run test:job-runner && npm run test:llm-response && npm run test:qa-agent && npm run test:scraper",
     "test:job-runner": "tsx src/server/jobRunner.test.ts",
-    "setup:browser": "playwright-core install chromium"
+    "setup:browser": "playwright-core install chromium",
+    "setup:scraper": "node scripts/setup-scraper.mjs",
+    "test:scrape-browser": "tsx src/lib/scrapeBrowser.test.ts",
+    "test:scrape-worker": ".venv/bin/python -m unittest discover -s scraper -p test_*.py",
+    "test:scrape-production": "node scripts/smoke-scraper.mjs"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.20",

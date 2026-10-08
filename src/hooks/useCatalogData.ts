@@ -1,6 +1,7 @@
 
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { api } from '../lib/api';
+import { scrapeCatalogSku } from '../lib/scrapeRequest';
 
 export type QAStatus = "pending" | "ready" | "cannot_qa" | "running" | "completed" | "failed";
 
@@ -19,6 +20,14 @@ export interface SkuData {
   attribute_set?: string;
   scraped_markdown?: string;
   scrape_status?: "success" | "failed" | "skipped_no_url";
+  scrape_metadata?: {
+    method: 'browser' | 'manual' | 'legacy';
+    requestedUrl: string | null;
+    finalUrl: string | null;
+    capturedAt: string | null;
+  } | null;
+  scrape_error?: string | null;
+  qa_stale?: boolean;
   tokensUsed?: {
     prompt_tokens: number;
     completion_tokens: number;
@@ -31,21 +40,32 @@ export interface SkuData {
   last_job_id?: string;
 }
 
-export function useCatalogData(enabled = true) {
+export function useCatalogData(enabled = true, sessionKey?: string) {
   const [skuDataList, setSkuDataList] = useState<SkuData[]>([]);
   const [isLoading, setIsLoading] = useState(enabled);
   const [catalogError, setCatalogError] = useState("");
   const generation = useRef(0);
+  const refreshSerial = useRef(0);
   const refreshCatalog = useCallback(async () => {
     if (!enabled) return;
     const current = generation.current;
+    const request = ++refreshSerial.current;
     const rows = await api<SkuData[]>('/api/catalog');
-    if (current === generation.current) { setSkuDataList(rows); setCatalogError(""); }
-  }, [enabled]);
+    if (current === generation.current && request === refreshSerial.current) {
+      setSkuDataList(previous => {
+        const known = new Map(previous.map(row => [row.sku, row]));
+        return rows.map(row => {
+          const saved = known.get(row.sku);
+          return saved && (saved.revision ?? 0) > (row.revision ?? 0) ? saved : row;
+        });
+      });
+      setCatalogError("");
+    }
+  }, [enabled, sessionKey]);
   const resetCatalog = useCallback(() => { generation.current++; setSkuDataList([]); }, []);
   useEffect(() => {
     generation.current++;
-    if (!enabled) { setSkuDataList([]); setIsLoading(false); return; }
+    if (!enabled) { setSkuDataList([]); setCatalogError(""); setIsLoading(false); return; }
     let active = true;
     setIsLoading(true);
     refreshCatalog().catch(error => { if (active) setCatalogError(error.message); })
@@ -54,8 +74,11 @@ export function useCatalogData(enabled = true) {
   }, [enabled, refreshCatalog]);
 
   const addParsedData = useCallback(async (data: SkuData[]) => {
+    const current = generation.current;
     try {
       const result = await api<{inserted: SkuData[]; skipped: string[]}>('/api/catalog', { method:'POST', body:JSON.stringify(data) });
+      if (current !== generation.current) return null;
+      refreshSerial.current++;
       setSkuDataList(previous => {
         const rows = new Map(previous.map(item => [item.sku,item]));
         result.inserted.forEach(item => rows.set(item.sku,item));
@@ -63,23 +86,50 @@ export function useCatalogData(enabled = true) {
       });
       setCatalogError("");
       return result;
-    } catch (error) { setCatalogError((error as Error).message); return null; }
+    } catch (error) { if (current === generation.current) setCatalogError((error as Error).message); return null; }
   }, []);
-  const updateSku = useCallback(async (sku: string, updates: Partial<SkuData>): Promise<boolean> => {
+  const updateSku = useCallback(async (sku: string, updates: Partial<SkuData>, expectedRevision?: number): Promise<boolean> => {
+    const current = generation.current;
     try {
-      const saved = await api<SkuData>(`/api/catalog/${encodeURIComponent(sku)}`, { method:'PUT', body:JSON.stringify(updates) });
-      setSkuDataList(previous => previous.map(item => item.sku === sku ? saved : item));
+      const revision = expectedRevision ?? skuDataList.find(item => item.sku === sku)?.revision ?? 0;
+      const saved = await api<SkuData>(`/api/catalog/${encodeURIComponent(sku)}`, { method:'PUT', body:JSON.stringify({...updates, expectedRevision: revision}) });
+      if (current !== generation.current) return false;
+      refreshSerial.current++;
+      setSkuDataList(previous => previous.map(item => item.sku === sku && (saved.revision ?? 0) > (item.revision ?? 0) ? saved : item));
       setCatalogError("");
       return true;
-    } catch (error) { setCatalogError((error as Error).message); return false; }
-  }, []);
+    } catch (error) {
+      if (current === generation.current) await refreshCatalog().catch(() => {});
+      if (current === generation.current) setCatalogError((error as Error).message);
+      return false;
+    }
+  }, [skuDataList, refreshCatalog]);
+  const scrapeSku = useCallback(async (sku: SkuData, signal?: AbortSignal): Promise<SkuData> => {
+    const current = generation.current;
+    try {
+      const saved = await scrapeCatalogSku(sku, signal);
+      if (current === generation.current) {
+        refreshSerial.current++;
+        setSkuDataList(previous => previous.map(item => item.sku === saved.sku && (saved.revision ?? 0) > (item.revision ?? 0) ? saved : item));
+        setCatalogError("");
+      }
+      return saved;
+    } catch (error) {
+      if (current === generation.current) await refreshCatalog().catch(() => {});
+      if (current === generation.current && !signal?.aborted) setCatalogError((error as Error).message);
+      throw error;
+    }
+  }, [refreshCatalog]);
   const removeSkus = useCallback(async (skus: string[]) => {
+    const current = generation.current;
     try {
       await api('/api/catalog', { method:'DELETE', body:JSON.stringify({skus}) });
+      if (current !== generation.current) return false;
+      refreshSerial.current++;
       setSkuDataList(previous => previous.filter(item => !skus.includes(item.sku)));
       setCatalogError("");
       return true;
-    } catch (error) { setCatalogError((error as Error).message); return false; }
+    } catch (error) { if (current === generation.current) setCatalogError((error as Error).message); return false; }
   }, []);
-  return { skuDataList, addParsedData, updateSku, removeSkus, resetCatalog, refreshCatalog, isLoading, catalogError };
+  return { skuDataList, addParsedData, updateSku, scrapeSku, removeSkus, resetCatalog, refreshCatalog, isLoading, catalogError };
 }

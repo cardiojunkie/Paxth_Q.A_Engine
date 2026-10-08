@@ -1,321 +1,749 @@
 # Paxth Q.A. Engine
 
-An internal ecommerce catalog review application, displayed in the UI as **Project 22**. Import product spreadsheets, collect SAP and product-page evidence, run an OpenAI-compatible language model against category rules, and download Excel files for human review.
+Paxth Q.A. Engine helps catalog editors review ecommerce product spreadsheets against supplied SAP information, product-page evidence, and category-specific rules. The interface calls the application **Project 22**.
 
-The application uses React, TypeScript, Express, PostgreSQL/Drizzle, and provider-side URL retrieval. See [security and durable jobs](docs/security-and-jobs.md) for the current authentication, execution limits, and validation record.
+Upload a spreadsheet, prepare the evidence, create a job, run the review, and export an Excel workbook with findings and suggested corrections. A language model produces the review; a person should verify its findings before changing the product catalog.
 
-## Does pushing to GitHub update the live app?
+**Current readiness:** imported data can no longer impersonate QA results. The repository builds and its fast tests pass, but remaining findings include a known administrator bootstrap password fallback, vulnerable dependencies, and scaling limits. Read the [codebase review](docs/codebase-review.md) for the original ratings, the QA integrity fix, and remaining release work. A successful build alone does not establish production readiness.
 
-**No, not by itself.** Tailscale Funnel routes public HTTPS traffic to a service on your server; it does not pull Git commits or rebuild the application. No automatic deployment workflow is checked into this repository. Any separate automation on the VPS has not been inspected. See the [Tailscale Funnel documentation](https://tailscale.com/docs/features/tailscale-funnel).
+## Contents
 
-The existing VPS deployment at `/opt/paxth-qa` contains copied source, **not a Git checkout**. Push the tested branch, transfer source from its exact commit (excluding secrets, backups, dependencies, and build artifacts), and build a release image before replacing the running app. Preserve the host's `.env`, `compose.yaml`, and gateway files. After retaining the previous image and tagging the tested release as `paxth-qa:local`, run **on the VPS**:
+- [Features and terminology](#features-and-terminology)
+- [How the app works](#how-the-app-works)
+- [Local setup](#local-setup)
+- [Configuration](#configuration)
+- [Your first review](#your-first-review)
+- [Spreadsheet format](#spreadsheet-format)
+- [Mapping rules and shared instructions](#mapping-rules-and-shared-instructions)
+- [Browser retrieval](#browser-retrieval)
+- [Jobs, recovery, and cancellation](#jobs-recovery-and-cancellation)
+- [Understanding results and exports](#understanding-results-and-exports)
+- [Accounts and permissions](#accounts-and-permissions)
+- [Architecture, storage, and source layout](#architecture-storage-and-source-layout)
+- [API reference](#api-reference)
+- [Tests and developer commands](#tests-and-developer-commands)
+- [Production deployment](#production-deployment)
+- [Scaling limits](#scaling-limits)
+- [Troubleshooting](#troubleshooting)
+- [Further documentation](#further-documentation)
 
-```bash
-cd /opt/paxth-qa
-docker compose up -d --no-build --no-deps app
-docker compose logs --tail=50 app
-```
+## Features and terminology
 
-Back up the database and retain the previous source and image before deployment as described in [deployment and updates](#deployment-and-updates). Record the deployed commit on the VPS. A container restart alone does not rebuild changed source. Leave the existing Funnel listener in place. Automatic deployment is not implemented.
+| Screen | Purpose | Access |
+| --- | --- | --- |
+| Dashboard | Import spreadsheets; search/select products; edit evidence; scrape URLs; create jobs; export a summary | Signed-in users; deletions require admin |
+| Scraper | Select a SKU; scrape its saved URL; save and preview evidence; cancel retrieval | Signed-in users |
+| Attribute Sets | Read category rules; create, edit, delete, or import rules | Shared reading; changes require admin |
+| Jobs | Queue reviews; follow progress; cancel eligible runs; inspect history; export detailed findings | Signed-in users; deletion requires admin |
+| LLM Settings | Configure the shared model, limits, temperature, and instructions; test model connectivity | Admin |
+| Users | Create accounts, change roles/passwords, remove accounts | Admin |
 
-## What the application does
+A **SKU** identifies a product. An **attribute set** is a category and its validation rules. **Evidence** means supplied SAP text or product-page content. A **job** groups products; a **run** records one execution of that job. A **QA verdict** describes review findings, separately from execution status.
 
-1. **Dashboard:** import the first sheet of an `.xlsx`, `.xls`, or `.csv` file, inspect/filter SKUs, scrape selected URLs, supply source content, and create jobs.
-2. **Scrapper agent:** retrieve a public URL through ScrapeGraphAI and preview its Markdown; save a personal key and loading controls.
-3. **Attribute Sets:** save category names and Markdown mapping rules in PostgreSQL.
-4. **LLM Settings:** administrators edit the Q&A model, output limits, and shared QA instructions. ScrapeGraph credentials and loading controls are managed per user in Scrapper agent.
-5. **Jobs:** run selected jobs, inspect results, rerun SKUs, and export detailed Excel feedback.
-6. **Users:** administrators manage shared server-authenticated accounts and roles.
+All users in one installation share the catalog, jobs, rules, history, and QA model settings. QA uses the shared server provider; scraping needs no model or provider credential. This is a shared internal workspace without organization/tenant isolation.
 
-SAP text is supplied through uploads or the editor; there is no direct SAP/ERP integration. SAP is the primary factual source. Web evidence supports details absent from SAP, and conflicts must be reported. The model is instructed to avoid invented facts and supply complete replacement cell values when supported. Human review remains necessary: structural validation cannot prove every model conclusion correct.
+There is no direct SAP/ERP integration. SAP text comes from the spreadsheet or editor. The app does not automatically update SAP, a storefront, or the uploaded file.
 
-## Architecture and storage
+## How the app works
 
 ```mermaid
 flowchart LR
-    B[Browser: React UI and progress polling] -->|JSON API| E[Express API and durable worker]
-    B -->|Import and export| X[Spreadsheet files]
-    E --> D[(PostgreSQL via Drizzle)]
-    E --> M[Shared LLM gateway: Q&A]
-    E --> S[ScrapeGraphAI: Markdown retrieval]
+    File[Product spreadsheet] --> Browser[React interface]
+    Browser -->|Same-origin API and session cookie| API[Express API]
+    API --> DB[(PostgreSQL)]
+    Worker[Worker in the Express process] -->|Claims durable runs| DB
+    Worker --> Model[OpenAI-compatible QA provider]
+    Worker --> Scraper[Local Python browser worker]
+    API -->|Interactive retrieval| Scraper
+    Browser -->|Poll progress and results| API
+    Browser --> Export[Excel review workbook]
 ```
 
-Express mounts Vite middleware in development. With `NODE_ENV=production`, it serves `dist/public` and the same API routes. The server entrypoint is `dist/server.mjs`; it is outside the public asset directory.
+The browser parses imports and generates Excel exports. Express handles authentication, validation, persistence, provider requests, and background execution. PostgreSQL holds durable state. One database-owned worker processes one SKU at a time across the installation.
 
-| Data | Where it lives | Consequence |
-| --- | --- | --- |
-| Catalog rows, source text, scraped Markdown, latest QA results | PostgreSQL `sku_data` | Shared by clients using the same database |
-| Job membership, status, token/time totals | PostgreSQL `jobs` | Runs and per-SKU results persist in `job_runs`/`job_run_items`; execution survives tab closure |
-| Category rules and QA agent memory | `attribute_sets`, `qa_agent_settings` | Shared; a configuration snapshot is loaded at each run |
-| Legacy domain selectors | Existing PostgreSQL `site_selectors` data | Retained untouched; no runtime routes or dependencies |
-| Provider URL/API key; model/settings | Server environment; PostgreSQL `provider_settings` | Shared, admin-configured; secrets never reach browsers |
-| Personal ScrapeGraph key and loading controls | PostgreSQL `users` | Used only by the signed-in user and jobs they start; keys are never returned to clients |
-| Accounts and sessions | PostgreSQL `users`/`sessions` | Scrypt password hashes, hashed session tokens, eight-hour HttpOnly cookies, server role enforcement |
-| Notifications; run controls | React memory; server run state | Notifications reset on reload; job controls reconnect by polling |
+The review follows this source hierarchy:
 
-Every protected API checks the server session and permissions. Keep the Caddy authentication gateway and Compose loopback binding as additional barriers. Run `npm run admin:bootstrap` to create the first administrator (defaults: `Aswath` / `potusdown@2230`). Existing accounts are not overwritten. See [security setup and recovery](docs/security-and-jobs.md).
+1. SAP is the primary factual source.
+2. Product-page evidence can support details absent from SAP.
+3. Category rules define requirements, formats, and severity; they do not supply product facts.
+4. Conflicting sources should produce a review finding.
+
+The app checks the model's JSON structure, evidence flags, issue types, severity, and correction requirements. Those checks cannot prove that the model interpreted a source correctly. Confidence is model-reported, not a measured probability.
 
 ## Local setup
 
-Use **Node.js 22**, npm, and an accessible PostgreSQL database. URL retrieval uses the hosted ScrapeGraphAI v2 API; QA uses the configured model provider. Each user supplies a ScrapeGraph v2 key through Scrapper agent.
+### Prerequisites
+
+- **Node.js 22** and npm, matching the Docker image.
+- An accessible PostgreSQL database; use a maintained release for new installations.
+- A direct database connection or **session pooler**. Transaction pooling is unsuitable for the worker's session advisory lock.
+- An OpenAI-compatible provider account for QA.
+- **Python 3.11**, a virtual environment, Xvfb, and Chromium system libraries for local retrieval; see [browser worker setup](docs/browser-scraper.md).
+
+Docker is optional for local development. The supplied application Compose file does **not** provision PostgreSQL.
+
+### 1. Install dependencies and create configuration
+
+From the repository root:
 
 ```bash
 npm ci
-# Create the file only if it does not already exist.
 test -e .env || cp .env.example .env
 ```
 
-Edit `.env` and set `DATABASE_URL` to the intended database. Create that database with your PostgreSQL service first; Compose does not provision PostgreSQL. For Supabase, use the exact TLS-enabled connection URI from the project's Connect dialog. In an IPv4-only environment, use its Session pooler connection details rather than guessing the hostname or region.
+The second command preserves an existing `.env`. Edit it locally; never commit credentials. Git and Docker ignore the real environment file.
 
-Startup creates the application schema and verifies required constraints before serving requests or starting the worker. It stops on migration errors. Existing selector rows are neither inspected nor modified. Before upgrading existing data, back up and test against a restored copy; do not run `db:push` blindly. Configure `LLM_BASE_URL` and `LLM_API_KEY`, set `APP_ORIGIN` to the exact HTTPS origin for production (development derives the Codespaces origin when unset), then create the first administrator with `npm run admin:bootstrap` using the environment variables described in [security setup](docs/security-and-jobs.md). Use a direct PostgreSQL connection or session pooler; the worker requires a session-scoped advisory lock.
+Set `DATABASE_URL` to your intended development database:
 
-Start the application:
-
-```bash
-./start.sh
+```dotenv
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/paxth_qa_engine
 ```
 
-Open [localhost:3000](http://localhost:3000). Codespaces forwards port 3000 and opens its frontend URL automatically when the port is forwarded; the launcher also prints the URL. The frontend, API, and Vite live reload share this port. Development also watches backend imports and restarts Express when server code changes; new API routes do not require a manual restart. The production image runs the Node application as `node`; Chromium is needed only for the development UI test.
+These are development credentials only. The database must already exist: startup creates application tables inside it, not the PostgreSQL database itself. Use a dedicated development database because startup executes schema changes.
 
-| Configuration | Current use |
-| --- | --- |
-| `DATABASE_URL` | PostgreSQL connection; loaded from `.env` or the process environment |
-| `LLM_BASE_URL`, `LLM_API_KEY` | Complete server-only QA provider override; configure both together. With neither set, existing `AICREDITS_API_KEY` uses `https://api.aicredits.in/v1`. ScrapeGraph retrieval uses each user’s separately saved key |
-| `PORT` | Express port, default `3000` |
-| `NODE_ENV=production` | Serve built frontend assets instead of Vite middleware |
-| `DISABLE_HMR=true` | Disable development HMR/file watching through Vite configuration |
-| `CHROMIUM_EXECUTABLE` | Optional installed Chromium path for the development UI test only |
-
-For a production build outside Docker:
+If Docker is installed and port 5432 is available, this optional command creates a database matching that example:
 
 ```bash
-npm run build
-NODE_ENV=production npm start
+docker run --name paxth-qa-dev-db \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=paxth_qa_engine \
+  -p 127.0.0.1:5432:5432 \
+  -v paxth-qa-dev-db:/var/lib/postgresql/data \
+  -d postgres:17
 ```
 
-`npm start` alone does not set production mode. `npm run preview` serves the Vite frontend preview, not the Express API. The Linux launcher `./start.sh` requires Node, npm, and `lsof`; the development container includes Git and `lsof`. Rebuild the container to apply development-tool or forwarding changes. The launcher stops only this checkout's existing listener on port 3000 (or the exported `PORT`), allows ten seconds for graceful shutdown, and refuses to stop another project's process. Run it again after changing `.env` to reload server credentials. `npm run dev` starts the same application without the restart checks.
+For Supabase, copy the exact TLS-enabled URI from the project's Connect dialog. In an IPv4-only environment, use the Session pooler. Preserve its hostname, region, port, username, and connection parameters rather than guessing them.
 
-With the development server running, verify its frontend, database readiness, and live-reload websocket without additional dependencies:
+### 2. Configure QA credentialss
+
+```dotenv
+LLM_BASE_URL=https://your-provider.example/v1
+LLM_API_KEY=your-private-provider-keys
+```
+
+Replace both placeholders with the actual provider details. The server appends `/chat/completions` unless the URL already ends with it. The provider must accept the selected model and chat-completion payload, including JSON output mode.
+
+If neither override is set, the legacy `AICREDITS_API_KEY` variable enables the built-in AI Credits gateway fallback. A partial override does not use that fallback. Scraping is independent of these credentials; websites and Python receive no provider key.
+
+### 3. Create the first administrator
+
+Supply a unique username and a password of **12–256 characters**. The current script has a known default credential fallback; **always override it**.
+
+This Bash example avoids putting the password in shell history:
+
+```bash
+read -r -p 'Administrator username: ' BOOTSTRAP_ADMIN_USERNAME
+read -r -s -p 'Administrator password: ' BOOTSTRAP_ADMIN_PASSWORD
+echo
+export BOOTSTRAP_ADMIN_USERNAME BOOTSTRAP_ADMIN_PASSWORD
+npm run admin:bootstrap
+unset BOOTSTRAP_ADMIN_USERNAME BOOTSTRAP_ADMIN_PASSWORD
+```
+
+Bootstrap creates auth tables if needed and refuses to replace an existing administrator with a usable password hash. Manage existing accounts through Users. The optional `--recover-legacy` flag is restricted to installations whose administrator passwords are all in the retired plaintext format; it is not a general password-reset command.
+
+### 4. Start and verify
+
+```bash
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). In Codespaces, use the forwarded port 3000 URL. Development derives its origin when `APP_ORIGIN` is empty. Frontend, API, and live reload share this port.
+
+Backend imports are watched and restart the server when changed. Restart the process after changing environment credentials.
+
+On Linux, `./start.sh` is an alternative launcher. It stops an existing listener belonging to this checkout, waits for shutdown, and refuses to stop another project's listener. It requires `lsof`, `readlink`, and standard shell tools. Its port check uses exported `PORT`; export a custom port before using it.
+
+With the development server running and HMR enabled:
 
 ```bash
 node scripts/verify-dev-server.mjs
 ```
 
-## Importing and reviewing a catalog
+This checks development HTML, database readiness, Vite, and the live-reload WebSocket. It does not test a paid provider request.
 
-The separate vps-38no installation is documented in [its deployment runbook](docs/vps-38no.md).
+## Configuration
 
-### Input columns
+### Server environment
 
-The first worksheet and its first header row are used. There is no interactive column-mapping step.
+| Variable | Required? | Meaning |
+| --- | --- | --- |
+| `DATABASE_URL` | Yes | PostgreSQL URI; loaded from the process environment or `.env` |
+| `APP_ORIGIN` | In production | Exact public HTTPS origin, e.g. `https://qa.example.com`, without path/query/credentials |
+| `LLM_BASE_URL` | For QA with `LLM_API_KEY` | Shared server-only provider endpoint |
+| `LLM_API_KEY` | For QA with `LLM_BASE_URL` | Shared server-only provider key |
+| `AICREDITS_API_KEY` | Legacy alternative | Used only when both LLM overrides are absent/empty |
+| `PORT` | No | Express port, default `3000` |
+| `HOST` | No | Listening address, default `0.0.0.0`; use loopback where appropriate for native deployment |
+| `NODE_ENV` | Set for production | `production` serves built assets; other values start Vite middleware |
+| `DISABLE_HMR` | No | `true` disables development live reload/file watching |
+| `BOOTSTRAP_ADMIN_USERNAME` | Supply for bootstrap | First-admin name; remove after use |
+| `BOOTSTRAP_ADMIN_PASSWORD` | Supply for bootstrap | First-admin password; remove after use |
+| `TEST_DATABASE_URL` | For DB tests | Explicit disposable PostgreSQL connection; never production |
+| `CHROMIUM_EXECUTABLE` | Optional test override | Installed Chromium path for browser tests; irrelevant to production retrieval |
 
-| Column | Meaning |
+Production cookies are Secure, so a production browser session needs HTTPS. An HTTP request to the container is useful for `/healthz`, but is not a complete login test.
+
+### Shared QA settings
+
+Admins edit these in **LLM Settings**. They persist in PostgreSQL and apply to new runs.
+
+| Setting | Fresh-install default | Accepted range/behavior |
+| --- | --- | --- |
+| QA model | `deepseek/deepseek-v4.1-flash` | Provider identifier; availability depends on the gateway |
+| Temperature | `0.1` | `0`–`1` |
+| Maximum output tokens | `4096` | Integer `1`–`65536`; the model/provider can impose a lower limit |
+| Maximum evidence characters | `40000` | Integer `1`–`200000`; limits web Markdown, not the entire prompt |
+| Shared QA instructions | Built-in catalog review instructions | Global; blank text uses the default |
+
+The exact default model receives `reasoning_effort: "low"`. Existing saved settings can differ. Compatibility concurrency/retry fields do not increase worker concurrency.
+
+**Test API** sends a short prompt to the displayed QA model, including unsaved model edits. It does not save settings, retrieve a page, or validate a complete QA answer. It uses the server key and can incur provider cost.
+
+## Your first review
+
+1. Sign in as an admin. Select a supported model in **LLM Settings**, test connectivity, and save.
+2. In **Attribute Sets**, add or edit the category and save its Markdown rules. Seeded names initially have blank rules.
+3. Prepare a spreadsheet with SKU, category, attributes, and SAP evidence or a product URL.
+4. Upload in **Dashboard**. Check the import notification for duplicates and missing identifiers.
+5. For URLs, install the local browser worker, then use Dashboard's **Scrape URLs** on selected SKUs. Inspect the retrieved evidence; paste manual content when needed.
+6. Select products sharing one nonblank category and click **Create QA Job**. A SKU with SAP, usable saved Markdown, or a URL can join a job; URL-only SKUs scrape before QA.
+7. Open **Jobs** and run it. Closing the screen does not stop an accepted server run.
+8. Inspect the findings and source conflicts. Export through Jobs for detailed correction cells and notes.
+9. Verify the replacements before applying them to the source catalog.
+
+A URL can make an imported SKU appear `ready` before evidence is collected. That label alone does not prove the SKU has enough information for QA.
+
+## Spreadsheet format
+
+### Recognized columns
+
+Only the first worksheet is imported. Its first header row supplies column names. There is no interactive column-mapping step.
+
+| Header | Meaning | Matching |
+| --- | --- | --- |
+| `sku` or `SKU` | Product identifier | These two spellings |
+| `attributes__brand`, `attributes__colour`, etc. | Uploaded values to review | Lowercase `attributes__` prefix; stripped in the parsed attribute object |
+| `source__sap` or `sap` | SAP text | Exact `source__sap`; case-insensitive standalone `sap` |
+| `source__url` or `url` | Product-page URL | Exact `source__url`; case-insensitive standalone `url` |
+| `attribute_set` or `attribute set` | Category for grouping/rules | Case-insensitive header |
+| Other columns, e.g. `name`, `base_code` | Original template values | Preserved and included in QA unless recognized as source/result metadata |
+
+Example CSV:
+
+```csv
+sku,attribute_set,attributes__brand,attributes__colour,source__sap,source__url
+000123,Electronics-TV,Example Brand,Black,"Brand: Example Brand; Colour: Black; Model: TV-55A",
+000124,Electronics-TV,Example Brand,Silver,"Brand: Example Brand; Colour: Black; Model: TV-55B",https://shop.example.com/products/tv-55b
+```
+
+Replace the example URL with a real public product page, or leave it empty for SAP-only QA. For identifiers with leading zeroes, an XLSX worksheet with text-formatted cells is safer than relying on CSV type inference.
+
+### Import behavior and limits
+
+- The file picker accepts `.xlsx`, `.xls`, and `.csv`.
+- Rows without usable SKUs are skipped. The first occurrence of a trimmed SKU within a file is kept.
+- Existing database SKUs are skipped atomically. Uploading duplicates is not an edit operation.
+- The API accepts **1–10,000 rows per import request**. The UI sends the file as one batch without automatic chunking.
+- Express accepts JSON bodies up to **50 MB**. This is a request-body limit, not a spreadsheet file-size guarantee.
+- Browser parsing has no pre-parse file-size cap and can freeze on large files before reaching the API.
+- Keep identifiers and barcodes as text. Numeric cells may already have lost formatting or precision.
+- Original rows and header order are retained for detailed exports.
+
+`qa_result` is reserved for server-generated QA. Any row with its own `raw_row.qa_result` property rejects the **entire request with HTTP 400**, even when the value is `null`, blank, a string, or a plausible review. Nothing from that batch is saved. Remove the reserved column/property and resubmit. The response is:
+
+```text
+raw_row.qa_result is reserved for server-generated QA; remove it before importing.
+```
+
+Top-level QA results, export metadata, token usage, and last-job metadata are also rejected. Imports may use only unprocessed states (`pending`, `ready`, `cannot_qa`). The server validates every row before opening the write transaction.
+
+## Mapping rules and shared instructions
+
+An attribute set stores a category name and Markdown rules. Define exact column names, required/optional values, accepted formats/units, missing-evidence handling, source conflicts, severity, and when a complete correction is supported.
+
+Job grouping currently requires identical category strings, including case and spacing. Rule lookup trims names and ignores case. Keep spreadsheet category names consistent.
+
+Reference documents for [TVs](tv_mapping_rules.md), [USB hubs](usb_hubs_mapping_rules.md), and [adapters, chargers, and cables](power_adapters_chargers_utility_cables_mapping_rules.md) are not automatically imported. Review and paste applicable rules into Attribute Sets.
+
+Example:
+
+```markdown
+# Television review rules
+
+## attributes__brand
+- Required.
+- Compare with SAP; use web evidence when SAP lacks the value.
+- A confirmed different brand is critical.
+- Suggest the complete source-supported replacement.
+
+## attributes__colour
+- Optional when neither source supplies a colour.
+- Do not infer colour from material or a model number.
+- Explain the evidence needed for an unverifiable claim.
+- Leave the correction blank when no source supports it.
+```
+
+Shared QA instructions provide standing guidance. Category rules take precedence for category checks; the application's final output/evidence requirements take precedence over both.
+
+Missing, blank, or ambiguous rules produce a general review with a warning. New runs snapshot configuration; editing rules does not retroactively change a running review or old result.
+
+Legacy **Import browser rules** fills missing/blank shared rules without overwriting nonblank ones. Browser-owned accounts and provider credentials are retired and discarded.
+
+## Browser retrieval
+
+Retrieval uses one local Python worker and Chromium session per URL. **CloakBrowser** loads and reveals page content, **Scrapling** selects captured rendered HTML, and **Markdownify** converts it locally to Markdown. Conversion never fetches the page again. Earlier tab and dialog content survives subsequent interactions; headings, lists, tables, links, Unicode, numbers, and units are preserved. Scraping makes no model calls.
+
+Install Python/system dependencies and run `npm run setup:scraper` before native development or deployment. Docker installs them during its build. See [worker setup and verification](docs/browser-scraper.md).
+
+Use Dashboard's **Scrape URLs**, or select an existing SKU in **Scraper**. Both save evidence against that SKU through `POST /api/catalog/:sku/scrape` with `{expectedRevision}`; the server obtains the URL from the saved row. Success means the database commit completed. Source URL edits are saved before scraping. A newer edit, competing scrape, or deletion rejects a stale save. Bulk progress distinguishes saved, failed, conflicted, and skipped SKUs and supports cancellation.
+
+Saved provenance records browser/manual/legacy evidence, requested/final URLs where known, and capture time. Failed attempts preserve prior evidence and set a separate scrape error. Manual Markdown works without a URL. Browser evidence from an older source URL remains viewable but is excluded from QA. Existing evidence/history and retired database data are preserved; URL-only retrieval, AI navigation, and personal scraper settings are retired.
+
+| Retrieval limit | Value |
 | --- | --- |
-| `sku` or `SKU` | Product identifier; required for the row to be imported |
-| `attributes__<field>` | Upload attributes being checked; the prefix is stripped in `upload_attributes`, while the original row is retained |
-| `source__sap` or a case-insensitive `sap` header | Supplied SAP source text |
-| `source__url` or a case-insensitive `url` header | Product-page URL |
-| Case-insensitive `attribute_set` or `attribute set` | Category name used to group a job and find its mapping rules |
-| Other columns, such as `name`, `base_code`, `note` | Retained in the original row and included in QA unless they are source/QA metadata |
+| Browser admission | One active, eight queued; 60-second queue wait |
+| Execution deadline after admission | 120 seconds |
+| Interaction budget | 20 clicks and 20 scroll steps |
+| Worker output | 4 MiB; Markdown including source URLs at most 200,000 characters |
 
-Keep identifiers such as SKUs and barcodes as text in spreadsheets to avoid numeric conversion. Rows without a usable SKU are skipped. Within a file, the first occurrence of a trimmed SKU is kept. The server atomically skips SKUs already in the catalog; uploading a duplicate is not an edit operation. Category grouping currently requires identical, nonblank names, including case and spacing, even though rule lookup trims names and ignores case.
+A DNS-pinning loopback egress proxy validates every connection, including redirects and subresources, and prevents private-network access and DNS rebinding. Service workers and WebSockets are blocked. Navigation and product/offer parameter changes, forms, purchases, and variant controls are restricted.
 
-### Prepare evidence and create a job
+Unrelated controls are ignored. Unsupported potentially relevant hidden panels or exhausted collection budgets return `INCOMPLETE_CONTENT`; remaining challenges return `PAGE_BLOCKED`. Public-page access still depends on the site and IP reputation. Use SAP/manual evidence when retrieval fails. Paid proxies, CAPTCHA services, and OCR are not included.
 
-1. Configure the server provider URL/key, then sign in as an admin and save the model and instructions in **LLM Settings**. Users can operate QA; admins control shared settings and deletions. Save your personal ScrapeGraph key in **Scrapper agent** for URL evidence.
-2. Add mapping rules in **Attribute Sets**, matching the spreadsheet category. Seeded category names initially have blank rules.
-3. Upload the spreadsheet and select SKUs. A URL makes a row initially `ready`, but job creation still requires SAP text or actual scraped/pasted content.
-4. Use **Scrape Selected** for URL evidence. Failed scrapes can enter the manual-content queue. **Edit SAP** is available when a SKU has no nonblank scraped content; saving it preserves the uploaded row and previous QA result.
-5. Create one job from SKUs sharing one nonblank attribute set. Open **Jobs** and run it.
+## Jobs, recovery, and cancellation
 
-The **Scrapper agent**, Dashboard URL retrieval, and automatic job retrieval share the [ScrapeGraphAI v2 Scrape API](https://docs.scrapegraphai.com/api-reference/endpoint/scrape). It returns normal-mode Markdown with a source line. The standalone screen previews that text, links to the source, and supports cancellation. The server uses native fetch; production requires no local browser, proxy, or Python service.
+A job groups SKUs. Each run stores the actor, configuration, evidence snapshots, attempts, and results.
 
-Each signed-in user saves one personal API key and loading controls in **Scrapper agent**. Defaults are auto rendering, stealth off, a 2,000 ms wait, and three scrolls. Rendering can be auto, fast, or JavaScript; wait accepts 0–30,000 ms and scroll count 0–100. Stealth currently adds five credits per scrape. Save edits before retrieving URLs. **Test key / check credits** checks an entered draft key or the saved key without saving or spending scrape credits. The password input clears after successful saving; failed saves preserve the draft. Saved keys are held on the server and never returned to browsers or included in QA/run snapshots.
+| Mode | Behavior |
+| --- | --- |
+| `unfinished` | Process SKUs without completed QA, including evidence marked for rerun |
+| `all` | Review every SKU again |
+| `single` | Review one specified SKU in the job |
 
-Dashboard requests use the signed-in user's latest saved configuration. Background retrieval reads the initiating user's current key and controls immediately before each scrape. Replacing a key affects subsequent requests; requests already dispatched retain their configuration. An invalid key or exhausted credit balance produces an actionable error without signing the user out. After replacing a key, scrape failed URLs again through Dashboard. Existing SAP fallback and durable scrape checkpoints remain in place; failed paid requests are not automatically retried.
+Run creation is idempotent by request ID. Retrying the same ID and payload returns the same run. One active run is allowed per job; different jobs queue behind the worker.
 
-The application validates public HTTP(S) URLs and checks that DNS resolves only to public addresses. ScrapeGraph manages fetching, redirects, rendering and loading; the old exact-page navigation restrictions and custom accordion/tab interactions are retired. Each scrape has a 120-second deadline, a 60-second upstream fetch timeout, a 4 MiB response limit, and a 200,000-character output ceiling including its source line. Empty, malformed and recognizable challenge results fail rather than becoming evidence. Content is never silently truncated; QA separately applies its saved evidence limit.
+A SKU satisfies the completed-review check only when it has a canonical server-written `qa_result` for its current revision, no error, and catalog status `completed` or `failed`. A genuine `fail` verdict is a finished review; `completed` status by itself is insufficient. An `unfinished` run selects unverified legacy reviews for processing, but creating or viewing history does not automatically start a paid rerun.
 
-Startup adds personal key/settings columns to users without changing existing catalog evidence. Existing users begin with no scraper key. The existing URL-to-Markdown API and scraped_markdown storage remain compatible; legacy scraper-model/selector data remains readable but does not control retrieval. Public retailer pages may still fail; SAP or manually supplied content remains available.
+Run snapshots store evidence, not proof that QA happened. Newly skipped items with a trusted prior review retain it in their dedicated item `result`. That keeps genuine reviews available for partial-run exports and excludes their previous token usage from the new run's usage totals. An older skipped item with QA only in its snapshot stays unverified and cannot make the job fully reviewed.
 
-Jobs execute on one PostgreSQL-owned server worker, one SKU at a time. Closing the tab or switching modules does not stop execution. Reopen Jobs to view progress, cancel your runs, and choose historical results. Cancellation aborts active requests and keeps committed results. After a restart, unfinished items resume within their original deadline and attempt budget; committed results are skipped. A provider call interrupted before its result was saved can be billed again. Editing evidence increments its revision, preventing older runs from overwriting the new catalog evidence.
+### Execution limits
 
-### QA settings and results
+- One SKU executes at a time across the installation.
+- Each SKU has a five-minute budget covering waits, scraping, and retries.
+- QA has at most three total attempts for transient errors; permanent errors fail immediately.
+- Attempt counts are recorded before dispatch and survive restart.
+- A QA request has a 120-second deadline after admission and the durable attempt checkpoint.
+- QA and admin connectivity tests share two active calls and eight waiting slots per process, with a 60-second queue wait cap.
+- Browser retrieval shares one active slot and eight queued requests across Scraper, Dashboard, and background jobs.
 
-The default QA model is `deepseek/deepseek-v4.1-flash`, requested with low reasoning effort. Defaults are 4,096 output tokens, temperature 0.1, and 40,000 evidence characters; saved settings retain their configured limits. QA allows at most three server-owned attempts for transient failures within a five-minute per-SKU deadline; permanent errors fail immediately. Each QA request has a 120-second response deadline beginning after queue admission and its saved attempt checkpoint. Provider admission is shared across QA and admin tests: two active calls, eight waiting, with a 60-second queue wait limit. Response bodies remain subject to deadlines and a 4 MiB limit. ScrapeGraph retrieval uses a separate API and has no local admission queue; provider rate-limit errors are reported to the user.
+### Recovery
 
-Provider failures are saved before retrying. If an interrupted item resumes after consuming all three attempts, its error reports the last recorded provider failure, or explains that a fresh rerun is needed when no cause was saved. Successful completion clears transient errors.
+An accepted run continues when the tab closes. Reopen Jobs to reconnect.
 
-**Test API** checks the displayed Q&A model, including unsaved edits, without saving settings. It sends a short connectivity prompt independent of shared QA instructions, output limits and URL retrieval. Results appear inline and in Notifications; provider errors, empty/refused/truncated responses and timeouts fail visibly. This check uses the server key and incurs provider cost.
+After a restart, committed items are skipped and unfinished items resume within the original budget. Downtime counts against an item already started. A dispatched scrape interrupted by a crash is not automatically repeated; SAP can provide fallback, otherwise start a fresh run.
 
-Each run fetches shared memory and category rules before processing. Unavailable shared configuration prevents the run from starting. Missing, blank, or ambiguous rules produce a general review with a warning; truncated web content also produces a warning. A SKU with no usable SAP or web evidence fails. The same prepared evidence is retained through that SKU's retries.
+If saving a paid QA response fails, the worker retains it in memory and retries the database commit. A process crash before commit can still cause another billable request. Exactly-once provider billing is not guaranteed.
 
-The application validates the returned JSON structure and reconciles issue counts, severity colors, and status. `data_mismatch` requires both source truth and a complete suggested replacement. These checks validate the response contract, not the truth of the source claim.
+Evidence edits increment the catalog revision. An older run retains its historical result but cannot overwrite newer catalog evidence. Human edits also require the expected revision; conflicts retain the unsaved draft and require refresh. Successful job scraping is committed before QA, so a later QA failure or cancellation preserves it.
 
-| QA finding | Color | Result behavior |
+### Cancellation and deletion
+
+Creators can cancel their own runs; admins can cancel any run. Active requests are aborted and committed results are preserved. A queued run may remain `cancelling` until the worker reaches it.
+
+Cancel affected runs and wait for them to stop before deleting jobs/SKUs. Job deletion cascades to its run history. Clear All Data removes jobs and catalog rows, not accounts, rules, or provider settings.
+
+## Understanding results and exports
+
+### Execution status versus verdict
+
+| Concept | Values | Meaning |
 | --- | --- | --- |
-| Critical | Red | QA fails |
-| Moderate | Orange | At least a warning |
-| Minor | Yellow | At least a warning |
-| Missing category rules or truncated evidence | Orange | Cannot pass without a warning |
+| Catalog state | `pending`, `ready`, `cannot_qa`, `running`, `completed`, `failed` | Catalog/workflow state |
+| Run state | `queued`, `running`, `cancelling`, `completed`, `failed`, `cancelled` | Execution lifecycle |
+| QA verdict | `pass`, `warning`, `fail` | Whether reviewed values meet the checks |
 
-Catalog processing status (`ready`, `running`, `completed`, `failed`, etc.) differs from the review verdict (`pass`, `warning`, `fail`). A job can finish processing successfully while individual SKUs have a failing QA verdict. Jobs reference the catalog's current results; they are not immutable historical result snapshots.
+A completed run can contain failing QA verdicts: execution succeeded and found critical defects. That SKU's catalog state becomes `failed`, while the run item can be `completed` because a valid review was returned. Use run-item state for progress; the catalog need not show `running` while work executes.
 
-### Exporting
+| Severity | Color | Effect |
+| --- | --- | --- |
+| Critical | Red | Failing verdict |
+| Moderate | Orange | At least warning |
+| Minor | Yellow | At least warning |
 
-Use **Jobs** exports for detailed review. Single-job, selected completed-job, and issues-only exports preserve original columns and add `Corrected: <original header>` beside affected `attributes__` columns. Cells have severity highlighting and notes with explanations, source truth, and suggestions. Conflicting or absent suggestions leave correction cells blank for review. General/unmatched findings are attached to `qa_status`; `qa_scrape_status` and `job_error` are appended.
+Missing rules, truncated web evidence, and reported source conflicts prevent an unqualified pass. Issue types are `data_mismatch`, `missing_data`, `formatting`, `spelling_grammar`, and `unsupported_claim`.
 
-Combined jobs must use one attribute set and compatible original header order. Issues-only export includes warning/fail verdicts. Legacy uploads without stored header order can be exported with a warning. The Dashboard's Excel download is a separate summary; its missing/mapping counts currently use outdated issue types. A JSON-download function remains in source but has no UI control. Existing results can be exported without a new LLM call.
+A `data_mismatch` requires source truth and a complete replacement value. Unverifiable claims should explain missing evidence and leave replacement blank. JSON validation does not establish factual correctness.
 
-### Writing mapping rules
+### Detailed Jobs exports
 
-Paste category-specific Markdown into **Attribute Sets** and save. The root-level [TV](tv_mapping_rules.md), [USB hub](usb_hubs_mapping_rules.md), and [charger/cable](power_adapters_chargers_utility_cables_mapping_rules.md) documents are reference material; they are not automatically imported.
+Prefer Jobs exports for review. They preserve original column order, add `Corrected: <original header>` beside affected `attributes__` fields, highlight severity, and attach notes containing explanation/source truth/suggestion. Corrections remain blank when unavailable or conflicting. General/unmatched findings attach to `qa_status`. The workbook appends `qa_status`, `qa_scrape_status`, and `job_error`.
 
-Use this prompt when drafting rules, then review the result before saving:
+Single-job exports use a selected historical run when viewing one, otherwise the latest run. Legacy jobs without history use current catalog data. Combined exports include completed jobs, require one identical nonblank category and compatible headers, and deduplicate repeated SKUs. **Issues Only** includes warning/fail verdicts.
+
+Genuine historical results survive later evidence edits and reruns. Catalog `qa_stale` hides reviews and usage for older revisions from Dashboard and current exports; Jobs can still export a selected historical run. Legacy rows without recorded header order export with a warning. Exports reuse saved results without a model request.
+
+### Legacy reviews that need a rerun
+
+The dedicated catalog `qa_result` column and durable run-item `result` are the authorities for review output. A review found only in an original raw row or an old run snapshot is not verified. The app hides its verdict, findings, corrections, and issue notes and shows:
 
 ```text
-Write Markdown QA mapping rules for [CATEGORY] and these exact uploaded
-column names: [ATTRIBUTES]. For each attribute, state required/optional
-status, accepted formats and units, missing-data handling, and severity.
-Use supplied SAP as primary evidence and product-page content as secondary
-evidence. Report source conflicts. Do not invent product facts or infer
-shipping weight from product weight, or colour from material. Preserve
-identifiers and the cell's language. Request complete replacement cell
-values only where evidence or a formatting rule supports the correction;
-otherwise explain what must be verified and leave the correction blank.
+Legacy review is unverified; rerun QA.
 ```
 
-**QA Agent Memory** supplies shared standing instructions. Category rules take precedence for category-specific checks; the application's output/evidence requirements take precedence over both. Blank saved memory uses the default. Changes affect new runs/reruns, not an already running configuration snapshot or existing results. “Import browser rules” imports only missing/blank shared rules without overwriting nonblank ones. Legacy browser account/session/provider-key caches are discarded; reconfigure the server explicitly.
+Original product fields and stored legacy data are preserved. For an unverified catalog row previously marked `completed`, the app shows `ready` when SAP, saved Markdown, or a URL exists; otherwise it shows `cannot_qa`. Existing meaningful errors take precedence. Exports can retain original fields and the error explanation, but unverified reviews supply no QA corrections and are excluded from **Issues Only**.
 
-## API and developer checks
+Run QA explicitly after checking the evidence. No migration promotes old metadata into trusted results, and no automatic paid reruns are triggered. New worker results are saved in canonical result storage without being copied into the original raw row.
 
-Routes are registered in [server.ts](server.ts) and its server modules. APIs require an eight-hour server session; mutations additionally require the configured same origin. Admin-only operations include users, configuration, chat testing, and deletions. `GET /healthz` exposes only readiness without authentication.
+Dashboard's **Export Results** is a separate summary. Its missing/mapping counts use obsolete issue types and can undercount. Use Jobs findings for decisions. Other export helpers remain in Dashboard source without visible controls.
 
-| Routes | Methods | Purpose |
+## Accounts and permissions
+
+| Capability | User | Admin |
 | --- | --- | --- |
-| `/api/db-status` | GET | Authenticated database schema readiness |
-| `/api/catalog`, `/api/catalog/:sku` | GET/POST/DELETE collection; PUT item | Load/import/delete catalog data; edit one SKU |
-| `/api/jobs`, `/api/jobs/:id` | GET/POST/DELETE collection; PUT/DELETE item | Persist job definitions; runs use `/api/jobs/:id/runs` |
-| `/api/qa-configuration` | GET | Shared memory and attribute sets in one snapshot |
-| `/api/qa-agent-memory` | PUT | Save shared memory |
-| `/api/attribute-sets`, `/api/attribute-sets/:id`, `/api/attribute-sets/import` | POST collection/import; PUT/DELETE item | Maintain shared category rules |
-| `/api/scraper-settings` | GET/PUT | Personal loading controls and configured status; optional write-only `apiKey`, with `null` to remove it |
-| `/api/scraper-settings/test` | POST | Optional draft `{apiKey}` or `{}` for the saved key; returns `{remaining, used, plan}` |
-| `/api/scrape` | POST | `{ url }` → `{ markdown }`; failures use `{ error, code }` |
-| `/api/chat` | POST | Admin test; accepts optional `modelName` and `purpose: "qa" \| "scrapper"` (defaults to QA) |
+| Read shared catalog, jobs, rules, history | Yes | Yes |
+| Import rows and edit evidence | Yes | Yes |
+| Create/edit jobs and start runs | Yes | Yes |
+| Retrieve/preview URLs | Yes | Yes |
+| Cancel runs | Own | Any |
+| Delete catalog data/jobs | No | Yes |
+| Change shared rules/instructions/model | No | Yes |
+| Test shared QA provider | No | Yes |
+| Manage accounts | No | Yes |
 
-Run `npm test` for the complete fast suite, including provider limits. Run `TEST_DATABASE_URL=... npm run test:security-db` against a disposable PostgreSQL instance for auth, transactions, recovery, cancellation, and failure injection. Other focused checks:
+Passwords use salted scrypt. Random session tokens are stored as hashes in PostgreSQL and sent in eight-hour HttpOnly cookies. Production adds Secure and SameSite=Strict. Mutations require the configured same origin; permissions are enforced server-side.
 
-```bash
-npm run lint
-npm run test:job-state
-npm run test:llm-response
-npm run test:qa-agent
-npm run test:scrape-agent
+Account changes revoke that account's sessions. The last administrator with a usable scrypt password cannot be deleted/demoted. Password reset is administrator-managed; no self-service recovery is implemented.
+
+Login throttling is process-local: 10 attempts per socket-address/username key and 100 total attempts per process per 15 minutes, including successes. Behind a proxy the socket address is usually the proxy. This is a known availability/scaling issue, not a recommended public deployment policy.
+
+## Architecture, storage, and source layout
+
+### Storage
+
+| Table/data | Purpose |
+| --- | --- |
+| `sku_data` | Upload, original row, evidence/provenance/error, revision, QA revision and latest result |
+| `jobs` | Definitions, JSON SKU membership, aggregate totals |
+| `job_runs` | Execution history, actor, idempotency key, configuration snapshot |
+| `job_run_items` | Per-SKU snapshot, attempts, scrape checkpoint, historical result |
+| `attribute_sets` | Category names and Markdown rules |
+| `qa_agent_settings` | Shared instructions |
+| `provider_settings` | Editable QA settings, excluding credentials |
+| `users` | Accounts, password hashes, retired scraper credential/control columns |
+| `sessions` | Hashed tokens and expiry |
+| Legacy `site_selectors` | Compatibility data; no active selector runtime |
+| Browser memory/local storage | Temporary notifications/UI state, last filename, legacy importable rules |
+
+Startup initializes schema through server SQL and Drizzle configuration setup, then verifies required tables/indexes/columns/constraints before listening. Schema errors stop startup. The Drizzle schema also describes tables for tooling; maintain both representations consistently.
+
+There is no checked-in versioned migration history. `db:generate`/`db:push` are developer tools, not the deployed startup mechanism. Do not blindly apply `db:push` to shared production data. Rehearse initialization against a restored backup.
+
+### Source layout
+
+```text
+server.ts                     Startup, middleware, routes, shutdown
+src/
+  App.tsx, main.tsx           Browser entrypoint and navigation
+  components/                Dashboard, Jobs, rules, settings, accounts, UI checks
+  context/AppContext.tsx     Session, catalog, jobs, notifications
+  hooks/                     Data-loading and mutation hooks
+  server/
+    auth.ts                  Accounts, sessions, origin checks, permissions
+    catalog.ts               Catalog and job-definition routes
+    database.ts              Schema setup and shared write transactions
+    provider.ts              QA dispatch, settings and connectivity routes
+    jobRunner.ts             Durable runs and worker
+  db/                        Pool, Drizzle schema, shared configuration
+  lib/                       QA prompts/results, scraping, requests, exports
+scripts/                     Bootstrap and development/public-access checks
+docs/                        Review and operational/historical runbooks
+Dockerfile                   Development, build, production stages
+compose.yaml                 One app container; external PostgreSQL
 ```
 
-`lint` is TypeScript checking, not ESLint. Additional checks have prerequisites:
+Build output is `dist/public` for frontend assets, `dist/server.mjs` for Express, and `dist/bootstrap-admin.mjs` for administrator setup. The server bundle is outside the public directory. Frontend/API use one origin.
+
+## API reference
+
+Except `/healthz` and login, these routes require an application session. Login also requires a valid mutation origin. Protected APIs use `Cache-Control: no-store`. Production mutations need `Origin` matching `APP_ORIGIN`; command-line clients must supply it and the cookie.
+
+| Route | Methods | Purpose/input |
+| --- | --- | --- |
+| `/healthz` | GET | Public schema readiness: `{ "status": "ready" }` or 503 |
+| `/api/auth/login` | POST | `{ username, password }`; sets cookie |
+| `/api/auth/me` | GET | Current account |
+| `/api/auth/logout` | POST | Revoke current session |
+| `/api/users` | GET, POST | Admin list/create; username/password/role |
+| `/api/users/:id` | PUT, DELETE | Admin account changes/removal |
+| `/api/db-status` | GET | Authenticated schema readiness |
+| `/api/catalog` | GET, POST, DELETE | Full list; import array; delete `{ skus }` or `{ all: true }` |
+| `/api/catalog/:sku` | PUT | Edit evidence with `expectedRevision`; QA fields are server-controlled |
+| `/api/data` | DELETE | Admin clear jobs/catalog |
+| `/api/jobs` | GET, POST, DELETE | Full list; create one/array; delete `{ ids }` or `{ all: true }` |
+| `/api/jobs/:id` | PUT, DELETE | Edit name/SKUs/category while idle; admin deletion |
+| `/api/jobs/:id/runs` | GET, POST | History; queue `{ requestId, mode, sku? }` |
+| `/api/job-runs/:id` | GET | Metadata and all item snapshots/results |
+| `/api/job-runs/:id/cancel` | POST | Creator/admin cancellation |
+| `/api/qa-configuration` | GET | Consistent snapshot of memory/rules |
+| `/api/qa-agent-memory` | PUT | Admin `{ qaAgentMemory }` |
+| `/api/attribute-sets` | POST | Admin `{ name, rulesMarkdown }` |
+| `/api/attribute-sets/:id` | PUT, DELETE | Admin rule changes/removal |
+| `/api/attribute-sets/import` | POST | Admin rule array; preserve nonblank existing rules |
+| `/api/provider-settings` | GET, PUT | Shared editable settings; admin write |
+| `/api/chat` | POST | Admin test; optional `modelName`, `purpose` |
+| `/api/catalog/:sku/scrape` | POST | `{ expectedRevision }` → saved SKU row; server uses saved URL |
+
+`/api/chat` tests QA connectivity with optional `modelName` and `purpose: "qa"`. Navigation purposes, `/api/scrape`, and personal scraper-settings routes are retired.
+
+Example run body:
+
+```json
+{
+  "requestId": "a3d41183-83d6-45f0-a1ef-1fd5a57f7ac9",
+  "mode": "single",
+  "sku": "000123"
+}
+```
+
+Generate a fresh request ID for new work; retain it when retrying an uncertain start. Omit `sku` for `unfinished`/`all`.
+
+Common responses: `400` invalid input, `401` expired/missing session, `403` origin/role rejection, `409` conflict, `413` size limit, `429` admission/rate limit, `5xx` database/provider unavailable. Upstream bad keys are mapped away from application `401` so they do not sign users out.
+
+## Tests and developer commands
+
+### Fast suite and build
 
 ```bash
-# Development UI test only: install standard Chromium and its OS libraries.
-npm run setup:browser
-# On Linux, install missing OS libraries with: npx playwright-core install-deps chromium
-npm run test:sap-editor
+npm test
+npm run build
+```
 
-# Set TEST_DATABASE_URL to a disposable test database before running.
+The fast suite covers TypeScript, auth origins, provider limits/retries, catalog import/result trust, job state/exports, transaction recovery, response parsing, settings/QA contracts, and scraping contracts. Provider responses are mocked; no API credits are spent.
+
+`lint` is **`tsc --noEmit`**, not ESLint. Strict TypeScript is not enabled. `npm test` excludes database and browser suites. Run `npm run test:scrape-worker`, `npm run test:scrape-browser`, and the [production smoke check](docs/browser-scraper.md#verify-before-rollout) separately.
+
+### Database checks
+
+Create a dedicated test database first and use a connection that can create/drop schemas. Tests isolate their own schema and remove it, but must not point to production:
+
+```bash
+export TEST_DATABASE_URL='postgresql://postgres:postgres@localhost:5432/paxth_qa_test'
+npm run test:security-db
 npm run test:qa-config-db
+unset TEST_DATABASE_URL
 ```
 
-Retrieval checks mock ScrapeGraph and cover public URL/DNS checks, Markdown parsing, empty/challenge results, invalid keys, exhausted credits, rate limits, deadlines, response/output limits and cancellation. UI checks cover personal key/control saving, retained drafts, credit tests, reloads, secret exclusion, Markdown preview, cancellation, Dashboard saving and QA settings persistence. Database checks cover key ownership, replacement, removal, migrations and job actors. These checks incur no ScrapeGraph charges; use Retrieve URL for a live scrape with your saved key.
+The security suite covers auth, transactions, retired-column preservation, durable jobs, recovery, cancellation, failure injection, legacy QA reruns, and historical result trust. The configuration suite covers shared rules/instructions and conflicts.
 
-The database test creates and drops an isolated schema. Never point it at the shared production database. The SAP editor browser test mocks API traffic; it does not prove real database persistence. Check the [implementation validation record](docs/security-and-jobs.md#implementation-validation) for what was actually run.
-
-## Deployment and updates
-
-### Existing VPS topology
-
-The VPS, container, and Funnel routes were inspected on 2026-09-17:
-
-```text
-https://project22.tail608e42.ts.net/
-    → dedicated tailscaled-project22.service (HTTPS :443)
-    → Caddy 127.0.0.1:8082 (HTTP Basic authentication)
-    → Docker-published 127.0.0.1:3200
-    → Express container :3000
-```
-
-The deployment directory is `/opt/paxth-qa`. Its gateway requires separately supplied credentials; a Tailscale client is not required. The separate Rakazo application uses `https://rakazo.tail608e42.ts.net/`, its own containers, and the default Tailscale service. Do not change those resources. A legacy Rakazo-hostname listener on port 8443 also points to the QA gateway; leave that existing route unchanged.
-
-[compose.yaml](compose.yaml) defines the separate `paxth-qa` project, image `paxth-qa:local`, restart policy, loopback port binding, 1 CPU, 1,536 MiB memory, 256 MiB shared memory, and rotating container logs. The image runs the Node production build as `node` without a retrieval browser. Secrets and backups are excluded from the image build.
-
-Keep `/opt/paxth-qa/.env` readable only by its owner (`chmod 600 .env`). Its `DATABASE_URL` must reach PostgreSQL from inside the container: container `localhost` is not the VPS host. Caddy should authenticate every page, asset, and API request, strip inbound `Authorization` before proxying, store only the password hash, and accept the Funnel hostname. This repository does not contain its Caddyfile.
-
-Inspect Project 22's existing listener using its dedicated socket:
+### Browser checks
 
 ```bash
-tailscale --socket=/run/tailscale-project22/tailscaled.sock funnel status
+npm run setup:browser
+# Linux may also need Chromium system libraries:
+npx playwright-core install-deps chromium
+npm run test:sap-editor
 ```
 
-Do not rerun gateway setup for an ordinary code update. Before deploying, wait for active jobs to finish or cancel them, confirm the tested source commit, retain the previous source and image, and make a database backup using the database provider or PostgreSQL tools. Store it outside the source directory and verify it can be restored. Startup executes DDL, so a successful code build is not a database migration check. Build and smoke-test the release image before changing the running container.
+The historically named browser script also checks QA settings, SKU-connected Markdown, cancellation, run-start feedback, and unverified history display/export exclusion. APIs are mocked; it does not establish real persistence or provider behavior. OS dependency installation may require administrator privileges.
 
-For an existing deployment, retain the current image before the update commands near the top of this document:
+### Command reference
+
+| Command | Purpose |
+| --- | --- |
+| `npm run dev` | Watch Express and serve development frontend |
+| `./start.sh` | Linux launcher with checkout-aware listener restart |
+| `npm run build` | Frontend plus server/bootstrap bundles |
+| `NODE_ENV=production npm start` | Built production server |
+| `npm run preview` | Frontend-only Vite preview; no Express API |
+| `npm run clean` | Remove local `dist` |
+| `npm run lint` | TypeScript under current compiler options |
+| `npm test` | Fast suite |
+| `npm run test:auth` | Origin/auth boundaries |
+| `npm run test:provider` | Provider admission/retries |
+| `npm run test:catalog` | Import trust boundary and canonical result/history projections |
+| `npm run test:job-state` | Job state and Excel feedback |
+| `npm run test:job-runner` | Transaction retries/rollback |
+| `npm run test:llm-response` | Parsing/output budgets |
+| `npm run test:qa-agent` | Settings and QA contracts |
+| `npm run test:scraper` | Worker protocol, queue, DNS proxy, cancellation and SKU request contracts |
+| `npm run test:scrape-worker` | Python selection, Markdown and deterministic interactions |
+| `npm run test:scrape-browser` | Real CloakBrowser/Scrapling/Markdownify fixtures |
+| `npm run test:scrape-production` | Production SKU persistence/revisions, URL-only QA, legacy migration, login and memory smoke |
+| `npm run test:security-db` | Disposable-database auth/jobs |
+| `npm run test:qa-config-db` | Disposable-database configuration |
+| `npm run test:sap-editor` | Mocked browser checks |
+| `npm run admin:bootstrap` | First admin/restricted legacy recovery |
+| `npm run db:generate` | Generate Drizzle migrations for review |
+| `npm run db:push` | Direct schema application; avoid blind production use |
+| `npm run db:studio` | Local DB inspection UI |
+
+### Validation on 6 October 2026
+
+The QA integrity follow-up passed `npm test`, `npm run build`, `test:security-db`, `test:qa-config-db`, and `test:sap-editor` on Node 22.23.3. The frontend JS bundle was approximately **1.78 MB minified / 533 KB gzip**, with Vite's existing large-chunk warning.
+
+The database suites used an isolated local PostgreSQL 15 instance and disposable schemas. Browser checks used mocked APIs, cached Chromium, and temporary Linux libraries/font configuration. These supplied the environment missing during the initial review. No production database or paid provider was used. Docker execution, the target host, and live provider behavior remain unverified. See the review for the original audit counts and strict-mode diagnostics.
+
+## Production deployment
+
+### Release decision
+
+Build artifacts and container configuration exist, but a successful build is not production approval. The QA import/result trust issue is fixed in this source. Resolve the review's remaining credential and dependency findings, then verify the intended database, HTTPS gateway, and provider contracts before unrestricted access.
+
+There is no checked-in automatic deployment workflow. Pushing to GitHub does not itself pull source, build an image, restart a service, or update Tailscale routing.
+
+### Without Docker
+
+```bash
+npm ci
+npm run setup:scraper
+npm test
+npm run build
+NODE_ENV=production npm start
+```
+
+Configure the database, production origin, and provider credentials first. `npm start` alone does not set production mode. Use a dedicated OS user, process supervisor, and HTTPS gateway. Native service units and proxy configuration are not included.
+
+The compiled bootstrap command is `node dist/bootstrap-admin.mjs`; supply temporary explicit credentials as in local setup.
+
+### Docker Compose
+
+The supplied configuration uses one app container, a non-root Node process, init, restart policy, rotating logs, readiness checks, one CPU, and 1,536 MiB memory. Host port `127.0.0.1:3200` maps to container `3000`.
+
+Set the real HTTPS `APP_ORIGIN`. PostgreSQL must be reachable **inside the container**; container `localhost` is not the host database.
+
+After resolving release blockers and rehearsing schema changes:
+
+```bash
+docker compose build app
+```
+
+For a new installation, bootstrap with temporary exported credentials:
+
+```bash
+read -r -p 'Administrator username: ' BOOTSTRAP_ADMIN_USERNAME
+read -r -s -p 'Administrator password: ' BOOTSTRAP_ADMIN_PASSWORD
+echo
+export BOOTSTRAP_ADMIN_USERNAME BOOTSTRAP_ADMIN_PASSWORD
+docker compose run --rm --no-deps \
+  -e BOOTSTRAP_ADMIN_USERNAME -e BOOTSTRAP_ADMIN_PASSWORD \
+  app node dist/bootstrap-admin.mjs
+unset BOOTSTRAP_ADMIN_USERNAME BOOTSTRAP_ADMIN_PASSWORD
+```
+
+Start and inspect:
+
+```bash
+docker compose up -d --no-build app
+docker compose ps
+docker compose logs --tail=50 app
+curl -fsS http://127.0.0.1:3200/healthz
+```
+
+Route the public HTTPS gateway to the private listener. A separate Basic authentication gate can be an additional barrier; its configuration is host-specific and absent here. Docker health failures mark the container unhealthy; the restart policy does not automatically restart a still-running unhealthy container.
+
+Several build tools are currently classified as production dependencies. Production retrieval uses the Python worker and its pinned CloakBrowser Chromium binary; the npm Playwright installation is used for UI tests.
+
+### Existing installations
+
+Two historical setups are documented; neither was remotely inspected in this review:
+
+| Record | Pattern | Guidance |
+| --- | --- | --- |
+| Original Project 22 host | Docker in `/opt/paxth-qa`, private listener, Caddy gate, dedicated Tailscale Funnel | Verify actual host/gateway configuration; historical notes are in security/jobs documentation |
+| `vps-38no` | Native systemd, versioned release and `current` symlink, Caddy/Tailscale | Use the [VPS runbook](docs/vps-38no.md) |
+
+Use the runbook matching the actual host. Do not apply Docker commands to a native service or reset shared gateway/Tailscale settings. Python/browser requirements for this source version are documented in the browser worker setup.
+
+### Updates and rollback
+
+1. Choose the exact tested commit and retain the prior image/release.
+2. Finish or cancel active jobs and verify they stopped.
+3. Back up data outside the source tree; restore into a separate database to verify the backup.
+4. Rehearse startup schema changes against that restored copy. Builds do not exercise initialization.
+5. Build a new release without replacing production `.env` or gateway configuration.
+6. Smoke-test it with an appropriate test database before promotion.
+7. Promote; verify readiness, HTTPS login, permissions, catalog/rules, evidence edits, a representative QA run, export, and restart recovery.
+8. Record the deployed commit and retain a compatible rollback release.
+
+For the QA integrity fix, reload browser clients after promotion so they use the new result readers. Before restoring normal access, confirm that a forged nested-QA import is rejected without partial saves, a normal import succeeds, an `unfinished` run selects an unverified legacy row, and a genuine saved review exports correctly. Keep the database backup and previous release. Legacy reruns require an explicit operator action; the release does not schedule them automatically.
+
+With the supplied Docker naming, retain the old image **before** rebuilding:
 
 ```bash
 docker image tag paxth-qa:local paxth-qa:previous
 ```
 
-After rebuilding, verify:
+After testing the replacement:
 
 ```bash
-docker compose ps
-docker compose logs --tail=50 app
-curl -fsS http://127.0.0.1:3200/healthz
-tailscale --socket=/run/tailscale-project22/tailscaled.sock funnel status
+docker compose up -d --no-build --no-deps --force-recreate app
 ```
 
-Also load the catalog and shared configuration, since application behavior must also be checked. From outside the tailnet, check that missing/wrong gateway credentials return `401` for the page, an asset, and an API route. With valid gateway and application credentials, run `scripts/verify-public-access.mjs` against the Project 22 URL and verify login, SAP editing, a sample scrape, and persistence after a controlled app restart. Confirm Rakazo's container IDs and start times are unchanged and ports 3200/8082 remain loopback-only.
-
-### Rollback and private access
-
-If the newly built image fails and the old image is compatible with the current schema, restore the retained image:
+If the previous image remains compatible with the current schema:
 
 ```bash
-cd /opt/paxth-qa
 docker image tag paxth-qa:previous paxth-qa:local
-docker compose up -d --no-build --force-recreate app
-docker compose logs --tail=50 app
+docker compose up -d --no-build --no-deps --force-recreate app
 ```
 
-This rolls back the image only. Do not run `--build` until the checkout is back on the intended release. Changes to Compose, environment configuration, or the database require their own reviewed rollback; never restore a shared database automatically over newer data.
+This rolls back the image, not schema/configuration/data. Do not automatically restore an old database over newer data. Native rollback restores the prior symlink/service release as described in its runbook.
 
-To switch this listener to private, tailnet-only access, configure its port with Serve. The most recent Serve/Funnel command determines that port's exposure, as described in the [Tailscale documentation](https://tailscale.com/docs/features/tailscale-funnel):
+For the Basic-auth gateway topology expected by the public verification script, temporarily supply `QA_USERNAME`, `QA_PASSWORD`, `APP_USERNAME`, and `APP_PASSWORD`, then run:
 
 ```bash
-tailscale --socket=/run/tailscale-project22/tailscaled.sock serve --bg --https=443 http://127.0.0.1:8082
+node scripts/verify-public-access.mjs https://your-real-qa-hostname/
 ```
 
-To remove this deployment, disable only its listener using the original flags, then stop only its Compose project. The target URL can be omitted when turning a listener off; see the [Funnel CLI reference](https://tailscale.com/docs/reference/tailscale-cli/funnel):
+It checks wrong/missing gateway credentials, application-session requirements, and protected catalog access. It assumes that gateway and is not a generic production probe.
 
-```bash
-tailscale --socket=/run/tailscale-project22/tailscaled.sock funnel --bg --https=443 off
-cd /opt/paxth-qa
-docker compose down
-```
+## Scaling limits
 
-The earlier deployment notes name `/opt/paxth-qa/backups/Caddyfile.before` as a gateway backup. Before restoring it, compare it with the current shared Caddy configuration and validate it with `caddy validate --config /opt/paxth-qa/backups/Caddyfile.before --adapter caddyfile`. Restore/reload only after confirming it preserves other services. Avoid `tailscale serve reset`, which would remove unrelated settings. Stopping this Compose project does not delete the external PostgreSQL database.
+The design fits a modest shared internal tool. There is no measured capacity guarantee. Growth first increases latency, queue wait, bandwidth, and memory; adding replicas does not remove every limit.
 
-## Troubleshooting and current limits
+| Growth | Limit | Consequence |
+| --- | --- | --- |
+| More catalog/evidence | Full catalog responses and browser rendering | Larger payloads and memory pressure |
+| More jobs/viewers | Each Jobs screen polls all histories plus catalog/jobs every two seconds | Traffic grows with viewers × jobs |
+| More QA work | One globally locked worker, one SKU at a time | Queue backlog and delays behind large jobs |
+| Large imports/run starts | Sequential inserts under a shared mutation lock | Unrelated writes wait; database latency compounds |
+| More replicas | Shared worker lock, process-local admission | Still one worker; limits/connections multiply elsewhere |
+| More history | Repeated snapshots/results/rules, no retention | Growing storage and progress payloads |
+| More sign-ins | Global cap counts successes | Valid sign-ins receive 429 |
+| More scraping | One active browser, eight waiting requests | Queue overflow and the VPS resource limit |
 
-| Symptom | Check |
+Illustration: at an average 30 seconds per SKU, the serial worker needs about **8.3 hours for 1,000 SKUs**, before other jobs. This is arithmetic, not a benchmark. Measure average/p95 service times and arrival rate before committing to capacity.
+
+Start with paginated summary APIs, relevant progress polling, bulk/bounded writes, run indexes, and history retention. Use shared admission when adding replicas. Add bounded worker concurrency only after preserving ownership, revision protection, cancellation, and provider budgets. These changes do not require a microservices rewrite.
+
+## Troubleshooting
+
+| Symptom | Check/next step |
 | --- | --- |
-| GitHub has new code but the public URL looks unchanged | Update/rebuild on the VPS; restarting the old container is insufficient. Refresh the browser after deployment. |
-| Startup fails or readiness is unavailable | Inspect migration errors; resolve conflicting data on a restored copy before production. |
-| Settings/rules will not save | Sign in as an administrator and check PostgreSQL availability. Model settings and memory save atomically. |
-| Scrape fails or shows a challenge | Check your saved key, credits and loading controls in Scrapper agent; inspect the specific key/credit/blocked/empty/timeout error. Test API checks QA connectivity only. Use SAP or manually supplied content when needed. |
-| Job remains queued | Check server worker logs, provider configuration, and database availability. Reloading the browser does not interrupt execution. |
-| An upload fails | Read the visible error. No rows from a failed batch are committed; retry after correcting the problem. |
-| A save/delete looks successful but returns after reload | Check the visible error and database availability, then reload to verify persistence. |
-| Combined export is rejected | Use one identical category name and compatible original header order across all included SKUs. |
-| Login fails after upgrade | Browser-local accounts are retired. Bootstrap a server administrator and recreate accounts. |
+| Startup exits | Database reachability/schema conflicts; production `APP_ORIGIN` |
+| Production login does not persist | HTTPS and exact origin; Secure cookies do not work through plain HTTP browser access |
+| Mutation returns 403 | Origin, role, proxy behavior |
+| Correct login returns 429 | Global attempt cap or two active password hashes |
+| Provider missing | Both LLM overrides, or neither plus legacy key; restart after env changes |
+| Model fails while readiness passes | Model availability, credentials, quota, supported payload |
+| Scrape fails | Worker setup, saved SKU URL, challenge, timeout; inspect scrape error or use SAP/manual evidence |
+| SKU cannot create a job | Supply SAP, usable saved Markdown, or a URL, and use one nonblank category |
+| Job waits in queue | Worker, older jobs, session-pooler mode, database/provider latency |
+| Queued cancellation waits | Worker must reach it after older work |
+| Run fails after restart | Original deadline/attempt budget may be exhausted; inspect history |
+| QA needs rerun after evidence edit | Current reviews are revision-bound; old results remain in job history |
+| Duplicate upload changes nothing | Imports skip existing SKUs; use supported edits |
+| Combined export rejected | One identical category and compatible original headers |
+| Summary counters wrong | Obsolete issue types; inspect Jobs findings |
+| Browser tests fail before assertions | Install Chromium OS libraries and inspect launch error |
+| GitHub changed but live app did not | Deploy/rebuild the commit; restarting an old image is insufficient |
+| Settings vanish after refresh | Save errors/database reachability; notifications are temporary |
 
-See [security and durable jobs](docs/security-and-jobs.md) for server work limits, public URL restrictions, release checks, and the remaining validation limits.
+## Further documentation
+
+- [Codebase review](docs/codebase-review.md): ratings, defects, scaling analysis, prioritized work, and actual validation limits.
+- [Security and durable jobs](docs/security-and-jobs.md): implementation details and historical validation; older sections include retired retrieval designs.
+- [vps-38no runbook](docs/vps-38no.md): host-specific history; confirm current state before operating it.
+
+There is no root `LICENSE` file. Individual source headers do not establish repository-wide licensing; confirm intended licensing before distribution.

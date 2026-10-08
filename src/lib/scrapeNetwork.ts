@@ -1,5 +1,6 @@
 import { lookup } from 'node:dns/promises';
-import { BlockList, isIP } from 'node:net';
+import { Agent, createServer, request as httpRequest } from 'node:http';
+import { BlockList, isIP, createConnection, type Socket } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 
 export class ScrapeError extends Error {
@@ -26,6 +27,7 @@ export function isPublicAddress(address: string) {
 export function validateScrapeInput(body: unknown): { url: string } {
   const value = (body as { url?: unknown })?.url;
   if (typeof value !== 'string' || !value.trim()) throw new ScrapeError('URL is required.', 400, 'INVALID_URL');
+  if (value.length > 8192) throw new ScrapeError('The URL exceeds 8,192 characters.', 400, 'INVALID_URL');
   let raw = value.trim();
   if (/[\s\\\x00-\x1f]/.test(raw)) throw new ScrapeError('Invalid URL provided.', 400, 'INVALID_URL');
   if (!/^[a-z][a-z\d+.-]*:/i.test(raw)) raw = 'https://' + raw;
@@ -56,4 +58,85 @@ export async function resolvePublicAddress(url: URL, resolve = lookup, signal = 
     }
     return addresses.find(item => item.family === 4) ?? addresses[0];
   } finally { done.abort(); }
+}
+
+/** Each TCP connection uses a validated numeric address: Chromium cannot re-resolve it. */
+export async function startScrapeProxy(resolve = lookup, connect = createConnection, signal = new AbortController().signal) {
+  const sockets = new Set<Socket>();
+  let closed = false;
+  let blocked: ScrapeError | undefined;
+  const track = (socket: Socket) => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.once('close', () => sockets.delete(socket));
+    return socket;
+  };
+  const dial = async (target: string) => {
+    signal.throwIfAborted();
+    const url = new URL(validateScrapeInput({ url: target }).url);
+    const address = await resolvePublicAddress(url, resolve, signal);
+    if (closed) throw new Error('Proxy closed');
+    const socket = track(connect({ host: address.address, family: address.family, port: Number(url.port) || (url.protocol === 'https:' ? 443 : 80) }));
+    await new Promise<void>((accept, reject) => {
+      const timeout = setTimeout(() => socket.destroy(new Error('Connection timed out')), 10_000);
+      socket.once('connect', () => { clearTimeout(timeout); accept(); });
+      socket.once('error', error => { clearTimeout(timeout); reject(error); });
+      socket.once('close', () => { clearTimeout(timeout); reject(new Error('Connection closed')); });
+    });
+    return socket;
+  };
+  const record = (error: unknown) => { if (error instanceof ScrapeError) blocked = error; };
+  const server = createServer(async (req, res) => {
+    let socket: Socket | undefined;
+    try {
+      const url = new URL(req.url!);
+      if (url.protocol !== 'http:') throw new ScrapeError('Unsupported proxy request.', 400);
+      socket = await dial(url.href);
+      if (res.destroyed) { socket.destroy(); return; }
+      const headers = { ...req.headers, host: url.host, connection: 'close' };
+      for (const name of ['proxy-authorization', 'proxy-connection', 'connection', 'upgrade']) delete headers[name];
+      const agent = new Agent({ keepAlive: false });
+      agent.createConnection = () => socket!;
+      const upstream = httpRequest(url, { method: req.method, headers, agent }, response => {
+        res.writeHead(response.statusCode || 502, response.headers);
+        response.pipe(res);
+      });
+      upstream.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
+      res.once('close', () => { upstream.destroy(); agent.destroy(); });
+      req.pipe(upstream);
+    } catch (error) {
+      socket?.destroy(); record(error);
+      if (!res.headersSent) res.writeHead(error instanceof ScrapeError ? 403 : 502);
+      res.end('Page connection rejected.');
+    }
+  });
+  server.on('connection', socket => track(socket));
+  server.on('connect', async (req, client, head) => {
+    let remote: Socket | undefined;
+    try {
+      if (!req.url || /[\s/@?#\\]/.test(req.url)) throw new ScrapeError('Invalid tunnel destination.', 400);
+      remote = await dial('https://' + req.url);
+      if (client.destroyed) { remote.destroy(); return; }
+      client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head.length) remote.write(head);
+      client.pipe(remote); remote.pipe(client);
+      client.once('close', () => remote?.destroy());
+      remote.once('close', () => client.destroy());
+    } catch (error) {
+      remote?.destroy(); record(error);
+      client.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+    }
+  });
+  server.on('upgrade', (_req, socket) => socket.destroy());
+  server.requestTimeout = 120_000;
+  await new Promise<void>((accept, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', accept); });
+  return {
+    server: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+    get blocked() { return blocked; },
+    close: async () => {
+      closed = true;
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>(accept => server.close(() => accept()));
+    },
+  };
 }
