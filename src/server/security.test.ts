@@ -9,12 +9,14 @@ import * as schema from '../db/schema';
 import {initializeQaConfiguration,registerQaConfigurationRoutes} from '../db/qaConfiguration';
 import {initializeDatabase,verifySchema} from './database';
 import {initializeAuth,registerAuth,hashPassword,hashSessionToken} from './auth';
-import {initializeProvider,registerProviderRoutes} from './provider';
+import {initializeProvider,registerProviderRoutes,getProviderSettings} from './provider';
 import {initializeJobRuns,registerJobRunRoutes,startJobWorker} from './jobRunner';
 import {ApiError,registerCatalogRoutes} from './catalog';
 import {registerScrapeRoutes} from './scraper';
+import {collectProductPage,scrapeProductPage} from './scrapePipeline';
+import type {AppSettings} from '../lib/providerSettings';
 import {ProviderError} from '../lib/chatCompletion';
-import {validateScrapeInput, ScrapeError, type ScrapePreview} from '../lib/browserScrape';
+import {validateScrapeInput, ScrapeError, type ScrapePreview} from '../lib/cloudScrape';
 import {DEFAULT_SETTINGS,editableSettings} from '../lib/providerSettings';
 import {CATALOG_INPUT_HEADERS,CATALOG_PASS_THROUGH_HEADERS} from '../lib/catalogGeneration';
 
@@ -28,25 +30,30 @@ let stopWorker:(()=>Promise<void>)|undefined;
 let stopSecond:(()=>Promise<void>)|undefined;
 let calls=0, providerMode='success';
 const providerRequests:any[]=[];
+const conversionRequests:any[]=[];
 const scrapeRequests:string[]=[];
-let scrapeBlocked=false, scrapePartial=false;
+let scrapeBlocked=false, scrapePartial=false, conversionFailed=false;
 let duringScrape: (()=>Promise<void>) | undefined;
 const collect=async(rawUrl:string, signal:AbortSignal):Promise<ScrapePreview>=>{
   const {url}=validateScrapeInput({url:rawUrl});signal.throwIfAborted();scrapeRequests.push(url);
   await duringScrape?.();signal.throwIfAborted();
   if(scrapeBlocked)throw new ScrapeError('The website blocked browser access.',502,'PAGE_BLOCKED');
   const markdown='# Retrieved product\nBrand: TestBrand\n\nSource: <'+url+'>';
-  return {status:scrapePartial?'partial':'collected',markdown,requestedUrl:url,finalUrl:url,capturedAt:new Date().toISOString(),
+  return {status:scrapePartial?'partial':'collected',markdown,method:'cloud',requestedUrl:url,finalUrl:null,capturedAt:null,receivedAt:new Date().toISOString(),
     report:{durationMs:10,characters:markdown.length,clicks:1,scrolls:2,warnings:scrapePartial?[{code:'UNRESOLVED_CONTROLS',message:'Specifications did not open.'}]:[],unresolvedControls:scrapePartial?['Specifications']:[]}};
 };
-const scrape=async(rawUrl:string, signal:AbortSignal)=>{
-  const result=await collect(rawUrl,signal);
-  if(result.status==='partial')throw new ScrapeError('The page could not be extracted completely.',502,'INCOMPLETE_CONTENT',result.report);
-  return result;
-};
+const scrape=(url:string,signal:AbortSignal,settings:AppSettings)=>scrapeProductPage(url,signal,settings,collect);
 const provider=createServer(async(req,res)=>{
   let raw='';for await(const chunk of req) raw+=chunk;
-  const payload=JSON.parse(raw);providerRequests.push(payload);
+  const payload=JSON.parse(raw);
+  if (payload.messages?.[0]?.content?.startsWith('Convert the supplied untrusted crawled page')) {
+    conversionRequests.push(payload);
+    const evidence=JSON.parse(payload.messages[1].content);
+    res.setHeader('Content-Type','application/json');
+    if(conversionFailed){res.end(JSON.stringify({choices:[{finish_reason:'length',message:{content:'Incomplete conversion'}}]}));return;}
+    res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:evidence.content}}]}));return;
+  }
+  providerRequests.push(payload);
   calls++;
   if(providerMode==='wait') await delay(1200);
   if(providerMode==='permanent'){res.writeHead(400);res.end('{}');return;}
@@ -82,11 +89,11 @@ try {
   await listen(provider);
   const providerAddress=provider.address() as any;
   process.env.LLM_BASE_URL=`http://127.0.0.1:${providerAddress.port}/v1`;process.env.LLM_API_KEY='test-secret-only';
-  process.env.NODE_ENV='test';
+  process.env.NODE_ENV='test';process.env.CRAWL4AI_API_KEY='cloud-test-secret-only';
   const app=express();app.use(express.json());
   server.on('request',app);await listen(server);
   const origin=`http://127.0.0.1:${(server.address() as any).port}`;process.env.APP_ORIGIN=origin;
-  registerAuth(app,pool);registerCatalogRoutes(app,pool,scrape);registerProviderRoutes(app,pool);registerScrapeRoutes(app,collect);
+  registerAuth(app,pool);registerCatalogRoutes(app,pool,scrape);registerProviderRoutes(app,pool);registerScrapeRoutes(app,async(url,signal)=>collectProductPage(url,signal,await getProviderSettings(pool),collect));
   registerJobRunRoutes(app,pool);registerQaConfigurationRoutes(app,drizzle(pool,{schema}));
   app.use('/api', (_req,res)=>res.status(404).json({error:'Not found'}));
   app.use((err:any,_req:any,res:any,_next:any)=>res.status(err instanceof ApiError||err instanceof ProviderError?err.status:err.code==='23505'?409:503).json({error:err.message}));
@@ -114,7 +121,7 @@ try {
   const preview=await request('/api/scrape/preview','POST',{url:'https://8.8.8.8/product'},user);
   assert.equal(preview.status,200);assert.equal(preview.body.status,'collected');assert.match(preview.body.markdown,/Retrieved product/);
   assert.deepEqual((await pool.query('SELECT (SELECT count(*) FROM sku_data) AS catalog, (SELECT count(*) FROM jobs) AS jobs, (SELECT count(*) FROM job_runs) AS runs')).rows,previewBefore.rows,'Standalone testing works with an empty catalog and writes no catalog/jobs/runs');
-  assert.equal(calls,previewCalls,'Standalone testing makes no provider calls');
+  assert.equal(calls,previewCalls,'Standalone testing does not invoke the QA model');
   const edit=async(id:string,updates:Record<string,unknown>)=>request(`/api/catalog/${id}`,'PUT',{
     ...updates,expectedRevision:(await pool.query('SELECT revision FROM sku_data WHERE sku=$1',[id])).rows[0]?.revision ?? 0,
   },user);
@@ -134,6 +141,17 @@ try {
   assert.equal((await request('/api/users/admin','PUT',{role:'user'},admin)).status,409);
   const settings=await request('/api/provider-settings','GET',undefined,user);
   assert.equal(settings.status,200);assert.doesNotMatch(JSON.stringify(settings.body),/test-secret-only|apiKey/);
+  assert.equal(settings.body.scraperConfigured,true);
+  assert.doesNotMatch(JSON.stringify(settings.body),/cloud-test-secret-only|CRAWL4AI_API_KEY/);
+  delete process.env.CRAWL4AI_API_KEY;
+  assert.equal((await request('/api/provider-settings','GET',undefined,user)).body.scraperConfigured,false);
+  const beforeMissingCloud=scrapeRequests.length;
+  const missingCloud=await request('/api/scrape/preview','POST',{url:'https://8.8.8.8/product'},user);
+  assert.equal(missingCloud.status,503);assert.equal(missingCloud.body.code,'SCRAPER_NOT_CONFIGURED');
+  assert.equal(scrapeRequests.length,beforeMissingCloud,'Cloud credential preflight prevents collection');
+  assert.equal((await request('/api/chat','POST',{purpose:'scrape'},admin)).status,200,'The Markdown model test only requires model credentials');
+  process.env.CRAWL4AI_API_KEY='cloud-test-secret-only';
+  assert.equal((await request('/api/provider-settings','PUT',{...editableSettings(DEFAULT_SETTINGS),scraperConfigured:true},admin)).status,400,'Cloud configuration is read-only');
   assert.ok(!('scrapperModelName' in settings.body));
   assert.equal(settings.body.baseUrl,'','The gateway destination remains server-only');
   assert.equal(settings.body.modelName,'deepseek/deepseek-v4.1-flash');
@@ -158,7 +176,7 @@ try {
   assert.equal((await request('/api/scrape','POST',{url:'https://8.8.8.8/product'},user)).status,404);
   assert.equal((await request('/api/catalog/nope/scrape','POST',{expectedRevision:0,url:'https://8.8.8.8/product'},user)).status,400);
   assert.equal((await request('/api/catalog/nope/scrape','POST',{expectedRevision:0},user)).status,404);
-  assert.equal(calls,0,'Scraping makes no provider calls');
+  assert.equal(calls,0,'Invalid scrape requests never call a provider');
   assert.doesNotMatch(JSON.stringify(providerRequests),/test-secret-only/);
   providerMode='success';calls=0;
   assert.equal((await request('/api/chat','POST',{baseUrl:'http://evil',apiKey:'x'},admin)).status,400);
@@ -188,10 +206,17 @@ try {
   const credentials={baseUrl:process.env.LLM_BASE_URL,key:process.env.LLM_API_KEY,legacyKey:process.env.AICREDITS_API_KEY};
   delete process.env.LLM_BASE_URL;delete process.env.LLM_API_KEY;delete process.env.AICREDITS_API_KEY;
   await request('/api/catalog','POST',[{...sku('scrape-check'),source:{url:'https://8.8.8.8/product?variant=42'}}],user);
+  const missingCredentials=await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:0},user);
+  assert.equal(missingCredentials.status,503,'Conversion requires server credentials');
+  process.env.LLM_BASE_URL=credentials.baseUrl;process.env.LLM_API_KEY=credentials.key;
   const scraped=await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:0},user);
-  assert.equal(scraped.status,200,'Scraping works without any LLM credentials');
+  assert.equal(scraped.status,200,'Scraping uses the shared provider');
+  assert.equal(scraped.body.scrape_metadata.crawler,'crawl4ai');
+  assert.equal(scraped.body.scrape_metadata.modelName,DEFAULT_SETTINGS.scraperModelName);
   assert.equal(scraped.body.sku,'scrape-check');assert.equal(scraped.body.revision,1);
-  assert.equal(scraped.body.scrape_metadata.method,'browser');assert.match(scraped.body.scraped_markdown,/variant=42/);
+  assert.equal(scraped.body.scrape_metadata.method,'cloud');assert.match(scraped.body.scraped_markdown,/variant=42/);
+  assert.equal(scraped.body.scrape_metadata.finalUrl,null);assert.equal(scraped.body.scrape_metadata.capturedAt,null);
+  assert.ok(scraped.body.scrape_metadata.receivedAt);
   assert.equal(calls,0);
   assert.equal((await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:0},user)).status,409);
   assert.equal((await request('/api/catalog/scrape-check','PUT',{source:{sap:'missing revision'}},user)).status,400);
@@ -202,6 +227,13 @@ try {
   const afterFailure=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='scrape-check');
   assert.equal(afterFailure.scraped_markdown,scraped.body.scraped_markdown);assert.equal(afterFailure.revision,1);
   assert.deepEqual(afterFailure.scrape_metadata,scraped.body.scrape_metadata);assert.match(afterFailure.scrape_error,/blocked/);
+  conversionFailed=true;
+  const conversionFailure=await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:1},user);
+  conversionFailed=false;
+  assert.equal(conversionFailure.status,502);assert.equal(conversionFailure.body.code,'CONVERSION_FAILED');
+  const preserved=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='scrape-check');
+  assert.equal(preserved.scraped_markdown,scraped.body.scraped_markdown);assert.equal(preserved.revision,1);
+  assert.deepEqual(preserved.scrape_metadata,scraped.body.scrape_metadata);
   scrapePartial=true;
   const partialPreview=await request('/api/scrape/preview','POST',{url:'https://8.8.8.8/product?variant=42'},user);
   assert.equal(partialPreview.status,200);assert.equal(partialPreview.body.status,'partial');
@@ -231,6 +263,7 @@ try {
   assert.equal((await request('/api/catalog/scrape-check/scrape','POST',{expectedRevision:0},user)).status,404);
   duringScrape=undefined;
   await request('/api/catalog','DELETE',{skus:['scrape-check']},admin);
+  delete process.env.LLM_BASE_URL;delete process.env.LLM_API_KEY;delete process.env.AICREDITS_API_KEY;
   const missingProvider=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'all'},user);
   assert.equal(missingProvider.status,503);
   assert.match(missingProvider.body.error,/LLM_BASE_URL.*LLM_API_KEY/,'Missing credentials return actionable configuration errors');
@@ -349,19 +382,21 @@ try {
   await waitFor(async()=>(await request(`/api/job-runs/${expired.body.id}`,'GET',undefined,user)).body.status==='failed','expired item deadline');
   assert.equal(calls,beforeExhaustion);
   await stopWorker();stopWorker=undefined;
-  // Browser retrieval is independent of models; QA retains its durable settings snapshot.
+  // Conversion and QA retain their independent durable model snapshots.
   const productUrl='https://8.8.8.8/product?variant=42';
   assert.equal((await edit('b',{source:{sap:'Brand: TestBrand',url:productUrl},scraped_markdown:''})).status,200);
   const webRun=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'b'},user);
   const snapshotConfig=(await pool.query('SELECT configuration FROM job_runs WHERE id=$1',[webRun.body.id])).rows[0].configuration;
   assert.ok(!('scrapperModelName' in snapshotConfig.settings));assert.ok(!('selectors' in snapshotConfig));
   assert.doesNotMatch(JSON.stringify(snapshotConfig),/test-secret-only|apiKey|sgai-.*-secret/);
-  await request('/api/provider-settings','PUT',{...configured,modelName:'next/qa'},admin);
+  await request('/api/provider-settings','PUT',{...configured,modelName:'next/qa',scraperModelName:'next/scrape'},admin);
   providerMode='success';let offset=providerRequests.length;stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await request(`/api/job-runs/${webRun.body.id}`,'GET',undefined,user)).body.status==='completed','snapshotted retrieval');
   await stopWorker();stopWorker=undefined;
   assert.deepEqual(providerRequests.slice(offset).map(payload=>payload.model),['deepseek/deepseek-v4.1-flash']);
   assert.equal(scrapeRequests.at(-1),productUrl);
+  assert.equal(conversionRequests.at(-1).model,DEFAULT_SETTINGS.scraperModelName);
+  assert.doesNotMatch(JSON.stringify(conversionRequests.at(-1)),/test-secret-only|SAP takes precedence/);
   const qaRequest=providerRequests[offset];
   assert.equal(qaRequest.reasoning_effort,'low');assert.equal(qaRequest.max_tokens,10000);
   assert.deepEqual(qaRequest.response_format,{type:'json_object'});assert.ok(qaRequest.messages[0].content.includes(mappingRules));
@@ -376,27 +411,40 @@ try {
   assert.equal(webHistory.items[1].error,null);assert.equal(webHistory.items[1].result.qa_result.qa_status,'pass');
   assert.deepEqual(webHistory.items[1].result.qa_result.source_notes,{sap_used:true,url_used:true,source_conflicts:[]});
   assert.match((await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='b').scraped_markdown,/variant=42/);
-  // Old job snapshots still retrieve with the browser without rewriting stored configuration.
+  // Old job snapshots still retrieve with the cloud without rewriting stored configuration.
   await pool.query("UPDATE sku_data SET scraped_markdown=NULL,scrape_status=NULL WHERE sku='b'");
   const legacyRun=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'b'},user);
-  await pool.query("UPDATE job_runs SET configuration=jsonb_set(configuration,'{settings}',(configuration->'settings')-'scrapperModelName') WHERE id=$1",[legacyRun.body.id]);
+  await pool.query("UPDATE job_runs SET configuration=jsonb_set(configuration,'{settings}',(configuration->'settings')-'scrapperModelName'-'scraperModelName') WHERE id=$1",[legacyRun.body.id]);
   offset=providerRequests.length;stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await request(`/api/job-runs/${legacyRun.body.id}`,'GET',undefined,user)).body.status==='completed','legacy retrieval defaults');
   await stopWorker();stopWorker=undefined;
   assert.equal(providerRequests[offset].model,'next/qa');
   assert.equal(providerRequests.length-offset,1);
   assert.equal(scrapeRequests.at(-1),productUrl);
-  // Keep the actual browser failure when no other evidence exists; never spend QA tokens on it.
+  assert.equal(conversionRequests.at(-1).model,DEFAULT_SETTINGS.scraperModelName);
+  assert.doesNotMatch(JSON.stringify(conversionRequests.at(-1)),/test-secret-only|SAP takes precedence/);
+  // Keep the actual retrieval failure when no other evidence exists; never spend QA tokens on it.
   await pool.query("UPDATE sku_data SET source=$1,scraped_markdown=NULL,scrape_status=NULL WHERE sku='b'",[JSON.stringify({url:productUrl})]);
   scrapeBlocked=true;
   const blockedRun=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'b'},user);
   offset=providerRequests.length;stopWorker=startJobWorker(pool,scrape);
-  await waitFor(async()=>(await request(`/api/job-runs/${blockedRun.body.id}`,'GET',undefined,user)).body.status==='failed','blocked page retains its browser error');
+  await waitFor(async()=>(await request(`/api/job-runs/${blockedRun.body.id}`,'GET',undefined,user)).body.status==='failed','blocked page retains its retrieval error');
   await stopWorker();stopWorker=undefined;scrapeBlocked=false;
   const blockedItem=(await request(`/api/job-runs/${blockedRun.body.id}`,'GET',undefined,user)).body.items.find((item:any)=>item.sku==='b');
   assert.match(blockedItem.error,/website blocked browser access/);
   assert.equal(blockedItem.result.scrape_status,'failed');
   assert.equal(providerRequests.length,offset,'No QA request without usable source evidence');
+  // Failed conversion retains the existing SAP-only fallback without saving incomplete Markdown.
+  await pool.query("UPDATE sku_data SET source=$1 WHERE sku='b'",[JSON.stringify({url:productUrl,sap:'Brand: TestBrand'})]);
+  conversionFailed=true;
+  const fallbackRun=await request('/api/jobs/job/runs','POST',{requestId:randomUUID(),mode:'single',sku:'b'},user);
+  offset=providerRequests.length;stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await request(`/api/job-runs/${fallbackRun.body.id}`,'GET',undefined,user)).body.status==='completed','conversion failure falls back to SAP');
+  await stopWorker();stopWorker=undefined;conversionFailed=false;
+  const fallbackInput=JSON.parse(providerRequests[offset].messages[1].content);
+  assert.equal(fallbackInput.source_sap,'Brand: TestBrand');assert.ok(!fallbackInput.scraped_markdown);
+  const fallbackRow=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='b');
+  assert.equal(fallbackRow.scrape_status,'failed');assert.equal(fallbackRow.scraped_markdown,null);
   // Retrieval is committed before QA; later model failure or cancellation cannot erase it.
   await request('/api/catalog','POST',[{...sku('url-only'),source:{url:productUrl}}],user);
   assert.equal((await request('/api/jobs','POST',{id:'url-only-job',name:'URL-only job',skus:['url-only'],attribute_set:'TestSet'},user)).status,201);
@@ -407,7 +455,7 @@ try {
   await stopWorker();stopWorker=undefined;
   const savedEvidence=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='url-only');
   assert.match(savedEvidence.scraped_markdown,/Retrieved product/);assert.equal(savedEvidence.scrape_status,'success');
-  assert.equal(savedEvidence.revision,1);assert.equal(savedEvidence.scrape_metadata.method,'browser');
+  assert.equal(savedEvidence.revision,1);assert.equal(savedEvidence.scrape_metadata.method,'cloud');
   const savedItem=(await pool.query('SELECT revision,snapshot FROM job_run_items WHERE run_id=$1',[failureAfterScrape.body.id])).rows[0];
   assert.equal(savedItem.revision,savedEvidence.revision);assert.equal(savedItem.snapshot.scraped_markdown,savedEvidence.scraped_markdown);
   const cancelUrl='https://8.8.8.8/new-product';

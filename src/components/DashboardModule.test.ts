@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createServer } from "vite";
-import type { ScrapePreview } from '../lib/browserScrape';
+import type { ScrapePreview } from '../lib/cloudScrape';
 import type { SkuData } from "../hooks/useCatalogData";
 import { DEFAULT_SETTINGS } from "../lib/providerSettings";
 import { prepareQaInput } from "../lib/qaAgent";
@@ -130,7 +130,7 @@ try {
         await new Promise<void>(resolve=>{finishPreview=resolve;});
         return route.fulfill({json:{status:'collected',markdown:'# Stale preview',requestedUrl,finalUrl:requestedUrl,capturedAt:'2026-10-07T00:00:00Z',report}}).catch(()=>{});
       }
-      lastPreview = {status:previewMode,markdown:previewMarkdown,requestedUrl,finalUrl:'https://example.com/final',capturedAt:'2026-10-07T00:00:00Z',report};
+      lastPreview = {status:previewMode,method:'cloud',crawler:'crawl4ai',modelName:'z-ai/glm-5.3-flash',markdown:previewMarkdown,requestedUrl,finalUrl:null,capturedAt:null,receivedAt:'2026-10-07T00:00:00Z',report: previewMode === 'partial' ? report : { durationMs: report.durationMs, characters: report.characters, warnings: [] }};
       return route.fulfill({json:lastPreview});
     }
     if (request.method() === 'POST' && path.startsWith('/api/catalog/') && path.endsWith('/scrape')) {
@@ -153,7 +153,7 @@ try {
       }
       if (item.revision !== expectedRevision) return route.fulfill({status:409,json:{error:'SKU changed. Refresh before scraping.'}});
       Object.assign(item, { revision: expectedRevision + 1, scraped_markdown: scrapeMarkdown, scrape_status: 'success', scrape_error: null,
-        scrape_metadata: {method:'browser',requestedUrl:item.source.url,finalUrl:item.source.url,capturedAt:'2026-10-07T00:00:00Z'} });
+        scrape_metadata: {method:'cloud',requestedUrl:item.source.url,finalUrl:null,capturedAt:null,receivedAt:'2026-10-07T00:00:00Z'} });
       return route.fulfill({json:item}).catch(()=>{});
     }
     if (request.method() === "PUT" && path.startsWith("/api/catalog/")) {
@@ -440,7 +440,7 @@ try {
   assert.equal(await row('empty').getByRole('button', { name: 'View/Edit Data', exact: true }).isEnabled(), true);
   await editData('empty');
   assert.equal(await content.inputValue(), 'Automatically scraped content');
-  await page.getByText('Evidence: browser', {exact:false}).waitFor();
+  await page.getByText('Evidence: cloud', {exact:false}).waitFor();
   await page.keyboard.press('Escape');
   emptyCatalog = true;
   await page.reload();
@@ -464,7 +464,11 @@ try {
   assert.equal(await page.locator('.prose img').count(),0,'Preview images render as alt text without automatic fetching');
   assert.equal(imageRequests,0,'Preview Markdown cannot request a private image from the user’s browser');
   assert.ok(lastPreview.markdown.includes(imageMarkdown),'Raw Markdown retains the original image reference');
-  await page.getByText(`1.5 seconds · ${previewMarkdown.length} characters · 2 clicks · 3 scrolls`,{exact:true}).waitFor();
+  await page.getByText(`1.5 seconds · ${previewMarkdown.length} characters`,{exact:true}).waitFor();
+  await page.getByText('Received:', { exact: false }).waitFor();
+  assert.equal(await page.getByText('Final:', { exact: false }).count(), 0);
+  assert.equal(await page.getByText('Captured:', { exact: false }).count(), 0);
+  assert.equal(await page.getByText(/\d+ clicks/).count(), 0, 'Cloud previews hide unavailable browser counters');
   await page.context().grantPermissions(['clipboard-read','clipboard-write']);
   await page.getByRole('button',{name:'Copy Markdown',exact:true}).click();
   await page.getByRole('button',{name:'Copied',exact:true}).waitFor();
@@ -521,7 +525,7 @@ try {
   assert.equal(previewRequests,7);
   assert.equal(writes.length,previewWrites,'Preview never writes catalog data');
   assert.equal(createdJobs.length,previewJobs,'Preview never creates jobs');
-  assert.equal(chatRequests.length,previewChats,'Preview never invokes models');
+  assert.equal(chatRequests.length,previewChats,'Preview does not invoke the admin connectivity endpoint');
   assert.deepEqual(catalog,savedCatalog,'Preview leaves saved evidence untouched');
   emptyCatalog = false;
   await page.reload();
@@ -595,14 +599,14 @@ try {
   await page.getByRole('button', { name: 'LLM Settings', exact: true }).click();
   assert.equal(await page.getByLabel('Navigation model', {exact:true}).count(),0);
   await page.getByLabel('Q&A model', { exact: true }).fill('draft/qa');
-  const testing = page.getByRole('button', { name: 'Test API', exact: true });
+  const testing = page.getByRole('button', { name: 'Test Q&A API', exact: true });
   await testing.click();
   await page.getByText('Q&A (draft/qa): Testing…', { exact: true }).waitFor();
   assert.equal(await testing.isDisabled(), true);
   assert.equal(await page.getByLabel('Q&A model', { exact: true }).isDisabled(), true);
   releaseChat();
   await page.getByText('Q&A (draft/qa): Passed.', { exact: true }).waitFor();
-  assert.deepEqual(chatRequests, [{ modelName: 'draft/qa' }], 'Only QA makes model requests');
+  assert.deepEqual(chatRequests, [{ modelName: 'draft/qa', purpose: 'qa' }], 'Connectivity tests use their selected purpose');
   assert.equal(settingsWrites.length, 0, 'Testing leaves settings unsaved');
   const notifications = page.getByRole('button', { name: 'Notifications', exact: true });
   await notifications.click();
@@ -617,16 +621,24 @@ try {
   await notifications.click();
   assert.equal(settingsWrites.length, 0, 'Connection failures do not save settings');
   assert.equal(await page.getByLabel('Q&A model', { exact: true }).inputValue(), 'draft/qa');
+  await page.getByLabel('Scraping / Markdown model', {exact:true}).fill('draft/scrape');
+  chatMode = 'success';
+  await page.getByRole('button', {name:'Test Markdown model',exact:true}).click();
+  await page.getByText('Scraping (draft/scrape): Passed.', {exact:true}).waitFor();
+  assert.deepEqual(chatRequests.at(-1), {modelName:'draft/scrape',purpose:'scrape'});
+  assert.equal(settingsWrites.length,0);
   await page.getByRole('button', { name: 'Save changes', exact: true }).click();
   await page.getByText('Settings saved for everyone.', { exact: true }).waitFor();
   assert.equal(settingsWrites.length, 1);
   assert.equal(Object.hasOwn(settingsWrites[0], 'scrapperModelName'), false);
   assert.equal(settingsWrites[0].modelName, 'draft/qa');
+  assert.equal(settingsWrites[0].scraperModelName, 'draft/scrape');
   assert.doesNotMatch(JSON.stringify(settingsWrites), /apiKey|test-only/);
   await page.reload();
   await page.getByRole('button', { name: 'LLM Settings', exact: true }).click();
   await page.waitForFunction(input => (input as HTMLInputElement).value === 'draft/qa', await page.getByLabel('Q&A model', { exact: true }).elementHandle());
   assert.equal(await page.getByLabel('API Key', { exact: true }).count(), 0);
+  assert.equal(await page.getByLabel('Scraping / Markdown model', {exact:true}).inputValue(),'draft/scrape');
   savedSettings.providerConfigured = false;
   chatMode = 'missing';
   await page.reload();

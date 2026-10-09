@@ -2,7 +2,9 @@ import type { Express } from 'express';
 import type { Pool, PoolClient } from 'pg';
 import { transaction } from './database';
 import { LEGACY_REVIEW_ERROR, unprocessedStatus, withoutRawQaResult } from '../lib/jobRunState';
-import { scrapePage, ScrapeError, validateScrapeInput } from '../lib/browserScrape';
+import { ScrapeError, validateScrapeInput, type ScrapedPage } from '../lib/cloudScrape';
+import { scrapeProductPage } from './scrapePipeline';
+import { getProviderSettings } from './provider';
 import { usableScrapedMarkdown } from '../lib/scrapeEvidence';
 import { getCatalogMapping, missingCatalogInputHeaders } from '../lib/catalogGeneration';
 import { prepareCatalogOutputs } from '../lib/catalogFiles';
@@ -89,9 +91,15 @@ async function ensureIdle(client: PoolClient, jobIds?: string[], skus?: string[]
   if (rows.length) throw new ApiError(409, 'Cancel active runs and wait for them to stop before deleting or changing this job');
 }
 
+export function scrapedMetadata(result: ScrapedPage) {
+  return { method: result.method ?? 'browser', requestedUrl: result.requestedUrl, finalUrl: result.finalUrl,
+    capturedAt: result.capturedAt ?? null, ...(result.receivedAt ? { receivedAt: result.receivedAt } : {}),
+    ...(result.crawler ? { crawler: result.crawler, modelName: result.modelName } : {}) };
+}
+
 /** Called within the existing mutation transaction by HTTP retrieval and durable jobs. */
-export async function saveScrapedEvidence(client: PoolClient, sku: string, revision: number, result: Awaited<ReturnType<typeof scrapePage>>, id?: number) {
-  const metadata = { method: 'browser', requestedUrl: result.requestedUrl, finalUrl: result.finalUrl, capturedAt: new Date().toISOString() };
+export async function saveScrapedEvidence(client: PoolClient, sku: string, revision: number, result: ScrapedPage, id?: number) {
+  const metadata = scrapedMetadata(result);
   const { rows: [row] } = await client.query(`UPDATE sku_data SET scraped_markdown=$3,scrape_metadata=$4,
     scrape_status='success',scrape_error=NULL,status='ready',error=NULL,revision=revision+1
     WHERE sku=$1 AND revision=$2 AND ($5::integer IS NULL OR id=$5) RETURNING *`, [sku, revision, result.markdown, JSON.stringify(metadata), id ?? null]);
@@ -104,7 +112,7 @@ export async function saveScrapeFailure(client: PoolClient, sku: string, revisio
   return row;
 }
 
-export function registerCatalogRoutes(app: Express, pool: Pool, scrape = scrapePage) {
+export function registerCatalogRoutes(app: Express, pool: Pool, scrape = scrapeProductPage) {
   app.get('/api/catalog', async (_req, res) => res.json((await pool.query('SELECT * FROM sku_data ORDER BY id')).rows.map(mapCatalogRow)));
   app.post('/api/catalog', async (req, res) => {
     validateCatalogImport(req.body, req.query.mode);
@@ -173,8 +181,8 @@ export function registerCatalogRoutes(app: Express, pool: Pool, scrape = scrapeP
       if (!current) throw new ApiError(404, 'SKU not found');
       if (current.revision !== revision) throw new ApiError(409, 'SKU evidence changed. Refresh the catalog before scraping.');
       const { url } = validateScrapeInput({ url: current.source?.url });
-      let result: Awaited<ReturnType<typeof scrapePage>>;
-      try { result = await scrape(url, controller.signal); }
+      let result: ScrapedPage;
+      try { result = await scrape(url, controller.signal, await getProviderSettings(pool)); }
       catch (error) {
         if (controller.signal.aborted || error instanceof ScrapeError && error.code === 'CANCELLED') throw error;
         await transaction(pool, async client => {

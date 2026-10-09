@@ -6,13 +6,13 @@ import type { SkuData } from '../hooks/useCatalogData';
 import { usableScrapedMarkdown } from '../lib/scrapeEvidence';
 import { ApiError } from '../lib/api';
 import { previewScrapeUrl } from '../lib/scrapeRequest';
-import type { ScrapePreview, ScrapeReport } from '../lib/browserScrape';
+import type { ScrapePreview, ScrapeReport } from '../lib/cloudScrape';
 
 function Diagnostics({ report }: { report: ScrapeReport }) {
   return <div className="mt-3 space-y-2 text-sm">
-    <p>{(report.durationMs / 1000).toFixed(1)} seconds · {report.characters.toLocaleString()} characters · {report.clicks} clicks · {report.scrolls} scrolls</p>
+    <p>{(report.durationMs / 1000).toFixed(1)} seconds · {report.characters.toLocaleString()} characters{report.clicks !== undefined && ` · ${report.clicks} clicks`}{report.scrolls !== undefined && ` · ${report.scrolls} scrolls`}</p>
     {report.warnings.length > 0 && <ul className="list-disc pl-5">{report.warnings.slice(0, 20).map((warning, index) => <li key={index}><span className="font-mono">{warning.code}</span>: {warning.message}</li>)}</ul>}
-    {report.unresolvedControls.length > 0 && <p>Unresolved controls: {report.unresolvedControls.slice(0, 20).join(', ')}</p>}
+    {!!report.unresolvedControls?.length && <p>Unresolved controls: {report.unresolvedControls.slice(0, 20).join(', ')}</p>}
   </div>;
 }
 
@@ -116,7 +116,7 @@ export function ScraperModule() {
       </>}
       {loading && <button type="button" className="border px-4 py-2 ml-4" onClick={cancel}>Cancel scraping</button>}
     </form>
-    {loading && <p role="status" className="mt-4">Revealing and collecting page content…</p>}
+    {loading && <p role="status" className="mt-4">Collecting page content and structuring product evidence…</p>}
     {error && <p role="alert" className="mt-4 text-red-700">{error}</p>}
     {mode === 'preview' && failedPreview && <div className="max-w-4xl mt-6">
       <h3 className="text-xl mb-2">{failedPreview.label}</h3>
@@ -127,7 +127,9 @@ export function ScraperModule() {
     {mode === 'preview' && preview && <div className="max-w-4xl mt-6">
       <h3 className="text-xl mb-2">{preview.status === 'collected' ? 'Content collected' : 'Partial'}</h3>
       <p className="text-sm break-all">Requested: {preview.requestedUrl}</p>
-      <p className="text-sm break-all">Final: {preview.finalUrl} · {new Date(preview.capturedAt).toLocaleString()}</p>
+      {preview.finalUrl && <p className="text-sm break-all">Final: {preview.finalUrl}</p>}
+      {preview.capturedAt ? <p className="text-sm">Captured: {new Date(preview.capturedAt).toLocaleString()}</p>
+        : preview.receivedAt && <p className="text-sm">Received: {new Date(preview.receivedAt).toLocaleString()}</p>}
       {preview.status === 'partial' && <p className="text-amber-700 mt-2">Some content could not be collected. This preview is not saved as SKU evidence.</p>}
       <Diagnostics report={preview.report} />
       <div className="flex flex-wrap gap-2 mt-4">
@@ -142,7 +144,7 @@ export function ScraperModule() {
     {mode === 'sku' && selected?.scrape_error && <p className="mt-4 text-red-700">Latest scrape: {selected.scrape_error}</p>}
     {mode === 'sku' && selected?.scraped_markdown?.trim() && <div className="max-w-4xl mt-6">
       <h3 className="text-xl mb-2">Saved Scraped Data — {selected.sku}</h3>
-      {metadata && <p className="text-sm">Evidence: {metadata.method}{metadata.capturedAt && ` · ${new Date(metadata.capturedAt).toLocaleString()}`}{metadata.requestedUrl && ` · ${metadata.requestedUrl}`}</p>}
+      {metadata && <p className="text-sm">Evidence: {metadata.method}{metadata.capturedAt ? ` · Captured: ${new Date(metadata.capturedAt).toLocaleString()}` : metadata.receivedAt && ` · Received: ${new Date(metadata.receivedAt).toLocaleString()}`}{metadata.requestedUrl && ` · ${metadata.requestedUrl}`}</p>}
       {!usableScrapedMarkdown(selected) && <p className="text-amber-700">The source URL changed. Rescrape or save manual content in Dashboard before QA uses this evidence.</p>}
       {selected.qa_stale && <p className="text-amber-700">QA needs to be rerun for the current evidence.</p>}
       {sourceUrl && /^https?:\/\//i.test(sourceUrl) && <a href={sourceUrl} target="_blank" rel="noreferrer" className="underline">View source page</a>}

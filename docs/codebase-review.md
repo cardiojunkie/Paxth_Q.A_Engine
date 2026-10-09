@@ -2,6 +2,8 @@
 
 Reviewed **6 October 2026**, against checkout `f3a7125e` before the documentation changes in this review. Scope: application source, runtime configuration, schema initialization, tests, Docker/Compose, launcher, and operational documentation. Secrets were not printed. No production database, remote host, deployment, account, or paid provider was changed.
 
+The app is currently under development in GitHub Codespaces and has not been deployed. Deployment readiness below concerns a future release.
+
 **Follow-up:** the QA import/result trust finding below is fixed in the current source. The original ratings and audit counts describe the initial review; they have not been recalculated. Remaining findings are outside this fix. Legacy raw-only and snapshot-only reviews require explicit reruns rather than automatic promotion.
 
 ## Assessment
@@ -34,12 +36,12 @@ For a limited internal deployment, the code has a reasonable foundation once the
 | QA-result import trust reproduction | Confirmed using existing validation/mapping/state functions, without DB writes |
 | Attribute-edit/template reproduction | Confirmed using `prepareQaInput`, without DB writes |
 | Docker build/run | Not verified; no Docker executable was available |
-| Live model/ScrapeGraph/remote VPS | Not tested; no paid calls or remote access performed |
+| Live model/ScrapeGraph | Not tested; no paid calls performed |
 | `.env` protection | Real `.env` is ignored and not currently tracked; example configuration is tracked |
 
 Node was **22.23.3**, npm **10.9.9**. The build emitted one frontend JS asset of approximately **1,777 KB minified / 533 KB gzip**, and Vite's large-chunk warning. Audit counts are time-sensitive package findings, not 13 proven exploitable application vulnerabilities. Re-run audits after any lockfile changes.
 
-Earlier success claims in the operational documents were not repeated here. They are historical evidence, not current live-infrastructure verification. Current `.env` exclusion is not a forensic guarantee about Git history or credentials stored outside the workspace.
+Earlier deployment claims in operational documents were incorrect and have been removed. This review covers the Codespaces checkout. Current `.env` exclusion is not a forensic guarantee about Git history or credentials stored outside the workspace.
 
 ### QA integrity follow-up validation
 
@@ -118,7 +120,7 @@ Evidence: [`server.ts`](../server.ts): `express.json({ limit: '50mb' })` is inst
 
 Anonymous requests can make the application buffer and parse large JSON before their session or origin is rejected. Concurrent requests can pressure the one-CPU, 1.5 GiB container. The spreadsheet row-count limit is checked after parsing and does not bound that earlier work.
 
-An existing gateway requiring authentication could reduce exposure, but gateway configuration is absent here and was not inspected. The route order itself is confirmed; a denial-of-service load experiment was not performed.
+A future gateway requiring authentication could reduce exposure, but gateway configuration is absent here. The route order itself is confirmed; a denial-of-service load experiment was not performed.
 
 **Smallest fix:** use small default body limits and a larger authenticated limit only for import. Bound request concurrency/body size at ingress as well. Keep import row/content limits after parsing. No general-purpose validation framework is needed for that change.
 
@@ -240,7 +242,7 @@ PostgreSQL documents that [session advisory locks last for the database session]
 
 ## Deployment readiness decision
 
-**Do not approve a broad production release of this exact version.** An existing deployment may already be running, but that does not resolve these findings or prove the current source is deployed.
+**Do not approve a broad production release of this exact version.** The app has not been deployed; resolve the remaining findings and verify a future installation before release.
 
 | Present | Missing or unresolved |
 | --- | --- |

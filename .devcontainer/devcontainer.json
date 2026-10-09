@@ -28,5 +28,5 @@
       "onAutoForward": "openBrowser"
     }
   },
-  "postCreateCommand": "npm ci && npm run setup:scraper"
+  "postCreateCommand": "npm ci"
 }

@@ -4,6 +4,8 @@ Paxth Q.A. Engine helps catalog editors review ecommerce product spreadsheets an
 
 Upload a spreadsheet, prepare the evidence, create a job, run the review, and export an Excel workbook with findings and suggested corrections. A language model produces the review; a person should verify its findings before changing the product catalog.
 
+**Development status:** the app is currently being built in GitHub Codespaces. It has not been deployed. The production instructions below describe a possible future deployment.
+
 **Current readiness:** imported data can no longer impersonate QA results. The repository builds and its fast tests pass, but remaining findings include a known administrator bootstrap password fallback, vulnerable dependencies, and scaling limits. Read the [codebase review](docs/codebase-review.md) for the original ratings, the QA integrity fix, and remaining release work. A successful build alone does not establish production readiness.
 
 ## Contents
@@ -16,7 +18,7 @@ Upload a spreadsheet, prepare the evidence, create a job, run the review, and ex
 - [Creating a catalog](#creating-a-catalog)
 - [Spreadsheet format](#spreadsheet-format)
 - [Mapping rules and shared instructions](#mapping-rules-and-shared-instructions)
-- [Browser retrieval](#browser-retrieval)
+- [Cloud retrieval](#cloud-retrieval)
 - [Jobs, recovery, and cancellation](#jobs-recovery-and-cancellation)
 - [Understanding results and exports](#understanding-results-and-exports)
 - [Accounts and permissions](#accounts-and-permissions)
@@ -41,7 +43,7 @@ Upload a spreadsheet, prepare the evidence, create a job, run the review, and ex
 
 A **SKU** identifies a product. An **attribute set** is a category and its validation rules. **Evidence** means supplied SAP text or product-page content. A **job** groups products; a **run** records one execution of that job. A **QA verdict** describes review findings, separately from execution status.
 
-All users in one installation share the catalog, jobs, rules, history, and QA model settings. QA uses the shared server provider; scraping needs no model or provider credential. This is a shared internal workspace without organization/tenant isolation.
+All users in one installation share the catalog, jobs, rules, history, and QA model settings. QA/Catalog and scraping use independent models with the same shared server provider credentials. This is a shared internal workspace without organization/tenant isolation.
 
 There is no direct SAP/ERP integration. SAP text comes from the spreadsheet or editor. The app does not automatically update SAP, a storefront, or the uploaded file.
 
@@ -54,7 +56,8 @@ flowchart LR
     API --> DB[(PostgreSQL)]
     Worker[Worker in the Express process] -->|Claims durable runs| DB
     Worker --> Model[OpenAI-compatible QA provider]
-    Worker --> Scraper[Local Python browser worker]
+    Worker --> Scraper[Crawl4AI cloud API]
+    Scraper --> Formatter[GLM Markdown cleanup]
     API -->|Interactive retrieval| Scraper
     Browser -->|Poll progress and results| API
     Browser --> Export[Excel review workbook]
@@ -79,7 +82,7 @@ The app checks the model's JSON structure, evidence flags, issue types, severity
 - An accessible PostgreSQL database; use a maintained release for new installations.
 - A direct database connection or **session pooler**. Transaction pooling is unsuitable for the worker's session advisory lock.
 - An OpenAI-compatible provider account for QA.
-- **Python 3.11**, a virtual environment, Xvfb, and Chromium system libraries for local retrieval; see [browser worker setup](docs/browser-scraper.md).
+- A Crawl4AI cloud API key for URL retrieval; see [scraping configuration](docs/browser-scraper.md).
 
 Docker is optional for local development. The supplied application Compose file does **not** provision PostgreSQL.
 
@@ -116,16 +119,17 @@ docker run --name paxth-qa-dev-db \
 
 For Supabase, copy the exact TLS-enabled URI from the project's Connect dialog. In an IPv4-only environment, use the Session pooler. Preserve its hostname, region, port, username, and connection parameters rather than guessing them.
 
-### 2. Configure QA credentialss
+### 2. Configure provider credentials
 
 ```dotenv
-LLM_BASE_URL=https://your-provider.example/v1
-LLM_API_KEY=your-private-provider-keys
+AICREDITS_API_KEY=your-private-aicredits-key
 ```
 
-Replace both placeholders with the actual provider details. The server appends `/chat/completions` unless the URL already ends with it. The provider must accept the selected model and chat-completion payload, including JSON output mode.
+With neither LLM override set, the server uses `https://aicredits.in/v1`. This same-provider HTTPS route is reachable from this Codespace; the documented `api.aicredits.in` subdomain timed out during verification. QA and Markdown conversion use the same server-only key; Crawl4AI receives only its own key.
 
-If neither override is set, the legacy `AICREDITS_API_KEY` variable enables the built-in AI Credits gateway fallback. A partial override does not use that fallback. Scraping is independent of these credentials; websites and Python receive no provider key.
+On 9 October 2026, both live connectivity tests passed through the running Codespaces app: `deepseek/deepseek-v4.1-flash` for Q&A and `z-ai/glm-5.3-flash` for scraping. These checks verify model connectivity, not retailer extraction or review accuracy.
+
+To use an explicit OpenAI-compatible provider, set both `LLM_BASE_URL` and `LLM_API_KEY`. A partial override fails rather than using the AI Credits key with another destination. The server appends `/chat/completions` unless the URL already ends with it. The provider must accept the selected model and chat-completion payload, including JSON output mode.
 
 ### 3. Create the first administrator
 
@@ -174,7 +178,8 @@ This checks development HTML, database readiness, Vite, and the live-reload WebS
 | `APP_ORIGIN` | In production | Exact public HTTPS origin, e.g. `https://qa.example.com`, without path/query/credentials |
 | `LLM_BASE_URL` | For QA with `LLM_API_KEY` | Shared server-only provider endpoint |
 | `LLM_API_KEY` | For QA with `LLM_BASE_URL` | Shared server-only provider key |
-| `AICREDITS_API_KEY` | Legacy alternative | Used only when both LLM overrides are absent/empty |
+| `AICREDITS_API_KEY` | For AI Credits | Shared server-only key for `https://aicredits.in/v1`; used when both LLM overrides are absent/empty |
+| `CRAWL4AI_API_KEY` | For URL scraping | Server-only Crawl4AI cloud key; scraping also requires model credentials |
 | `PORT` | No | Express port, default `3000` |
 | `HOST` | No | Listening address, default `0.0.0.0`; use loopback where appropriate for native deployment |
 | `NODE_ENV` | Set for production | `production` serves built assets; other values start Vite middleware |
@@ -186,13 +191,14 @@ This checks development HTML, database readiness, Vite, and the live-reload WebS
 
 Production cookies are Secure, so a production browser session needs HTTPS. An HTTP request to the container is useful for `/healthz`, but is not a complete login test.
 
-### Shared QA settings
+### Shared model settings
 
 Admins edit these in **LLM Settings**. They persist in PostgreSQL and apply to new runs. Catalog generation shares the model, temperature, token limit, and evidence limit; QA instructions apply only to QA.
 
 | Setting | Fresh-install default | Accepted range/behavior |
 | --- | --- | --- |
 | QA model | `deepseek/deepseek-v4.1-flash` | Provider identifier; availability depends on the gateway |
+| Scraping / Markdown model | `z-ai/glm-5.3-flash` | Independent formatter model using the same server credentials |
 | Temperature | `0.1` | `0`–`1` |
 | Maximum output tokens | `4096` | Integer `1`–`65536`; the model/provider can impose a lower limit |
 | Maximum evidence characters | `40000` | Integer `1`–`200000`; limits web Markdown, not the entire prompt |
@@ -200,7 +206,7 @@ Admins edit these in **LLM Settings**. They persist in PostgreSQL and apply to n
 
 The exact default model receives `reasoning_effort: "low"`. Existing saved settings can differ. Compatibility concurrency/retry fields do not increase worker concurrency.
 
-**Test API** sends a short prompt to the displayed QA model, including unsaved model edits. It does not save settings, retrieve a page, or validate a complete QA answer. It uses the server key and can incur provider cost.
+**Test Q&A API** and **Test Markdown model** send a short prompt to their displayed model, including unsaved edits. They do not save settings, retrieve a page, or validate a complete task answer. They use the same server key and can incur provider cost. The remaining limits and QA instructions apply to mapping; Markdown conversion has fixed instructions and a 16,384-token ceiling.
 
 ## Your first review
 
@@ -208,7 +214,7 @@ The exact default model receives `reasoning_effort: "low"`. Existing saved setti
 2. In **Attribute Sets**, add or edit the category and save its Markdown rules. Seeded names initially have blank rules.
 3. Prepare a spreadsheet with SKU, category, attributes, and SAP evidence or a product URL.
 4. Upload in **Dashboard**. Check the import notification for duplicates and missing identifiers.
-5. For URLs, install the local browser worker, then use Dashboard's **Scrape URLs** on selected SKUs. Inspect the retrieved evidence; paste manual content when needed.
+5. For URLs, configure both Crawl4AI and model credentials, then use Dashboard's **Scrape URLs** on selected SKUs. Inspect the retrieved evidence; paste manual content when needed.
 6. Select products sharing one nonblank category and click **Create QA Job**. A SKU with SAP, usable saved Markdown, or a URL can join a job; URL-only SKUs scrape before QA.
 7. Open **Jobs** and run it. Closing the screen does not stop an accepted server run.
 8. Inspect the findings and source conflicts. Export through Jobs for detailed correction cells and notes.
@@ -365,28 +371,32 @@ This is a format example, not an approved production template. Add all required 
 
 `attributes__lulu_product_type` is the mandatory product-type header for Catalog uploads, downloaded input templates, and output-header lists. Older `attributes__product_type` headers cannot substitute in new Catalog uploads and must be removed from newly saved output lists. Startup renames that header in existing saved output lists, preserving order; if both names exist, the canonical header keeps its position. Earlier SKU uploads retain their original rows, and Catalog carries their old product-type value into the renamed column when no canonical value exists. Admitted runs and historical exports retain their saved header snapshots; rerun to generate output with the new header.
 
-## Browser retrieval
+## Cloud retrieval
 
-Retrieval uses one local Python worker and Chromium session per URL. **CloakBrowser** loads and reveals page content, **Scrapling** selects captured rendered HTML, and **Markdownify** converts it locally to Markdown. Conversion never fetches the page again. Earlier tab and dialog content survives subsequent interactions; headings, lists, tables, links, Unicode, numbers, and units are preserved. Scraping makes no model calls.
+Dashboard, Scraper URL previews, and durable QA/Catalog jobs share this pipeline:
 
-Install Python/system dependencies and run `npm run setup:scraper` before native development or deployment. Docker installs them during its build. See [worker setup and verification](docs/browser-scraper.md).
+`public URL → Crawl4AI cloud API → GLM Markdown cleanup → product evidence`
 
-The Scraper screen defaults to **Test URL** and works with an empty catalog. Enter a public URL to inspect rendered content, raw Markdown, duration, characters, interactions, unresolved controls, and warnings. Copy Markdown or download Markdown/JSON. Results are temporary, with no saved history. Authenticated `POST /api/scrape/preview` accepts only `{url}`, writes no catalog/job records, and makes no model calls. It returns collected/partial Markdown, requested/final URLs, capture time, and diagnostics; hard failures return sanitized errors/codes and available diagnostics without Markdown.
+Set server-only `CRAWL4AI_API_KEY` and model credentials (`AICREDITS_API_KEY`, or the complete `LLM_BASE_URL`/`LLM_API_KEY` pair). Both configurations are checked before collection. The cloud request follows the [official API reference](https://api.crawl4ai.com/llms.txt): one Bearer-authenticated `POST https://api.crawl4ai.com/scrape` with `{url, format: "md"}`. Proxy and region use the service defaults. There is no local fallback or automatic cloud retry.
 
-Use Dashboard's **Scrape URLs**, or select an existing SKU in Scraper's **Save to SKU** mode, to save evidence through `POST /api/catalog/:sku/scrape` with `{expectedRevision}`; the server obtains the URL from the saved row. Success means the database commit completed. Source URL edits are saved before scraping. A newer edit, competing scrape, or deletion rejects a stale save. Bulk progress distinguishes saved, failed, conflicted, and skipped SKUs and supports cancellation.
+The existing `scraperModelName` defaults to `z-ai/glm-5.3-flash`, independently of QA. Cleanup removes navigation, cookie banners, unrelated promotions, recommendations, and duplicate boilerplate. It preserves source language, product facts, identifiers, specifications, numbers, currencies, variants, tables, and relevant links. Page instructions are treated as untrusted content. Temperature is fixed at `0.1`, with 16,384 output tokens and bounded model retries that reuse the collected Markdown. These instructions cannot prove factual preservation; inspect live results.
 
-Saved provenance records browser/manual/legacy evidence, requested/final URLs where known, and capture time. Failed or partial attempts preserve prior evidence and set a separate scrape error; partial captures stay out of automatic SKU QA. Manual Markdown works without a URL. Browser evidence from an older source URL remains viewable but is excluded from QA. Existing evidence/history and retired database data are preserved; the old `/api/scrape` endpoint, AI navigation, and personal scraper settings are retired.
+Scraper defaults to **Test URL** and works with an empty catalog. Authenticated `POST /api/scrape/preview` accepts only `{url}`, returns temporary cleaned Markdown and diagnostics, and writes no catalog/jobs/runs. Copy/download, duration, character count, and cancellation remain available. Unknown interaction diagnostics are hidden. **Test Markdown model** in Settings checks only model connectivity; **Test URL** checks the complete paid pipeline.
+
+Use Dashboard's **Scrape URLs**, or Scraper's **Save to SKU**, to save evidence with `POST /api/catalog/:sku/scrape` and `{expectedRevision}`. The server obtains the URL from the saved row. A newer edit, competing scrape, or deletion rejects a stale save. Bulk progress distinguishes saved, failed, conflicted, and skipped SKUs and supports cancellation.
+
+New provenance uses `method: "cloud"`, `crawler: "crawl4ai"`, the formatter's `modelName`, requested URL, and `receivedAt`. The current API supplies neither final URL nor capture time: `finalUrl` and `capturedAt` stay null. Receipt time is labeled **Received**, never **Captured**. Browser/manual/legacy evidence and historical runs remain readable. A source change excludes old URL evidence from automatic processing. Failed retrieval or invalid/empty/refused/truncated cleanup preserves previously saved evidence. Jobs retain SAP fallback.
 
 | Retrieval limit | Value |
 | --- | --- |
-| Browser admission | One active, eight queued; 60-second queue wait |
-| Execution deadline after admission | 120 seconds |
-| Interaction budget | 20 clicks and 20 scroll steps |
-| Worker output | 4 MiB; Markdown including source URLs at most 200,000 characters |
+| Cloud admission | One active, eight queued; 60-second queue wait |
+| Retrieval deadline after admission | 120 seconds, including DNS and response reading |
+| Cleanup deadline | Separate 120 seconds, including model admission/retries |
+| Job execution budget | Existing five minutes |
+| Response size | 4 MiB for each upstream response |
+| Markdown size | 200,000 characters, including appended source footer |
 
-A DNS-pinning loopback egress proxy validates every connection, including redirects and subresources, and prevents private-network access and DNS rebinding. Service workers and WebSockets are blocked. Navigation and product/offer parameter changes, forms, purchases, and variant controls are restricted.
-
-Readiness checks wait for stable rendered content and relevant loading requests; dialog content is collected before background controls. Visible details outside `main` are retained. Unsupported relevant panels or exhausted collection budgets return a **Partial** preview and `INCOMPLETE_CONTENT` for SKU/QA callers. The UI also reports **Content collected**, **Blocked**, or **Failed**. Private-target failures discard text; blocked ancillary resources and frame/shadow-root limitations receive advisories. A page result does not certify an entire website as fully scrapeable. Public-page access still depends on the site and IP reputation. Use SAP/manual evidence when retrieval fails. Paid proxies, CAPTCHA services, and OCR are not included.
+Public HTTP(S) input and all initial DNS answers are validated before the cloud request. Private addresses and embedded credentials are rejected. Crawl4AI performs page navigation remotely; the app no longer runs a browser or DNS-pinning proxy. API redirects are rejected, and keys go only to their respective providers. Safe errors distinguish bad keys, exhausted credits, rate limits, blocked/login pages, busy service, network failure, and invalid content. Upstream key failures do not sign users out. A page result cannot certify an entire website as fully scrapeable. Use SAP/manual evidence when a site cannot be retrieved. See [configuration and verification](docs/browser-scraper.md).
 
 ## Jobs, recovery, and cancellation
 
@@ -412,7 +422,7 @@ Run snapshots store evidence, not proof that QA happened. Newly skipped items wi
 - Attempt counts are recorded before dispatch and survive restart.
 - A QA request has a 120-second deadline after admission and the durable attempt checkpoint.
 - QA and admin connectivity tests share two active calls and eight waiting slots per process, with a 60-second queue wait cap.
-- Browser retrieval shares one active slot and eight queued requests across Scraper, Dashboard, and background jobs.
+- Cloud retrieval shares one active slot and eight queued requests across Scraper, Dashboard, and background jobs.
 
 ### Recovery
 
@@ -601,7 +611,7 @@ npm run build
 
 The fast suite covers TypeScript, auth origins, provider limits/retries, catalog import/result trust, job state/exports, transaction recovery, response parsing, settings/QA contracts, and scraping contracts. Provider responses are mocked; no API credits are spent.
 
-`lint` is **`tsc --noEmit`**, not ESLint. Strict TypeScript is not enabled. `npm test` excludes database and browser suites. Run `npm run test:scrape-worker`, `npm run test:scrape-browser`, and the [production smoke check](docs/browser-scraper.md#verify-before-rollout) separately.
+`lint` is **`tsc --noEmit`**, not ESLint. Strict TypeScript is not enabled. `npm test` excludes database and browser suites. Run the browser/database suites and the [production smoke check](docs/browser-scraper.md#verify-before-rollout) separately.
 
 ### Database checks
 
@@ -648,10 +658,9 @@ The historically named browser script also checks QA settings, SKU-connected Mar
 | `npm run test:job-runner` | Transaction retries/rollback |
 | `npm run test:llm-response` | Parsing/output budgets |
 | `npm run test:qa-agent` | Settings and QA contracts |
-| `npm run test:scraper` | Worker protocol, queue, DNS proxy, cancellation, SKU requests and standalone preview/auth contracts |
-| `npm run test:scrape-worker` | Python selection, Markdown and deterministic interactions |
-| `npm run test:scrape-browser` | Real CloakBrowser/Scrapling/Markdownify fixtures |
-| `npm run test:scrape-production` | Production standalone URL previews, SKU persistence/revisions, URL-only QA, legacy migration, login and memory smoke |
+| `npm run test:scraper` | Cloud authentication, URL/DNS restrictions, queue, deadlines, cleanup/retries, cancellation, SKU requests and preview contracts |
+| `npm run test:scrape-production` | Production-bundle preview, SKU persistence, URL-only jobs, compatibility and login with both providers mocked |
+| `npm run test:scrape-live` | Paid cloud/GLM check with raw/cleaned Markdown comparison; optional case-name filter |
 | `npm run test:security-db` | Disposable-database auth/jobs |
 | `npm run test:qa-config-db` | Disposable-database configuration |
 | `npm run test:sap-editor` | Mocked browser checks |
@@ -668,17 +677,18 @@ The database suites used an isolated local PostgreSQL 15 instance and disposable
 
 ## Production deployment
 
+The app has not been deployed. These instructions apply only to a future production installation.
+
 ### Release decision
 
 Build artifacts and container configuration exist, but a successful build is not production approval. The QA import/result trust issue is fixed in this source. Resolve the review's remaining credential and dependency findings, then verify the intended database, HTTPS gateway, and provider contracts before unrestricted access.
 
-There is no checked-in automatic deployment workflow. Pushing to GitHub does not itself pull source, build an image, restart a service, or update Tailscale routing.
+There is no checked-in automatic deployment workflow. Pushing to GitHub does not publish the app or restart a hosted service.
 
 ### Without Docker
 
 ```bash
 npm ci
-npm run setup:scraper
 npm test
 npm run build
 NODE_ENV=production npm start
@@ -724,18 +734,7 @@ curl -fsS http://127.0.0.1:3200/healthz
 
 Route the public HTTPS gateway to the private listener. A separate Basic authentication gate can be an additional barrier; its configuration is host-specific and absent here. Docker health failures mark the container unhealthy; the restart policy does not automatically restart a still-running unhealthy container.
 
-Several build tools are currently classified as production dependencies. Production retrieval uses the Python worker and its pinned CloakBrowser Chromium binary; the npm Playwright installation is used for UI tests.
-
-### Existing installations
-
-Two historical setups are documented; neither was remotely inspected in this review:
-
-| Record | Pattern | Guidance |
-| --- | --- | --- |
-| Original Project 22 host | Docker in `/opt/paxth-qa`, private listener, Caddy gate, dedicated Tailscale Funnel | Verify actual host/gateway configuration; historical notes are in security/jobs documentation |
-| `vps-38no` | Native systemd, versioned release and `current` symlink, Caddy/Tailscale | Use the [VPS runbook](docs/vps-38no.md) |
-
-Use the runbook matching the actual host. Do not apply Docker commands to a native service or reset shared gateway/Tailscale settings. Python/browser requirements for this source version are documented in the browser worker setup.
+Several build tools are currently classified as production dependencies. Production retrieval uses native fetch with Crawl4AI cloud and the shared model provider; npm Playwright is used only for UI tests.
 
 ### Updates and rollback
 
@@ -771,9 +770,9 @@ docker image tag paxth-qa:previous paxth-qa:local
 docker compose up -d --no-build --no-deps --force-recreate app
 ```
 
-This rolls back the image, not schema/configuration/data. Do not automatically restore an old database over newer data. Native rollback restores the prior symlink/service release as described in its runbook.
+This rolls back the image, not schema/configuration/data. Do not automatically restore an old database over newer data. A future native installation needs its own tested service and release rollback procedure.
 
-For the Basic-auth gateway topology expected by the public verification script, temporarily supply `QA_USERNAME`, `QA_PASSWORD`, `APP_USERNAME`, and `APP_PASSWORD`, then run:
+If a future installation adds a Basic-auth gateway, temporarily supply `QA_USERNAME`, `QA_PASSWORD`, `APP_USERNAME`, and `APP_PASSWORD`, then run the public verification script with that installation's explicit HTTPS URL:
 
 ```bash
 node scripts/verify-public-access.mjs https://your-real-qa-hostname/
@@ -810,7 +809,8 @@ Start with paginated summary APIs, relevant progress polling, bulk/bounded write
 | Correct login returns 429 | Global attempt cap or two active password hashes |
 | Provider missing | Both LLM overrides, or neither plus legacy key; restart after env changes |
 | Model fails while readiness passes | Model availability, credentials, quota, supported payload |
-| Scrape fails | Worker setup, saved SKU URL, challenge, timeout; inspect scrape error or use SAP/manual evidence |
+| Model connection fails with a hostname/error code | Server DNS, TLS, or outbound connectivity to that hostname; the AI Credits default uses `https://aicredits.in/v1` |
+| Scrape fails | Check both cloud/model keys and credits, saved URL, blocked/login page, rate limit or timeout; inspect scrape error or use SAP/manual evidence |
 | SKU cannot create a job | Supply SAP, usable saved Markdown, or a URL, and use one nonblank category |
 | Job waits in queue | Worker, older jobs, session-pooler mode, database/provider latency |
 | Queued cancellation waits | Worker must reach it after older work |
@@ -820,13 +820,12 @@ Start with paginated summary APIs, relevant progress polling, bulk/bounded write
 | Combined export rejected | One identical category and compatible original headers |
 | Summary counters wrong | Obsolete issue types; inspect Jobs findings |
 | Browser tests fail before assertions | Install Chromium OS libraries and inspect launch error |
-| GitHub changed but live app did not | Deploy/rebuild the commit; restarting an old image is insufficient |
+| Codespaces app shows older code | Check the branch, development-server output, and browser reload |
 | Settings vanish after refresh | Save errors/database reachability; notifications are temporary |
 
 ## Further documentation
 
 - [Codebase review](docs/codebase-review.md): ratings, defects, scaling analysis, prioritized work, and actual validation limits.
 - [Security and durable jobs](docs/security-and-jobs.md): implementation details and historical validation; older sections include retired retrieval designs.
-- [vps-38no runbook](docs/vps-38no.md): host-specific history; confirm current state before operating it.
 
 There is no root `LICENSE` file. Individual source headers do not establish repository-wide licensing; confirm intended licensing before distribution.

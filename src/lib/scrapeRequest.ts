@@ -1,6 +1,6 @@
 import type { SkuData } from '../hooks/useCatalogData';
 import { api } from './api';
-import type { ScrapePreview } from './browserScrape';
+import type { ScrapePreview } from './cloudScrape';
 
 export async function previewScrapeUrl(url: string, signal?: AbortSignal): Promise<ScrapePreview> {
   const result = await api<ScrapePreview>('/api/scrape/preview', { method: 'POST', body: JSON.stringify({ url }), signal });

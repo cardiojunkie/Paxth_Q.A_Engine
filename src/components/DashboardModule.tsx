@@ -993,7 +993,7 @@ export function DashboardModule() {
             <div className="flex-1 p-6 overflow-hidden flex flex-col bg-gray-50 gap-3">
               {viewedEvidence?.scrape_metadata && <p className="text-xs text-[#8C8882]">
                 Evidence: {viewedEvidence.scrape_metadata.method}
-                {viewedEvidence.scrape_metadata.capturedAt && ` · ${new Date(viewedEvidence.scrape_metadata.capturedAt).toLocaleString()}`}
+                {viewedEvidence.scrape_metadata.capturedAt ? ` · Captured: ${new Date(viewedEvidence.scrape_metadata.capturedAt).toLocaleString()}` : viewedEvidence.scrape_metadata.receivedAt && ` · Received: ${new Date(viewedEvidence.scrape_metadata.receivedAt).toLocaleString()}`}
                 {viewedEvidence.scrape_metadata.requestedUrl && ` · ${viewedEvidence.scrape_metadata.requestedUrl}`}
                 {viewedEvidence.scrape_metadata.finalUrl && viewedEvidence.scrape_metadata.finalUrl !== viewedEvidence.scrape_metadata.requestedUrl && ` → ${viewedEvidence.scrape_metadata.finalUrl}`}
               </p>}

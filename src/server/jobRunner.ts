@@ -7,15 +7,15 @@ import { prepareQaInput } from '../lib/qaAgent';
 import { buildQaRequest, parseQaResponse } from '../lib/qaRequest';
 import { hasCompletedQa, unreviewedRunSnapshot, withoutRawQaResult } from '../lib/jobRunState';
 import { normalizeSettings } from '../lib/providerSettings';
-import { scrapePage } from '../lib/browserScrape';
+import { scrapeProductPage } from './scrapePipeline';
 import { usableScrapedMarkdown } from '../lib/scrapeEvidence';
 import { ProviderError } from '../lib/chatCompletion';
 import { completeQa, getProviderCredentials, getProviderSettings } from './provider';
-import { ApiError, mapCatalogRow, saveScrapedEvidence, saveScrapeFailure, prepareJobCatalogOutputs } from './catalog';
+import { ApiError, mapCatalogRow, saveScrapedEvidence, saveScrapeFailure, scrapedMetadata, prepareJobCatalogOutputs } from './catalog';
 import { CATALOG_PASS_THROUGH_HEADERS, catalogPassThroughValue, hasCompletedCatalog, prepareCatalogInput, parseCatalogResponse } from '../lib/catalogGeneration';
 import { catalogMappings, catalogMappingFor, prepareCatalogOutputs } from '../lib/catalogFiles';
 
-// ponytail: global mutation lock and one worker fit this deployment; partition by job if throughput requires it.
+// ponytail: global mutation lock and one worker fit this backend; partition by job if throughput requires it.
 export const JOB_MUTATION_LOCK = 73462190;
 const WORKER_LOCK = 73462191;
 const ACTIVE = ['queued', 'running', 'cancelling'];
@@ -261,7 +261,7 @@ async function finishRun(client: PoolClient, run: any, owner: string) {
   });
 }
 
-async function executeRun(client: PoolClient, pool: Pool, run: any, owner: string, ownership: AbortSignal, scrape: typeof scrapePage) {
+async function executeRun(client: PoolClient, pool: Pool, run: any, owner: string, ownership: AbortSignal, scrape: typeof scrapeProductPage) {
   const settings = normalizeSettings(run.configuration.settings);
   const isCatalog = run.configuration.jobType === 'catalog';
   while (!ownership.aborted) {
@@ -300,9 +300,9 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
             await assertOwner(client, run.id, owner);
             await client.query('UPDATE job_run_items SET scrape_started=true WHERE run_id=$1 AND sku=$2', [run.id, item.sku]);
           });
-          let retrieved: Awaited<ReturnType<typeof scrapePage>> | undefined;
+          let retrieved: Awaited<ReturnType<typeof scrapeProductPage>> | undefined;
           let retrievalFailure: unknown;
-          try { retrieved = await scrape(snapshot.source.url, execution); }
+          try { retrieved = await scrape(snapshot.source.url, execution, settings); }
           catch (error) {
             execution.throwIfAborted();
             retrievalFailure = error;
@@ -317,7 +317,7 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
             // A newer live revision keeps this evidence in run history only.
             const nextRevision = saved && retrieved ? saved.revision : item.revision;
             const nextSnapshot: SkuData = retrieved ? { ...snapshot, revision: nextRevision, scraped_markdown: retrieved.markdown,
-              scrape_metadata: saved?.scrape_metadata || { method: 'browser', requestedUrl: retrieved.requestedUrl, finalUrl: retrieved.finalUrl, capturedAt: new Date().toISOString() },
+              scrape_metadata: saved?.scrape_metadata || scrapedMetadata(retrieved),
               scrape_status: 'success', scrape_error: null } : snapshot;
             await client.query('UPDATE job_run_items SET snapshot=$3,revision=$4 WHERE run_id=$1 AND sku=$2', [run.id, item.sku, JSON.stringify(nextSnapshot), nextRevision]);
             execution.throwIfAborted();
@@ -384,7 +384,7 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
   }
 }
 
-export function startJobWorker(pool: Pool, scrape = scrapePage): () => Promise<void> {
+export function startJobWorker(pool: Pool, scrape = scrapeProductPage): () => Promise<void> {
   const stop = new AbortController();
   const task = (async () => {
     while (!stop.signal.aborted) {

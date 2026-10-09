@@ -1,7 +1,7 @@
 import type { Express } from 'express';
-import { collectPage, ScrapeError, validateScrapeInput } from '../lib/browserScrape';
+import { collectPage, ScrapeError, validateScrapeInput } from '../lib/cloudScrape';
 
-export function registerScrapeRoutes(app: Express, collect = collectPage) {
+export function registerScrapeRoutes(app: Express, collect: typeof collectPage) {
   app.post('/api/scrape/preview', async (req, res) => {
     const controller = new AbortController();
     const disconnect = () => { if (!res.writableEnded) controller.abort(); };
@@ -16,7 +16,7 @@ export function registerScrapeRoutes(app: Express, collect = collectPage) {
       if (!res.destroyed) res.json(result);
     } catch (error) {
       if (!res.destroyed) res.status(error instanceof ScrapeError ? error.status : controller.signal.aborted ? 499 : 503).json({
-        error: error instanceof ScrapeError ? error.message : controller.signal.aborted ? 'URL retrieval was cancelled.' : 'The browser service could not complete retrieval.',
+        error: error instanceof ScrapeError ? error.message : controller.signal.aborted ? 'URL retrieval was cancelled.' : 'The scraping service could not complete retrieval.',
         code: error instanceof ScrapeError ? error.code : controller.signal.aborted ? 'CANCELLED' : 'RETRIEVAL_FAILED',
         ...(error instanceof ScrapeError && error.report ? { report: error.report } : {}),
       });

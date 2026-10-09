@@ -22,10 +22,13 @@ export interface SkuData {
   scraped_markdown?: string;
   scrape_status?: "success" | "failed" | "skipped_no_url";
   scrape_metadata?: {
-    method: 'browser' | 'manual' | 'legacy';
+    method: 'cloud' | 'browser' | 'manual' | 'legacy';
     requestedUrl: string | null;
     finalUrl: string | null;
     capturedAt: string | null;
+    receivedAt?: string;
+    crawler?: 'crawl4ai';
+    modelName?: string;
   } | null;
   scrape_error?: string | null;
   qa_stale?: boolean;

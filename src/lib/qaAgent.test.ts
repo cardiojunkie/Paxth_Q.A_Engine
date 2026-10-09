@@ -26,6 +26,10 @@ assert.equal(usableScrapedMarkdown(browserEvidence), '');
 assert.equal(prepareQaInput(browserEvidence, [set], 'Memory', 40000).webAvailable, false);
 assert.throws(() => prepareQaInput({ ...browserEvidence, source: { url: sku.source.url } }, [set], 'Memory', 40000), /no usable SAP/);
 assert.equal(usableScrapedMarkdown({ ...browserEvidence, source: { url: 'example.com/old#details' } }), sku.scraped_markdown);
+const cloudEvidence: SkuData = { ...browserEvidence, scrape_metadata: { ...browserEvidence.scrape_metadata!, method: 'cloud', finalUrl: null, capturedAt: null, receivedAt: '2026-10-09T00:00:00Z' } };
+assert.equal(usableScrapedMarkdown(cloudEvidence), '', 'Source changes invalidate cloud evidence too');
+assert.equal(usableScrapedMarkdown({ ...cloudEvidence, source: { url: 'example.com/old#details' } }), sku.scraped_markdown);
+assert.equal(usableScrapedMarkdown({ ...browserEvidence, source: { url: 'example.com/old' }, scrape_metadata: { ...browserEvidence.scrape_metadata!, method: 'legacy' } }), sku.scraped_markdown);
 assert.equal(usableScrapedMarkdown({ ...browserEvidence, source: {}, scrape_metadata: { method: 'manual', requestedUrl: null, finalUrl: null, capturedAt: null } }), sku.scraped_markdown);
 const input = prepareQaInput(sku, [set], "Custom instructions", 40000);
 const requestSettings = normalizeSettings({

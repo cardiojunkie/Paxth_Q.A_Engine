@@ -1,4 +1,4 @@
-import type { ScrapeReport } from './browserScrape';
+import type { ScrapeReport } from './cloudScrape';
 
 export class ApiError extends Error {
   constructor(message: string, public status: number, public code?: string, public report?: ScrapeReport) { super(message); }

@@ -13,7 +13,7 @@ process.env.LLM_BASE_URL='https://provider.example/v1';process.env.LLM_API_KEY='
 try {
   process.env.AICREDITS_API_KEY='legacy-test-only';
   delete process.env.LLM_BASE_URL;delete process.env.LLM_API_KEY;
-  assert.deepEqual(getProviderCredentials(),{baseUrl:'https://api.aicredits.in/v1',apiKey:'legacy-test-only'});
+  assert.deepEqual(getProviderCredentials(),{baseUrl:'https://aicredits.in/v1',apiKey:'legacy-test-only'});
   process.env.LLM_BASE_URL='https://provider.example/v1';
   assert.throws(()=>getProviderCredentials(),/Configure both/, 'Never send the legacy key to an overridden destination');
   delete process.env.LLM_BASE_URL;process.env.LLM_API_KEY='test-only';
@@ -45,6 +45,26 @@ try {
   } finally {process.env.LLM_API_KEY='test-only';}
   await assert.rejects(completeQa({},new AbortController().signal,{onAttemptError:async()=>{throw new Error('failure checkpoint unavailable');}}),/failure checkpoint unavailable/);
   assert.equal(calls,2,'A failed error checkpoint must not trigger another provider attempt');
+  for (const [cause, expectedCode] of [
+    [Object.assign(new Error('test-only Bearer private-token'), { code: 'ENOTFOUND' }), 'ENOTFOUND'],
+    [Object.assign(new AggregateError([
+      Object.assign(new Error('test-only'), { code: 'ETIMEDOUT' }),
+      Object.assign(new Error('private-token'), { code: 'ENETUNREACH' }),
+    ]), { code: 'ETIMEDOUT' }), 'ETIMEDOUT'],
+    [new AggregateError([Object.assign(new Error('test-only'), { code: 'ECONNREFUSED' })]), 'ECONNREFUSED'],
+    [Object.assign(new Error('test-only'), { code: 'CERT_HAS_EXPIRED' }), 'CERT_HAS_EXPIRED'],
+    [Object.assign(new Error('test-only Bearer private-token'), { code: 'test-only' }), undefined],
+    [undefined, undefined],
+  ] as const) {
+    globalThis.fetch = async () => { throw new TypeError('test-only Bearer private-token', { cause }); };
+    await assert.rejects(fetchChatCompletion(process.env.LLM_BASE_URL!,process.env.LLM_API_KEY!,{},AbortSignal.timeout(2000)), error => {
+      assert.ok(error instanceof ProviderError);
+      assert.equal(error.status, 502); assert.equal(error.retryable, true);
+      assert.equal(error.message, `The model connection to provider.example failed${expectedCode ? ` (${expectedCode})` : ''}. Check server network and provider reachability.`);
+      assert.doesNotMatch(error.message, /test-only|private-token|Bearer|\/v1/);
+      return true;
+    });
+  }
   const nativeTimeout=AbortSignal.timeout,windows:number[]=[];
   AbortSignal.timeout=(ms:number)=>{windows.push(ms);return nativeTimeout(ms);};
   try {
@@ -94,6 +114,8 @@ try {
     assert.throws(() => validateSettings({ ...editableSettings(DEFAULT_SETTINGS), [retired]: 'retired' }), /Invalid/);
   }
   assert.equal(validateSettings({ ...editableSettings(DEFAULT_SETTINGS), modelName: ' custom/qa ' }).modelName, 'custom/qa');
+  assert.equal(validateSettings({ ...editableSettings(DEFAULT_SETTINGS), scraperModelName: ' custom/scrape ' }).scraperModelName, 'custom/scrape');
+  for (const scraperModelName of ['', ' ', 12, 'x'.repeat(257)]) assert.throws(() => validateSettings({ ...editableSettings(DEFAULT_SETTINGS), scraperModelName }), /Invalid/);
   const sanitized=await providerResponseError(Response.json({error:{message:'Invalid test-only Bearer secret sk-other-secret'}},{status:401}), 'test-only');
   assert.equal(sanitized.status,502);assert.doesNotMatch(sanitized.message,/test-only|Bearer secret|sk-other-secret/);
   const app=express();app.use(express.json());
@@ -152,12 +174,22 @@ try {
     assert.equal(missing.status,503);assert.match(missing.body.error,/Configure both/);
     process.env.AICREDITS_API_KEY='legacy-test-only';
     globalThis.fetch=async(url,init)=>{
-      assert.equal(String(url),'https://api.aicredits.in/v1/chat/completions');
+      assert.equal(String(url),'https://aicredits.in/v1/chat/completions');
       assert.equal(new Headers(init?.headers).get('Authorization'),'Bearer legacy-test-only');
       assert.doesNotMatch(String(init?.body),/legacy-test-only/);
       return Response.json({choices:[{finish_reason:'stop',message:{content:'OK'}}]});
     };
     assert.equal((await request({purpose:'qa',modelName:'draft/qa'})).status,200,'The existing key restores connectivity without copying secrets');
+    assert.equal((await request({purpose:'scrape',modelName:'draft/scrape'})).body.modelName,'draft/scrape');
+    assert.equal((await request({purpose:'scrape'})).body.modelName,DEFAULT_SETTINGS.scraperModelName);
+    assert.deepEqual(await completeQa({ model: DEFAULT_SETTINGS.modelName }, AbortSignal.timeout(2000)), { choices: [{ finish_reason: 'stop', message: { content: 'OK' } }] });
+    globalThis.fetch = async () => { throw new TypeError('legacy-test-only Bearer private-token', { cause: Object.assign(new Error('private-token'), { code: 'ETIMEDOUT' }) }); };
+    for (const purpose of ['qa', 'scrape']) {
+      const failed = await request({ purpose });
+      assert.equal(failed.status, 502);
+      assert.match(failed.body.error, /aicredits\.in.*ETIMEDOUT/);
+      assert.doesNotMatch(failed.body.error, /legacy-test-only|private-token|Bearer/);
+    }
   } finally {http.closeAllConnections();await new Promise<void>(resolve=>http.close(()=>resolve()));}
   console.log('Provider checks passed: retry counts, persistent attempts, stalled bodies, admission, and settings validation.');
 }finally{

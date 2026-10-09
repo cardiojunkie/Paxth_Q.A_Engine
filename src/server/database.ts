@@ -5,7 +5,7 @@ export async function transaction<T>(pool: Pool, work: (client: PoolClient) => P
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // ponytail: serialize writes for this single-worker deployment; split locks only if measured contention warrants it.
+    // ponytail: serialize writes for this single-worker backend; split locks only if measured contention warrants it.
     await client.query('SELECT pg_advisory_xact_lock($1)', [DATA_LOCK]);
     const result = await work(client);
     await client.query('COMMIT');

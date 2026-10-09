@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 
-// QA_PASSWORD=... APP_USERNAME=... APP_PASSWORD=... node scripts/verify-public-access.mjs [https://hostname/]
-const base = new URL(process.argv[2] ?? 'https://project22.tail608e42.ts.net/');
+// QA_PASSWORD=... APP_USERNAME=... APP_PASSWORD=... node scripts/verify-public-access.mjs https://hostname/
+assert.ok(process.argv[2], 'Supply the HTTPS URL of the installation to verify');
+const base = new URL(process.argv[2]);
 assert.equal(base.protocol, 'https:', 'Use HTTPS for the public password gate');
-assert.ok(process.env.QA_PASSWORD, 'Set QA_PASSWORD to the existing gate password');
+assert.ok(process.env.QA_PASSWORD, 'Set QA_PASSWORD to the configured gate password');
 const user = process.env.QA_USERNAME ?? 'paxth-admin';
 const authorization = password => `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`;
 const request = (url, password, cookie) => fetch(url, {

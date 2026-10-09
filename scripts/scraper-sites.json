@@ -1,0 +1,110 @@
+[
+  {
+    "name": "Noon — Galaxy S25",
+    "url": "https://www.noon.com/uae-en/galaxy-s25-ai-dual-sim-silver-shadow-12gb-ram-256gb-5g-middle-east-version/N70140511V/p/",
+    "facts": [
+      "Galaxy S25",
+      "256GB",
+      "12GB"
+    ]
+  },
+  {
+    "name": "Noon — iPhone 16",
+    "url": "https://www.noon.com/uae-en/iphone-16-128gb-black-5g-with-facetime-international-version/N70106131V/p/?o=cd3d8e6bfd17200a",
+    "facts": [
+      "iPhone 16",
+      "128GB",
+      "Black"
+    ]
+  },
+  {
+    "name": "Amazon — Galaxy S24 Ultra",
+    "url": "https://www.amazon.ae/SAMSUNG-Storage-Titanium-Android-Smartphone/dp/B0CQZ22Q7L",
+    "facts": [
+      "Galaxy S24 Ultra",
+      "256GB",
+      "200MP"
+    ]
+  },
+  {
+    "name": "Amazon — Galaxy A16",
+    "url": "https://www.amazon.ae/Samsung-Storage-Security-Updates-5000mAh/dp/B0DJMKSSW2",
+    "facts": [
+      "Galaxy A16",
+      "128GB",
+      "5000mAh"
+    ]
+  },
+  {
+    "name": "Carrefour — Samsung 459L fridge",
+    "url": "https://www.carrefouruae.com/mafuae/en/fridge-401l-to-500l/samsung-fridge-rb50dg632es9ae-459l/p/2164728",
+    "facts": [
+      "RB50DG632ES9",
+      "459",
+      "Samsung"
+    ]
+  },
+  {
+    "name": "Carrefour — Samsung 500L fridge",
+    "url": "https://www.carrefouruae.com/mafuae/en/fridge-401l-to-500l/samsung-500l-gross-capacity-refrigerator-rt50cg6400s9sg-refined-inox-silver/p/8806094920956?offer=offer_1024118555&sellerId=18555&sid=DEFAULT",
+    "facts": [
+      "RT50CG6400S9",
+      "500",
+      "Samsung"
+    ]
+  },
+  {
+    "name": "Sharaf DG — Samsung washer",
+    "url": "https://uae.sharafdg.com/product/samsung-front-load-washer-9-kg-ww90dg5u34aegu/",
+    "facts": [
+      "WW90DG5U34AE",
+      "9kg",
+      "Samsung"
+    ]
+  },
+  {
+    "name": "Sharaf DG — Galaxy A36",
+    "url": "https://uae.sharafdg.com/product/samsung-galaxy-a36-5g-128gb-6gb-ram-awesome-lavender-smartphone/",
+    "facts": [
+      "Galaxy A36",
+      "128GB",
+      "Lavender"
+    ]
+  },
+  {
+    "name": "Lulu — iPhone 17 Pro Max",
+    "url": "https://gcc.luluhypermarket.com/en-ae/apple-iphone-17-pro-max-5g-smartphone-1-tb-storage-deep-blue/p/2565687/?color=Deep+Blue",
+    "facts": [
+      "iPhone 17 Pro Max",
+      "1TB",
+      "Deep Blue"
+    ]
+  },
+  {
+    "name": "Lulu — Galaxy A36",
+    "url": "https://gcc.luluhypermarket.com/en-ae/samsung-galaxy-a36-5g-smartphone-8-ram-awesome-lime/p/2452038/?color=Awesome+Lime",
+    "facts": [
+      "Galaxy A36",
+      "256GB",
+      "Awesome Lime"
+    ]
+  },
+  {
+    "name": "Jumbo — iPhone 16",
+    "url": "https://www.jumbo.ae/apple-iphone-16-smartphone-ultramarine-512-gb.html",
+    "facts": [
+      "iPhone 16",
+      "512GB",
+      "Ultramarine"
+    ]
+  },
+  {
+    "name": "Jumbo — Galaxy S25",
+    "url": "https://www.jumbo.ae/samsung-galaxy-s25-5g-smartphone-navy-256-gb.html",
+    "facts": [
+      "Galaxy S25",
+      "256GB",
+      "4000mAh"
+    ]
+  }
+]

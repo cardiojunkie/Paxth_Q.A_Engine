@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {previewScrapeUrl, scrapeCatalogSku} from './scrapeRequest';
-import type { ScrapePreview } from './browserScrape';
+import type { ScrapePreview } from './cloudScrape';
 import type { SkuData } from '../hooks/useCatalogData';
 import { ApiError } from './api';
 const original=globalThis.fetch;

@@ -64,16 +64,10 @@ Apply these rules only to the `Elec-M&W-MA-Power Adapters / Chargers & Utility C
 * **`attributes__other_information`**: Use only for relevant source-supported details without a dedicated field. It MUST NOT contradict or hide core interface, power, wattage, compatibility, or safety information. Flag factual contradictions as CRITICAL and irrelevant or duplicated content as MODERATE.
 * **`note`**: Use for verified limitations, requirements, and customer-facing caveats, such as cable/adapter not included, shared output limits, charging-only cable, required protocol, or regional plug compatibility. Flag a missing caveat that materially affects safe use, compatibility, or expected performance as MODERATE; flag a note that contradicts the source as CRITICAL.
 
-## Cross-Field Checks
+## Cross-Field Checkss
 
 * `name`, `attributes__product_title`, all bullet points, `attributes__product_description`, `attributes__features`, `attributes__other_information`, and `note` MUST agree with the structured identity, interface, power, compatibility, and safety fields.
 * `attributes__interfaces` and `attributes__ports` MUST describe one consistent connector layout. `attributes__power` and `attributes__wattage` MUST describe one consistent electrical profile.
 * `attributes__no_of_pieces`, `attributes__pack`, `attributes__package_contents`, and `attributes__in_the_box` MUST describe one consistent selling configuration.
-* `attributes__weight` and `attributes__product_dimensions` MUST refer to the product; `attributes__shipping_weight` and `attributes__package_dimensions` MUST refer to the packed item.
+* `attributes__weight` and `attributes__product_dimensions` MUST refer to the product; `attributes__shipping_weight` and `attributes__package_dimensions` MUST refer to the packed items.
 * `attributes__compatible_models` and `attributes__compatible_devices` MUST be supported by the stated interfaces, electrical ratings, protocols, and source limitations.
-
-
-
-
-
-

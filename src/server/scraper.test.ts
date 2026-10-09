@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer, request } from 'node:http';
 import express from 'express';
 import type { Pool } from 'pg';
-import { ScrapeError, type ScrapePreview, type ScrapeReport } from '../lib/browserScrape';
+import { ScrapeError, type ScrapePreview, type ScrapeReport } from '../lib/cloudScrape';
 import { registerAuth } from './auth';
 import { registerScrapeRoutes } from './scraper';
 
@@ -23,8 +23,8 @@ const collect = async (url: string, signal: AbortSignal): Promise<ScrapePreview>
   const kind = new URL(url).pathname;
   if (kind === '/blocked') throw new ScrapeError('The website blocked access.', 502, 'PAGE_BLOCKED', report);
   if (kind === '/private-dns') throw new ScrapeError('The URL must resolve exclusively to public internet addresses.', 400, 'PRIVATE_ADDRESS', report);
-  if (kind === '/queue-full') throw new ScrapeError('The browser queue is full. Retry shortly.', 503, 'QUEUE_FULL');
-  if (kind === '/failure') throw new Error('Secret worker log and provider credential');
+  if (kind === '/queue-full') throw new ScrapeError('The scraping queue is full. Retry shortly.', 503, 'QUEUE_FULL');
+  if (kind === '/failure') throw new Error('Secret cloud log and provider credential');
   if (kind === '/wait') {
     started();
     await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => { cancelled(); reject(signal.reason); }, { once: true }));
@@ -54,7 +54,7 @@ try {
   assert.equal(collected.length, 0);
   assert.equal(queries.length, 0, 'Rejected anonymous/origin requests never reach collection or database');
   for (const body of [{}, [], { url: 'https://example.com/', sku: 'ignored' }, { url: 12 }, { url: 'file:///etc/passwd' }, { url: 'http://127.0.0.1/' }, { url: 'http://192.168.1.1/' }, { url: 'https://example.com:444/' }]) {
-    assert.equal((await post(body)).status, 400, 'Reject unsupported input before invoking the worker');
+    assert.equal((await post(body)).status, 400, 'Reject unsupported input before invoking the service');
   }
   assert.equal(collected.length, 0);
   const success = await post({ url: 'example.com/product#specifications' });
@@ -71,8 +71,8 @@ try {
     if (path !== 'queue-full') assert.deepEqual(failure.body.report, report, 'Available diagnostics survive hard failures');
   }
   assert.deepEqual(await post({ url: 'https://example.com/failure' }), {
-    status: 503, body: { error: 'The browser service could not complete retrieval.', code: 'RETRIEVAL_FAILED' },
-  }, 'Unknown worker details remain private');
+    status: 503, body: { error: 'The scraping service could not complete retrieval.', code: 'RETRIEVAL_FAILED' },
+  }, 'Unknown cloud details remain private');
   const disconnected = request(origin + '/api/scrape/preview', { method: 'POST', headers: { Origin: origin, Cookie: cookie, 'Content-Type': 'application/json' } });
   disconnected.on('error', () => {});
   disconnected.end(JSON.stringify({ url: 'https://example.com/wait' }));

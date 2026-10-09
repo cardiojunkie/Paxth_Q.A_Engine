@@ -8,7 +8,8 @@ import { ProviderError } from "./src/lib/chatCompletion.js";
 import { initializeDatabase, verifySchema } from "./src/server/database.js";
 import { ApiError, registerCatalogRoutes } from "./src/server/catalog.js";
 import { initializeAuth, registerAuth } from "./src/server/auth.js";
-import { initializeProvider, registerProviderRoutes } from "./src/server/provider.js";
+import { initializeProvider, registerProviderRoutes, getProviderSettings } from "./src/server/provider.js";
+import { collectProductPage } from "./src/server/scrapePipeline.js";
 import { initializeJobRuns, registerJobRunRoutes, startJobWorker } from "./src/server/jobRunner.js";
 import { registerScrapeRoutes } from "./src/server/scraper.js";
 
@@ -36,7 +37,7 @@ async function startServer() {
   });
   registerQaConfigurationRoutes(app,db);
   registerCatalogRoutes(app,pool);
-  registerScrapeRoutes(app);
+  registerScrapeRoutes(app, async (url, signal) => collectProductPage(url, signal, await getProviderSettings(pool)));
   registerProviderRoutes(app,pool);
   registerJobRunRoutes(app,pool);
   app.use('/api', (_req,res) => { res.status(404).json({error:'Endpoint not found'}); });

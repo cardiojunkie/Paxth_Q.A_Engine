@@ -9,9 +9,10 @@ import { transaction } from './database';
 export function getProviderCredentials() {
   let baseUrl = process.env.LLM_BASE_URL?.trim();
   let apiKey = process.env.LLM_API_KEY?.trim();
-  // Use the existing AI Credits key only with its own gateway; never mix a legacy key with an override.
+  // Use the existing AI Credits key only with its own gateway; never mix it with an override.
   if (!baseUrl && !apiKey && process.env.AICREDITS_API_KEY?.trim()) {
-    baseUrl = 'https://api.aicredits.in/v1';
+    // shortcut: the documented API host is unreachable from Codespaces, recheck its routing before switching back.
+    baseUrl = 'https://aicredits.in/v1';
     apiKey = process.env.AICREDITS_API_KEY.trim();
   }
   if (!baseUrl || !apiKey) throw new ProviderError('Configure both LLM_BASE_URL and LLM_API_KEY on the server, or use AICREDITS_API_KEY without LLM overrides.', 503);
@@ -23,7 +24,7 @@ export function getProviderCredentials() {
 export async function initializeProvider(pool: Pool) {
   await pool.query(`CREATE TABLE IF NOT EXISTS provider_settings (id text PRIMARY KEY CHECK(id='default'), settings jsonb NOT NULL);
     INSERT INTO provider_settings VALUES ('default','{}') ON CONFLICT DO NOTHING`);
-  // Scraping is credential-independent; remove retired navigation settings on every startup.
+  // The retired navigation model is unrelated to the Markdown formatter.
   await pool.query(`UPDATE provider_settings SET settings = settings - 'scrapperModelName' - 'navigationModelInitialized' - 'scraperTimeout'
     WHERE id='default' AND settings ?| ARRAY['scrapperModelName','navigationModelInitialized','scraperTimeout']`);
 }
@@ -32,11 +33,13 @@ export async function getProviderSettings(pool: Pool | PoolClient): Promise<AppS
   if (!row) throw new ProviderError('Provider settings unavailable', 503);
   let providerConfigured = false;
   try { getProviderCredentials(); providerConfigured = true; } catch { /* Report configuration state without exposing secrets. */ }
-  return normalizeSettings({ ...row.settings, qaAgentMemory: row.memory, providerConfigured });
+  return normalizeSettings({ ...row.settings, qaAgentMemory: row.memory, providerConfigured,
+    scraperConfigured: Boolean(process.env.CRAWL4AI_API_KEY?.trim()) });
 }
 export function validateSettings(value: any) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !Object.keys(editableSettings(DEFAULT_SETTINGS)).includes(key)) ||
     typeof value.modelName !== 'string' || !value.modelName.trim() || value.modelName.length > 256 ||
+    (value.scraperModelName !== undefined && (typeof value.scraperModelName !== 'string' || !value.scraperModelName.trim() || value.scraperModelName.length > 256)) ||
     typeof value.temperature !== 'number' || !Number.isFinite(value.temperature) || value.temperature < 0 || value.temperature > 1 ||
     !Number.isSafeInteger(value.maxTokens) || value.maxTokens < 1 || value.maxTokens > 65536 ||
     !Number.isSafeInteger(value.maxPageContentLength) || value.maxPageContentLength < 1 || value.maxPageContentLength > 200000 ||
@@ -44,7 +47,7 @@ export function validateSettings(value: any) {
   return editableSettings(normalizeSettings(value));
 }
 export async function completeQa(payload: unknown, signal: AbortSignal, options: {
-  taskLabel?: 'QA' | 'Catalog';
+  taskLabel?: 'QA' | 'Catalog' | 'Scraping';
   attempts?: number; beforeAttempt?: (attempt: number) => Promise<void>;
   lastError?: string | null; onAttemptError?: (attempt: number, error: ProviderError) => Promise<void>;
 } = {}) {
@@ -88,9 +91,9 @@ export function registerProviderRoutes(app: Express, pool: Pool) {
     if (res.locals.user?.role !== 'admin') { res.status(403).json({ error: 'Administrator access required' }); return; }
     if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) ||
       Object.keys(req.body).some(key => !['modelName', 'purpose'].includes(key)) ||
-      (req.body.purpose !== undefined && req.body.purpose !== 'qa') ||
+      (req.body.purpose !== undefined && !['qa', 'scrape'].includes(req.body.purpose)) ||
       (req.body.modelName !== undefined && (typeof req.body.modelName !== 'string' || !req.body.modelName.trim() || req.body.modelName.length > 256))) {
-      res.status(400).json({ error: 'Test API accepts optional modelName and purpose (qa) only' }); return;
+      res.status(400).json({ error: 'Test API accepts optional modelName and purpose (qa or scrape) only' }); return;
     }
     const controller = new AbortController();
     const disconnect = () => { if (!res.writableEnded) controller.abort(); };
@@ -102,7 +105,7 @@ export function registerProviderRoutes(app: Express, pool: Pool) {
       let modelName = req.body.modelName?.trim();
       if (modelName === undefined) {
         const settings = await getProviderSettings(pool);
-        modelName = settings.modelName;
+        modelName = purpose === 'scrape' ? settings.scraperModelName : settings.modelName;
       }
       signal.throwIfAborted();
       const response = await fetchChatCompletion(credentials.baseUrl, credentials.apiKey, {

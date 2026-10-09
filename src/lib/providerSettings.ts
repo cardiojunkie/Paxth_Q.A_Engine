@@ -4,7 +4,9 @@ export interface AppSettings {
   llmProvider: string;
   baseUrl: string;
   providerConfigured: boolean;
+  scraperConfigured: boolean;
   modelName: string;
+  scraperModelName: string;
   temperature: number;
   maxTokens: number;
   maxConcurrency: number;
@@ -14,8 +16,9 @@ export interface AppSettings {
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
-  llmProvider: "openai-compatible", baseUrl: "", providerConfigured: false,
+  llmProvider: "openai-compatible", baseUrl: "", providerConfigured: false, scraperConfigured: false,
   modelName: "deepseek/deepseek-v4.1-flash", temperature: 0.1, maxTokens: 4096,
+  scraperModelName: "z-ai/glm-5.3-flash",
   maxConcurrency: 1, maxRetries: 2,
   maxPageContentLength: 40_000, qaAgentMemory: DEFAULT_QA_AGENT_MEMORY,
 };
@@ -32,7 +35,10 @@ export function normalizeSettings(settings: Partial<AppSettings> = {}): AppSetti
     ...DEFAULT_SETTINGS,
     baseUrl: "",
     providerConfigured: settings.providerConfigured === true,
+    scraperConfigured: settings.scraperConfigured === true,
     modelName,
+    scraperModelName: typeof settings.scraperModelName === "string" && settings.scraperModelName.trim()
+      ? settings.scraperModelName.trim() : DEFAULT_SETTINGS.scraperModelName,
     temperature: typeof settings.temperature === "number" && settings.temperature >= 0 && settings.temperature <= 1
       ? settings.temperature : DEFAULT_SETTINGS.temperature,
     maxTokens: normalizeMaxTokens(settings.maxTokens),
@@ -46,6 +52,7 @@ export function normalizeSettings(settings: Partial<AppSettings> = {}): AppSetti
 export function editableSettings(settings: AppSettings) {
   return {
     modelName: settings.modelName,
+    scraperModelName: settings.scraperModelName,
     temperature: settings.temperature, maxTokens: settings.maxTokens,
     maxPageContentLength: settings.maxPageContentLength, qaAgentMemory: settings.qaAgentMemory,
   };

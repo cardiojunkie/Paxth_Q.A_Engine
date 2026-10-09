@@ -18,7 +18,7 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "test:scraper": "tsx src/lib/browserScrape.test.ts && tsx src/lib/scrapeRequest.test.ts && tsx src/server/scraper.test.ts",
+    "test:scraper": "tsx src/lib/cloudScrape.test.ts && tsx src/lib/scrapeRequest.test.ts && tsx src/server/scraper.test.ts && tsx src/server/scrapePipeline.test.ts",
     "admin:bootstrap": "tsx scripts/bootstrap-admin.ts",
     "test:provider": "tsx src/server/provider.test.ts",
     "test:auth": "tsx src/server/auth.test.ts",
@@ -29,10 +29,8 @@
     "test": "npm run lint && npm run test:auth && npm run test:provider && npm run test:catalog && npm run test:catalog-generation && npm run test:job-state && npm run test:job-runner && npm run test:llm-response && npm run test:qa-agent && npm run test:scraper",
     "test:job-runner": "tsx src/server/jobRunner.test.ts",
     "setup:browser": "playwright-core install chromium",
-    "setup:scraper": "node scripts/setup-scraper.mjs",
-    "test:scrape-browser": "tsx src/lib/scrapeBrowser.test.ts",
-    "test:scrape-worker": ".venv/bin/python -m unittest discover -s scraper -p test_*.py",
-    "test:scrape-production": "node scripts/smoke-scraper.mjs"
+    "test:scrape-production": "node scripts/smoke-scraper.mjs",
+    "test:scrape-live": "tsx scripts/test-live-scraper.ts"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.20",

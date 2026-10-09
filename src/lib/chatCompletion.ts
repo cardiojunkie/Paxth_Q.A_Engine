@@ -107,7 +107,16 @@ export async function fetchChatCompletion(
     } catch (error) {
       if (signal.aborted) throw signal.reason;
       if (boundedSignal.aborted) throw new ProviderError("The model request timed out.", 504, true);
-      if (error instanceof TypeError) throw new ProviderError("The model connection failed.", 502, true);
+      if (error instanceof TypeError) {
+        const cause = error.cause as { code?: unknown; errors?: Array<{ code?: unknown }> } | undefined;
+        const codes = [cause?.code, ...(Array.isArray(cause?.errors) ? cause.errors.map(error => error?.code) : [])];
+        const code = codes.find(code => typeof code === "string" && [
+          "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "ECONNREFUSED", "ECONNRESET", "ENETUNREACH", "EHOSTUNREACH",
+          "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET", "CERT_HAS_EXPIRED", "ERR_TLS_CERT_ALTNAME_INVALID",
+          "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+        ].includes(code));
+        throw new ProviderError(`The model connection to ${endpoint.hostname} failed${code ? ` (${code})` : ""}. Check server network and provider reachability.`, 502, true);
+      }
       throw error;
     }
   } finally { release(); }

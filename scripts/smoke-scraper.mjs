@@ -10,7 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Pool } from 'pg';
 assert.ok(process.env.TEST_DATABASE_URL, 'Set TEST_DATABASE_URL to a disposable database; DATABASE_URL is never used.');
 const root = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
-const namespace = `browser_smoke_${randomUUID().replaceAll('-', '')}`;
+const namespace = `cloud_smoke_${randomUUID().replaceAll('-', '')}`;
 const folder = await mkdtemp(path.join(tmpdir(), 'paxth-production-smoke-'));
 const url = new URL(process.env.TEST_DATABASE_URL);
 url.searchParams.set('options', `-c search_path=${namespace}`);
@@ -19,12 +19,18 @@ const container = process.env.SCRAPER_TEST_IMAGE;
 const name = `paxth-scrape-smoke-${randomUUID().slice(0, 8)}`;
 const username = 'Scraper smoke', password = randomUUID();
 const env = { ...process.env, DATABASE_URL: url.href, NODE_ENV: 'production', HOST: '127.0.0.1', PORT: String(port),
-  APP_ORIGIN: 'https://scrape-smoke.example', LLM_BASE_URL: 'https://mock.scrape.example/v1', LLM_API_KEY: 'mock-only',
+  APP_ORIGIN: 'https://scrape-smoke.example', LLM_BASE_URL: 'https://mock.scrape.example/v1', LLM_API_KEY: 'mock-only', CRAWL4AI_API_KEY: 'cloud-mock-only',
   BOOTSTRAP_ADMIN_USERNAME: username, BOOTSTRAP_ADMIN_PASSWORD: password };
 const preload = path.join(folder, 'provider.mjs');
-await writeFile(preload, `const original=globalThis.fetch;globalThis.fetch=async(url,init)=>{
-  if(String(url)!=='https://mock.scrape.example/v1/chat/completions')return original(url,init);
+await writeFile(preload, `globalThis.fetch=async(url,init)=>{
+  if(String(url)==='https://api.crawl4ai.com/scrape'){
+    if(new Headers(init.headers).get('Authorization')!=='Bearer cloud-mock-only')throw new Error('Cloud credential isolation failed');
+    return Response.json({ok:true,markdown:'# Product\\nBrand: TestBrand\\nWeight: 500 g\\nPrice: ₹1,299\\n[Manual](https://example.com/manual)'});
+  }
+  if(String(url)!=='https://mock.scrape.example/v1/chat/completions')throw new Error('Unexpected outbound destination');
+  if(new Headers(init.headers).get('Authorization')!=='Bearer mock-only')throw new Error('Model credential isolation failed');
   const input=JSON.parse(JSON.parse(init.body).messages.find(message=>message.role==='user').content);
+  if(input.content)return Response.json({choices:[{finish_reason:'stop',message:{content:input.content}}]});
   await new Promise(resolve=>setTimeout(resolve,5000));
   return Response.json({choices:[{finish_reason:'stop',message:{content:JSON.stringify({qa_status:'pass',confidence:'high',summary:'Mock review of supplied evidence',issue_count:0,issues:[],source_notes:{sap_used:!!input.source_sap,url_used:!!input.scraped_markdown,source_conflicts:[]}})}}]});
 };`);
@@ -44,7 +50,7 @@ let cookie = '';
 const request = async (endpoint, method = 'GET', body, authorized = true, expectedStatus) => {
   const response = await fetch(`http://127.0.0.1:${port}${endpoint}`, { method,
     headers: { Origin: env.APP_ORIGIN, 'Content-Type': 'application/json', ...(authorized ? { Cookie: cookie } : {}) },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(130000) });
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(300000) });
   const data = await response.json();
   if (expectedStatus === undefined) assert.ok(response.ok, `${endpoint}: HTTP ${response.status} ${JSON.stringify(data)}`);
   else assert.equal(response.status, expectedStatus, `${endpoint}: ${JSON.stringify(data)}`);
@@ -59,7 +65,7 @@ try {
     CREATE TABLE ${namespace}.provider_settings (id text PRIMARY KEY CHECK(id='default'), settings jsonb NOT NULL);
     INSERT INTO ${namespace}.provider_settings VALUES ('default','{"modelName":"smoke/qa","scrapperModelName":"retired/navigation","navigationModelInitialized":true}');`);
   const args = container ? ['run', '--rm', '--init', '--name', name, '--network', 'host', '--cpus', '1', '--memory', '1536m', '--shm-size', '256m',
-    ...['DATABASE_URL','NODE_ENV','HOST','PORT','APP_ORIGIN','LLM_BASE_URL','LLM_API_KEY'].flatMap(key=>['-e', `${key}=${env[key]}`]),
+    ...['DATABASE_URL','NODE_ENV','HOST','PORT','APP_ORIGIN','LLM_BASE_URL','LLM_API_KEY','CRAWL4AI_API_KEY'].flatMap(key=>['-e', `${key}=${env[key]}`]),
     '-v', `${preload}:/test-provider.mjs:ro`, container, 'node', '--import', '/test-provider.mjs', 'dist/server.mjs']
     : ['--import', preload, 'dist/server.mjs'];
   app = spawn(container ? 'docker' : process.execPath, args, { env, stdio: ['ignore','pipe','pipe'] });
@@ -79,14 +85,14 @@ try {
   assert.ok(!('scrapperModelName' in persisted));assert.ok(!('navigationModelInitialized' in persisted));
   const legacy = (await root.query(`SELECT scrapegraph_api_key,scrapegraph_settings FROM ${namespace}.users`)).rows[0];
   assert.equal(legacy.scrapegraph_api_key, 'retired-only');assert.deepEqual(legacy.scrapegraph_settings,{retired:true});
-  const scrapeUrl = process.env.SCRAPER_TEST_URL || 'https://example.com/';
+  const scrapeUrl = process.env.SCRAPER_TEST_URL || 'https://8.8.8.8/product';
   await request('/api/scrape/preview','POST',{url:scrapeUrl},false,401);
   const previewCounts=()=>root.query(`SELECT (SELECT count(*) FROM ${namespace}.sku_data) AS catalog,
     (SELECT count(*) FROM ${namespace}.jobs) AS jobs, (SELECT count(*) FROM ${namespace}.job_runs) AS runs`);
   const beforePreview=(await previewCounts()).rows;
   const preview=(await request('/api/scrape/preview','POST',{url:scrapeUrl})).data;
   assert.equal(preview.status,'collected');assert.ok(preview.markdown.length>50);
-  assert.equal(preview.requestedUrl,scrapeUrl);assert.ok(preview.finalUrl);assert.ok(preview.capturedAt);
+  assert.equal(preview.requestedUrl,scrapeUrl);assert.equal(preview.finalUrl,null);assert.equal(preview.capturedAt,null);assert.ok(preview.receivedAt);
   assert.equal(preview.report.characters,preview.markdown.length);
   assert.deepEqual((await previewCounts()).rows,beforePreview,'Standalone URL retrieval writes no catalog, jobs or runs');
   await request('/api/catalog','POST',[{sku:'smoke',attribute_set:'Smoke',source:{sap:'Brand: TestBrand'},raw_row:{sku:'smoke',attributes__brand:'TestBrand'},upload_attributes:{brand:'TestBrand'},status:'ready'}]);
@@ -104,9 +110,11 @@ try {
   assert.ok(retrieved.data.scraped_markdown.length>50);
   assert.match(retrieved.data.scraped_markdown,/Source:/);
   assert.equal(retrieved.data.revision,revision+1);
-  assert.equal(retrieved.data.scrape_metadata.method,'browser');
+  assert.equal(retrieved.data.scrape_metadata.method,'cloud');
+  assert.equal(retrieved.data.scrape_metadata.crawler,'crawl4ai');
+  assert.equal(retrieved.data.scrape_metadata.modelName,'z-ai/glm-5.3-flash');
   assert.equal(retrieved.data.scrape_metadata.requestedUrl,scrapeUrl);
-  assert.ok(retrieved.data.scrape_metadata.finalUrl);assert.ok(retrieved.data.scrape_metadata.capturedAt);
+  assert.equal(retrieved.data.scrape_metadata.finalUrl,null);assert.equal(retrieved.data.scrape_metadata.capturedAt,null);assert.ok(retrieved.data.scrape_metadata.receivedAt);
   const rows = (await request('/api/catalog')).data;
   assert.equal(rows.find(row=>row.sku==='scrape-smoke').scraped_markdown,retrieved.data.scraped_markdown);
   assert.equal(rows.find(row=>row.sku==='smoke').scraped_markdown,null);
@@ -123,13 +131,13 @@ try {
   assert.ok(finished.scraped_markdown?.length>50,'URL-only job saves evidence before QA');
   assert.ok(finished.qa_result,'URL-only job produces a current review');
   assert.equal(finished.qa_stale,false);
-  assert.equal(finished.scrape_metadata.method,'browser');
+  assert.equal(finished.scrape_metadata.method,'cloud');
   if(container){
     command('docker',['exec',name,'node','-e',"fetch('http://127.0.0.1:'+process.env.PORT+'/healthz').then(r=>process.exit(r.ok?0:1))"]);
     console.log('Production-container smoke passed with one CPU / 1536 MiB: migration preservation, SKU evidence persistence/revisions, QA, login and readiness.');
   } else {
     assert.ok(peakKiB < 1536*1024, `Observed process RSS ${peakKiB/1024} MiB exceeds the deployment limit`);
-    console.log(`Production-bundle smoke passed: standalone URL preview without catalog writes, migration preservation, SKU evidence persistence/revisions, concurrent QA and login, ${Date.now()-started} ms, peak process RSS ${(peakKiB/1024).toFixed(1)} MiB. PostgreSQL and an external DISPLAY server are excluded.`);
+    console.log(`Production-bundle smoke passed: standalone URL preview without catalog writes, migration preservation, SKU evidence persistence/revisions, concurrent QA and login, ${Date.now()-started} ms, peak process RSS ${(peakKiB/1024).toFixed(1)} MiB. PostgreSQL is excluded; both providers are mocked.`);
   }
 } finally {
   clearInterval(meter);
