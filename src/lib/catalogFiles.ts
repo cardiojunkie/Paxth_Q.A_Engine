@@ -1,6 +1,7 @@
 import type { SkuData } from '../hooks/useCatalogData';
 import type { CatalogFileGroup, CatalogOutputs } from '../types';
 import { CatalogMapping, catalogPassThroughValue, hasCompletedCatalog, prepareCatalogTemplate } from './catalogGeneration';
+export { populateCatalogFile } from './catalogGeneration';
 
 export const SHIPPING_REGIONS = ['uae', 'kwt', 'qtr', 'oman', 'ksa', 'bahrain'] as const;
 const fallbackNames = ['uae', 'kuwait', 'qatar', 'oman', 'ksa', 'bahrain'];
@@ -55,15 +56,11 @@ export function catalogMappingFor(configuration: Parameters<typeof catalogMappin
 }
 
 export function completedCatalogGroups(skus: SkuData[], groups: Pick<CatalogFileGroup, 'attributeSet' | 'headers'>[]): CatalogFileGroup[] {
-  return groups.map(group => ({ ...group, rows: skus.filter(sku => sku.attribute_set === group.attributeSet && hasCompletedCatalog(sku)).map(sku => {
-    if (JSON.stringify(sku.catalog_state!.headers) !== JSON.stringify(group.headers)) throw new Error('Catalog jobs must have identical saved header order to export together.');
-    return sku.catalog_state!.row!;
-  }) }));
-}
-
-export function populateCatalogFile(sheet: import('exceljs').Worksheet, file: Pick<CatalogFileGroup, 'headers' | 'rows'>) {
-  sheet.columns = file.headers.map(header => ({ width: Math.max(20, header.length + 2), style: { numFmt: '@' } }));
-  sheet.addRow(file.headers);
-  file.rows.forEach(row => sheet.addRow(file.headers.map(header => row[header] ?? '')));
-  sheet.getRow(1).font = { bold: true };
+  return groups.map(group => {
+    const completed = skus.filter(sku => sku.attribute_set === group.attributeSet && hasCompletedCatalog(sku));
+    return { ...group, rows: completed.map(sku => {
+      if (JSON.stringify(sku.catalog_state!.headers) !== JSON.stringify(group.headers)) throw new Error('Catalog jobs must have identical saved header order to export together.');
+      return sku.catalog_state!.row!;
+    }), cellWarnings: Object.fromEntries(completed.map(sku => [sku.catalog_state!.row!.sku, sku.catalog_state!.cellWarnings || []])) };
+  });
 }

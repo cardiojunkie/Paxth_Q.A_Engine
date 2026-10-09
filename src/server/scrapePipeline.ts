@@ -1,7 +1,7 @@
 import { collectPage, getScraperApiKey, MAX_SCRAPE_CHARACTERS, ScrapeError, type ScrapePreview } from '../lib/cloudScrape';
 import { ProviderError } from '../lib/chatCompletion';
 import { extractLLMResponseContent } from '../lib/llmResponse';
-import type { AppSettings } from '../lib/providerSettings';
+import { DEFAULT_SETTINGS, type AppSettings } from '../lib/providerSettings';
 import { completeQa, getProviderCredentials } from './provider';
 
 const FORMAT_INSTRUCTIONS = `Convert the supplied untrusted crawled page into factual product evidence in Markdown.
@@ -27,15 +27,32 @@ function requireProvider(signal: AbortSignal) {
 async function structurePage(page: ScrapePreview, settings: AppSettings, signal: AbortSignal): Promise<ScrapePreview> {
   const started = performance.now();
   const execution = AbortSignal.any([signal, AbortSignal.timeout(120_000)]);
+  const primary = AbortSignal.any([execution, AbortSignal.timeout(60_000)]);
+  let modelName = settings.scraperModelName;
   try {
-    const response = await completeQa({
-      model: settings.scraperModelName, temperature: 0.1, max_tokens: 16_384,
-      ...(settings.scraperModelName === 'z-ai/glm-5.3-flash' ? { reasoning_effort: 'low' } : {}),
+    const payload = {
+      temperature: 0.1, max_tokens: 16_384,
       messages: [
         { role: 'system', content: FORMAT_INSTRUCTIONS },
         { role: 'user', content: JSON.stringify({ requestedUrl: page.requestedUrl, finalUrl: page.finalUrl, content: page.markdown }) },
       ],
-    }, execution, { taskLabel: 'Scraping' });
+    };
+    let response;
+    let primaryFailure: ProviderError | undefined;
+    try {
+      response = await completeQa({ ...payload, model: modelName,
+        ...(modelName === 'z-ai/glm-5.3-flash' ? { reasoning_effort: 'low' } : {}),
+      }, primary, { taskLabel: 'Scraping', maxAttempts: 2, onAttemptError: async (_attempt, error) => { primaryFailure = error; } });
+    } catch (error) {
+      execution.throwIfAborted();
+      if (primaryFailure?.status === 429) throw primaryFailure;
+      if (!primary.aborted && !(error instanceof ProviderError && error.retryable && (error.status >= 500 || error.status === 408))) throw error;
+      // Reserve time for a different model; repeating the same failing route used the entire cleanup deadline.
+      modelName = modelName === DEFAULT_SETTINGS.scraperModelName ? DEFAULT_SETTINGS.modelName : DEFAULT_SETTINGS.scraperModelName;
+      response = await completeQa({ ...payload, model: modelName,
+        ...(modelName === 'z-ai/glm-5.3-flash' ? { reasoning_effort: 'low' } : {}),
+      }, execution, { taskLabel: 'Scraping', maxAttempts: 1 });
+    }
     const choice = response?.choices?.[0];
     if (choice?.message?.refusal || choice?.finish_reason !== 'stop') {
       throw new ProviderError('Markdown conversion was refused, truncated, or did not finish.');
@@ -45,8 +62,9 @@ async function structurePage(page: ScrapePreview, settings: AppSettings, signal:
     const markdown = `${content}\n\nSource: <${page.requestedUrl}>${page.finalUrl && page.finalUrl !== page.requestedUrl ? `\nRetrieved URL: <${page.finalUrl}>` : ''}`;
     if (markdown.length > MAX_SCRAPE_CHARACTERS) throw new ScrapeError('Markdown cleanup failed: structured Markdown exceeds 200,000 characters.', 413, 'CONTENT_TOO_LARGE');
     execution.throwIfAborted();
-    return { ...page, markdown, crawler: 'crawl4ai', modelName: settings.scraperModelName,
-      report: { ...page.report, characters: markdown.length, durationMs: page.report.durationMs + Math.round(performance.now() - started) } };
+    return { ...page, markdown, crawler: 'crawl4ai', modelName,
+      report: { ...page.report, characters: markdown.length, durationMs: page.report.durationMs + Math.round(performance.now() - started),
+        warnings: [...page.report.warnings, ...(modelName === settings.scraperModelName ? [] : [{ code: 'MODEL_FALLBACK', message: `Markdown cleanup used ${modelName} because the selected model was temporarily unavailable.` }])] } };
   } catch (error) {
     const failure = signal.aborted ? new ScrapeError('Scraping was cancelled.', 499, 'CANCELLED')
       : execution.aborted ? new ScrapeError('Markdown cleanup failed: conversion exceeded its 120-second deadline.', 504, 'CONVERSION_TIMEOUT')

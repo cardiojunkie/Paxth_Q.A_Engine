@@ -23,6 +23,13 @@ try {
   let calls=0;
   globalThis.fetch=async()=>{calls++;return Response.json({error:'invalid'},{status:400});};
   await assert.rejects(completeQa({},new AbortController().signal),/HTTP 400/);assert.equal(calls,1);
+  calls=0;
+  globalThis.fetch=async()=>{calls++;return Response.json({}, {status:500});};
+  await assert.rejects(completeQa({},AbortSignal.timeout(5000),{maxAttempts:1}),/HTTP 500/);
+  assert.equal(calls,1,'A cleanup backup can make exactly one attempt');
+  calls=0;
+  await assert.rejects(completeQa({},AbortSignal.timeout(5000),{maxAttempts:2}),/HTTP 500/);
+  assert.equal(calls,2,'Cleanup can reserve its third request for another model');
   calls=0;const attempts:number[]=[],failedAttempts:number[]=[];
   globalThis.fetch=async()=>{calls++;return calls<2?Response.json({}, {status:503}):Response.json({ok:true});};
   assert.deepEqual(await completeQa({},new AbortController().signal,{attempts:1,beforeAttempt:async n=>{attempts.push(n);},onAttemptError:async n=>{failedAttempts.push(n);}}),{ok:true});

@@ -14,7 +14,7 @@ import { shippingRegion } from '../lib/catalogFiles';
 
 type FilterType = "all" | "ready" | "cannot_qa" | "completed" | "failed";
 
-export function DashboardModule() {
+export function DashboardModule({ onCatalogJobCreated }: { onCatalogJobCreated?: (id: string) => void }) {
   const { user, workspaceMode, catalogError, skuDataList, addParsedData, clearData, updateSku, scrapeSku, removeSkus, isLoadingSkuData, jobs, addJobs, addNotification } = useAppContext();
   const isCatalog = workspaceMode === 'catalog';
   const statusOf = (sku: SkuData) => isCatalog ? catalogStatus(sku) : sku.status;
@@ -23,6 +23,8 @@ export function DashboardModule() {
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<FilterType>("all");
   const [selectedSkus, setSelectedSkus] = useState<Set<string>>(new Set());
+  const [isCreatingJob, setIsCreatingJob] = useState(false);
+  const creatingJob = useRef(false);
   useEffect(() => { setFilter('all'); setSelectedSkus(new Set()); }, [workspaceMode]);
   const [isScraping, setIsScraping] = useState(false);
   const [scrapeProgress, setScrapeProgress] = useState<{current: number, total: number} | null>(null);
@@ -176,7 +178,7 @@ export function DashboardModule() {
   };
 
   const handleCreateJob = async () => {
-    if (selectedSkus.size === 0) return;
+    if (selectedSkus.size === 0 || creatingJob.current) return;
     
     const skusToProcess = skuDataList.filter(s => selectedSkus.has(s.sku));
     const attributeSet = getCommonAttributeSet(skusToProcess);
@@ -220,13 +222,21 @@ export function DashboardModule() {
       status: "pending"
     };
 
-    if (!await addJobs([job])) return;
-    setSelectedSkus(new Set());
-    addNotification({
-      type: "success",
-      title: "Job Created",
-      message: `Created one job with ${job.skus.length} SKU(s). View it in the Jobs tab.`
-    });
+    creatingJob.current = true;
+    setIsCreatingJob(true);
+    try {
+      if (!await addJobs([job])) return;
+      setSelectedSkus(new Set());
+      addNotification({
+        type: "success",
+        title: "Job Created",
+        message: `Created one job with ${job.skus.length} SKU(s). View it in the Jobs tab.`
+      });
+      if (isCatalog) onCatalogJobCreated?.(job.id);
+    } finally {
+      creatingJob.current = false;
+      if (mounted.current) setIsCreatingJob(false);
+    }
   };
 
   const exportQAExcel = async () => {
@@ -675,10 +685,11 @@ export function DashboardModule() {
 
               <button
                 onClick={handleCreateJob}
-                disabled={selectedSkus.size === 0}
+                disabled={selectedSkus.size === 0 || isCreatingJob}
+                aria-busy={isCreatingJob}
                 className={cn(
                   "flex items-center gap-1.5 px-3 py-1.5 text-[10px] uppercase font-bold tracking-widest rounded-sm transition-colors",
-                  selectedSkus.size === 0
+                  selectedSkus.size === 0 || isCreatingJob
                     ? "bg-[#F5F2EF] text-[#B8B4AE] cursor-not-allowed border border-[#E5E2DE]"
                     : "bg-[#1A1A1A] text-white hover:bg-[#333333] shadow-xs"
                 )}

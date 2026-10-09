@@ -42,7 +42,7 @@ const runGroups = (run: Run) => run.catalogGroups?.length ? run.catalogGroups : 
 const runOutputs = (run: Run): CatalogOutputs => run.catalogOutputs || prepareCatalogOutputs(
   (run.items || []).map(item => item.snapshot), runGroups(run).map(group => ({ ...group, rulesMarkdown: '' })), true);
 
-export function JobsModule() {
+export function JobsModule({ initialJobId }: { initialJobId?: string }) {
   const { skuDataList, jobs: allJobs, workspaceMode, removeJob, addNotification, refreshData, user } = useAppContext();
   const isCatalog = workspaceMode === 'catalog';
   const jobs = allJobs.filter(job => (job.jobType || 'qa') === workspaceMode);
@@ -65,10 +65,10 @@ export function JobsModule() {
   const pendingRequests = useRef(new Map<string, string>());
 
   useEffect(() => {
-    setSelectedJobs(new Set()); setSelectedJobToView(null); setSelectedRunId(''); setExpandedSku(null);
+    setSelectedJobs(new Set()); setSelectedJobToView(jobs.find(job => job.id === initialJobId) || null); setSelectedRunId(''); setExpandedSku(null);
     setActiveRuns([]); setCatalogRuns({}); setPollError('');
     setPreparedFiles(null); setCombinedFiles(null); setFilesError('');
-  }, [workspaceMode]);
+  }, [workspaceMode, initialJobId]);
 
   useEffect(() => {
     let disposed = false;
@@ -195,7 +195,8 @@ export function JobsModule() {
             if (previous && JSON.stringify(previous.headers) !== JSON.stringify(group.headers)) {
               throw new Error('Catalog jobs must have identical saved header order to export together.');
             }
-            groups.set(group.attributeSet, { ...group, rows: [...(previous?.rows || []), ...group.rows] });
+            groups.set(group.attributeSet, { ...group, rows: [...(previous?.rows || []), ...group.rows],
+              cellWarnings: { ...previous?.cellWarnings, ...group.cellWarnings } });
           }
         }
         const files = [...groups.values()].map(group => ({ ...group, rows: [...new Map(group.rows.map(row => [row.sku, row])).values()] }));
@@ -521,7 +522,7 @@ export function JobsModule() {
       {/* JOB RESULTS MODAL */}
       {selectedJobToView && (
         <div className="fixed inset-0 bg-black/40 backdrop-blur-xs z-50 flex items-center justify-center p-6">
-          <div className="bg-white rounded-sm shadow-2xl w-full max-w-5xl h-[85vh] flex flex-col overflow-hidden border border-[#E5E2DE]">
+          <div role="dialog" aria-modal="true" aria-label="Job details" className="bg-white rounded-sm shadow-2xl w-full max-w-5xl h-[85vh] flex flex-col overflow-hidden border border-[#E5E2DE]">
             
             {/* Header */}
             <div className="p-6 border-b border-[#E5E2DE] bg-[#F5F2EF] flex items-center justify-between shrink-0">
@@ -549,6 +550,11 @@ export function JobsModule() {
               </div>
 
               <div className="flex items-center gap-3">
+                {isCatalog && <button onClick={() => runJob(selectedJobToView.id, false, undefined, true)}
+                  disabled={submitting || activeRuns.some(run => run.jobId === selectedJobToView.id)}
+                  className="flex items-center gap-2 px-4 py-2 text-xs text-white bg-[#1A1A1A] rounded-sm disabled:opacity-50">
+                  <Play className="w-3 h-3" />Run All Categories
+                </button>}
                 {!isCatalog && <button
                   onClick={() => exportJobExcel(selectedJobToView)}
                   className="flex items-center gap-2 px-5 py-2 text-[11px] uppercase tracking-widest font-bold text-white bg-emerald-700 hover:bg-emerald-800 transition-colors rounded-sm shadow-sm"
@@ -580,20 +586,30 @@ export function JobsModule() {
               {selectedRunId && !viewRun && <p>Loading saved run results…</p>}
               {viewRun?.error && <p role="alert" className="text-red-700">{viewRun.error}</p>}
               {isCatalog && <section aria-label="Catalog job files" className="border border-[#E5E2DE] rounded-sm p-4 space-y-3">
-                <h4 className="font-serif text-xl">Files</h4>
+                <h4 className="font-serif text-xl">Category Subjobs &amp; Files</h4>
                 {filesError && <p role="alert">{filesError} Close and reopen job details to retry.</p>}
                 {!selectedOutputs && !filesError && <p className="text-sm">Loading prepared files…</p>}
                 {selectedOutputs?.groups.map(group => {
                   const final = finalGroups.find(file => file.attributeSet === group.attributeSet);
                   const prefix = `${selectedJobToView.name}_${group.attributeSet}`;
-                  return <div key={group.attributeSet} className="space-y-2 border-t border-[#E5E2DE] pt-3">
+                  const items = (viewRun?.items || []).filter(item => item.snapshot.attribute_set === group.attributeSet);
+                  const completed = final?.rows.length || 0;
+                  const failed = items.filter(item => item.status === 'failed' || item.result?.catalog_state?.status === 'failed').length;
+                  const cancelled = items.filter(item => item.status === 'cancelled').length;
+                  const status = items.some(item => item.status === 'running') ? 'running'
+                    : items.some(item => item.status === 'queued') ? 'pending' : failed ? 'failed'
+                    : cancelled ? 'cancelled' : completed === group.rows.length ? 'completed' : 'pending';
+                  return <section key={group.attributeSet} aria-label={`Category ${group.attributeSet}`} className="space-y-2 border-t border-[#E5E2DE] pt-3">
                     <p className="text-sm">{group.attributeSet} · {group.rows.length} assigned SKU(s)</p>
+                    <p className="text-xs">{status} · {completed} completed · {failed} failed · {cancelled} cancelled</p>
+                    <progress aria-label={`${group.attributeSet} progress`} value={completed + failed + cancelled}
+                      max={Math.max(1, group.rows.length)} className="w-full h-2" />
                     <div className="flex flex-wrap gap-3">
                       <CatalogFileDownload file={group} filename={`${prefix}_Catalog_Template`} label={`Download ${group.attributeSet} Template`} />
                       {final && final.rows.length > 0 && <CatalogFileDownload file={final} filename={`${prefix}_Catalog_Upload`} label={`Download ${group.attributeSet} Upload`} />}
                     </div>
                     {final && <p className="text-xs text-[#8C8882]">{final.rows.length} validated row(s); {group.rows.length - final.rows.length} unfinished or failed row(s) omitted from the upload.</p>}
-                  </div>;
+                  </section>;
                 })}
                 {selectedOutputs?.shipping && <div className="border-t border-[#E5E2DE] pt-3 space-y-2">
                   <p className="text-sm">Shipping · {selectedOutputs.shipping.region.toUpperCase()} · {selectedOutputs.shipping.rows.length} SKU(s)</p>
@@ -628,9 +644,18 @@ export function JobsModule() {
                       </ul> : null}
                       {state?.row ? <table className="w-full text-left text-xs border-collapse">
                         <thead><tr><th className="p-2">Header</th><th className="p-2">Generated value</th></tr></thead>
-                        <tbody>{state.headers.map(header => <tr key={header} className="border-t border-[#E5E2DE]">
-                          <th className="p-2 font-mono font-normal">{header}</th><td className="p-2 whitespace-pre-wrap">{state.row![header] || '—'}</td>
-                        </tr>)}</tbody>
+                        <tbody>{state.headers.map(header => {
+                          const warnings = (state.cellWarnings || []).filter(warning => warning.header === header);
+                          return <tr key={header} className="border-t border-[#E5E2DE]">
+                            <th className="p-2 font-mono font-normal">{header}</th>
+                            <td data-warning={warnings.length ? 'true' : undefined} className={cn('p-2 whitespace-pre-wrap', warnings.length > 0 && 'bg-orange-50 text-orange-900')}>
+                              <span>{state.row![header] || '—'}</span>
+                              {warnings.length > 0 && <ul aria-label={`Warnings for ${header}`} className="mt-2 space-y-1">
+                                {warnings.map((warning, index) => <li key={index}><AlertTriangle className="inline w-3 h-3 mr-1" />{warning.message}</li>)}
+                              </ul>}
+                            </td>
+                          </tr>;
+                        })}</tbody>
                       </table> : <p className="text-xs text-[#8C8882]">No generated row available yet.</p>}
                     </div>}
                   </div>;

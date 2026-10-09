@@ -1,5 +1,10 @@
 export type JobType = 'qa' | 'catalog';
 
+export interface CatalogCellWarning {
+  header: string;
+  message: string;
+}
+
 export interface CatalogState {
   status: 'completed' | 'failed';
   revision: number;
@@ -7,6 +12,7 @@ export interface CatalogState {
   headers: string[];
   row?: Record<string, string>;
   warnings: string[];
+  cellWarnings?: CatalogCellWarning[];
   error?: string | null;
   tokensUsed?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
   timeTaken?: number;
@@ -46,6 +52,7 @@ export interface CatalogFileGroup {
   attributeSet: string;
   headers: string[];
   rows: Record<string, string>[];
+  cellWarnings?: Record<string, CatalogCellWarning[]>;
 }
 
 export interface CatalogOutputs {

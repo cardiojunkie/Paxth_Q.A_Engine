@@ -48,17 +48,19 @@ export function validateSettings(value: any) {
 }
 export async function completeQa(payload: unknown, signal: AbortSignal, options: {
   taskLabel?: 'QA' | 'Catalog' | 'Scraping';
+  maxAttempts?: 1 | 2 | 3;
   attempts?: number; beforeAttempt?: (attempt: number) => Promise<void>;
   lastError?: string | null; onAttemptError?: (attempt: number, error: ProviderError) => Promise<void>;
 } = {}) {
   const label = options.taskLabel || 'QA';
+  const maxAttempts = options.maxAttempts ?? 3;
   const exhaustedMessage = options.lastError?.trim()
     ? `${label} exhausted its three-attempt budget. Last recorded failure: ${options.lastError} Start a fresh run to retry this SKU.`
     : `${label} used all three attempts before a result was saved; execution was interrupted. Start a fresh run to retry this SKU.`;
   signal.throwIfAborted();
   if ((options.attempts ?? 0) >= 3) throw new ProviderError(exhaustedMessage);
   const { baseUrl, apiKey } = getProviderCredentials();
-  for (let attempt = (options.attempts ?? 0) + 1; attempt <= 3; attempt++) {
+  for (let attempt = (options.attempts ?? 0) + 1; attempt <= maxAttempts; attempt++) {
     signal.throwIfAborted();
     try {
       const response = await fetchChatCompletion(baseUrl, apiKey, payload, signal, () => options.beforeAttempt?.(attempt) ?? Promise.resolve(), 120_000);
@@ -68,7 +70,7 @@ export async function completeQa(payload: unknown, signal: AbortSignal, options:
       signal.throwIfAborted();
       if (error instanceof ProviderError) await options.onAttemptError?.(attempt, error);
       signal.throwIfAborted();
-      if (!(error instanceof ProviderError) || !error.retryable || attempt === 3) throw error;
+      if (!(error instanceof ProviderError) || !error.retryable || attempt === maxAttempts) throw error;
       if (error.retryAfterMs > 300000) throw new ProviderError('Provider requested a retry beyond the job deadline', 429);
       await delay(Math.max(attempt * 1000, Number.isFinite(error.retryAfterMs) ? error.retryAfterMs : 0), undefined, { signal });
     }

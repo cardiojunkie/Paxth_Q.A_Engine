@@ -30,6 +30,8 @@ const preparedFiles: Record<string, any> = {};
 let runRequests = 0;
 let cancelRequests = 0;
 let invalidMappings = 0;
+let jobCreateRequests = 0;
+let releaseJobCreation: (() => void) | undefined;
 const importModes: string[] = [];
 const server = await createServer({ cacheDir: '/tmp/paxth-catalog-vite-cache', server: { host: '127.0.0.1', port: 0, hmr: false }, logLevel: 'error' });
 let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
@@ -65,6 +67,10 @@ try {
     }
     if (path === '/api/jobs') {
       if (request.method() === 'POST') {
+        jobCreateRequests++;
+        if (releaseJobCreation === undefined && invalidMappings > 0) {
+          await new Promise<void>(resolve => { releaseJobCreation = resolve; });
+        }
         const newJobs = request.postDataJSON();
         assert.equal(newJobs[0].jobType, 'catalog');
         try {
@@ -91,7 +97,7 @@ try {
       const id = decodeURIComponent(path.split('/')[3]);
       if (request.method() === 'POST') {
         runRequests++;
-        assert.equal(request.postDataJSON().mode, 'unfinished');
+        assert.equal(request.postDataJSON().mode, 'all');
         const job = jobs.find(job => job.id === id)!;
         run = { id: 'catalog-run', jobId: id, jobType: 'catalog', catalogHeaders: headers, catalogOutputs: structuredClone(preparedFiles[id]), actorId: 'operator', actorName: 'Operator',
           createdAt: new Date().toISOString(), status: 'queued', items: job.skus.map(sku => ({ sku, status: 'queued', attempts: 0, snapshot: structuredClone(catalog.find(row => row.sku === sku)) })) };
@@ -293,14 +299,18 @@ try {
   await page.getByText(/configure Catalog Output Headers/).waitFor();
   assert.equal(invalidMappings, 1); assert.equal(jobs.length, 1);
   await page.getByRole('button', { name: 'Notifications', exact: true }).click();
+  assert.equal(await page.getByRole('button', { name: 'Create Catalog Job (2)', exact: true }).isEnabled(), true, 'Failed creation retains the selection');
   attributeSets[0].catalogHeaders = headers;
   await page.getByRole('button', { name: 'Create Catalog Job (2)', exact: true }).click();
-  await page.getByRole('button', { name: 'Create Catalog Job (0)', exact: true }).waitFor();
+  const creatingButton = page.getByRole('button', { name: 'Create Catalog Job (2)', exact: true });
+  assert.equal(await creatingButton.isEnabled(), false);
+  await creatingButton.dispatchEvent('click');
+  assert.equal(jobCreateRequests, 2, 'A repeated click while saving cannot create another parent');
+  assert.ok(releaseJobCreation); releaseJobCreation();
+  await page.getByRole('dialog', { name: 'Job details' }).waitFor();
   const catalogJob = jobs[1];
-  await page.getByRole('button', { name: 'Jobs', exact: true }).click();
   await page.getByRole('heading', { name: 'Catalog Jobs', exact: true }).waitFor();
   assert.equal(await page.getByText('Existing QA job', { exact: true }).count(), 0);
-  await page.getByRole('button', { name: 'View Results', exact: true }).click();
   const files = page.getByRole('region', { name: 'Catalog job files' });
   await files.getByRole('button', { name: 'Download TV Template', exact: true }).waitFor();
   assert.equal(await files.getByRole('button', { name: 'Download TV Upload', exact: true }).count(), 0);
@@ -329,8 +339,8 @@ try {
   assert.equal(shippingBook.worksheets[0].getRow(2).getCell(16).value, '');
   assert.equal(shippingBook.worksheets[0].getRow(2).getCell(2).value, '00001');
   assert.equal(runRequests, 0, 'Prepared file downloads do not start generation');
+  await page.getByRole('button', { name: 'Run All Categories', exact: true }).click();
   await page.getByRole('button', { name: 'Close job details', exact: true }).click();
-  await page.getByRole('button', { name: 'Run Catalog', exact: true }).click();
   await page.getByText('Cancel Run', { exact: true }).waitFor();
   await mode.getByRole('button', { name: 'QA', exact: true }).click();
   await page.getByRole('heading', { name: 'QA Jobs', exact: true }).waitFor();
@@ -341,16 +351,19 @@ try {
   run.items = run.items.map((item: any, index: number) => {
     const original = catalog.find(sku => sku.sku === item.sku)!;
     const input = prepareCatalogInput(original, mapping, 40000);
-    const generated = parseCatalogResponse({ choices: [{ message: { content: JSON.stringify({ row: { ...input.template, name: 'TestBrand USB Hub', attribute__fallback: 'No' }, warnings: [] }) } }] }, input);
+    const generated = parseCatalogResponse({ choices: [{ message: { content: JSON.stringify({ row: { ...input.template, name: 'TestBrand USB Hub', attribute__fallback: 'No' }, warnings: [], cellWarnings: [] }) } }] }, input);
     const catalog_state = index === 0 ? { ...generated, status: 'completed' as const, revision: 0, headers, jobId: catalogJob.id }
-      : { status: 'failed' as const, revision: 0, headers, jobId: catalogJob.id, warnings: [], error: 'Model returned invalid catalog JSON.' };
+      : { status: 'failed' as const, revision: 0, headers, jobId: catalogJob.id, warnings: [], cellWarnings: [], error: 'Model returned invalid catalog JSON.' };
     original.catalog_state = catalog_state;
     return { ...item, status: index === 0 ? 'completed' : 'failed', result: { ...item.snapshot, status: catalog_state.status, catalog_state, error: catalog_state.error || null } };
   });
   await mode.getByRole('button', { name: 'Catalog', exact: true }).click();
   await page.getByRole('button', { name: 'View Results', exact: true }).click();
   await page.getByRole('button', { name: /SKU: 00042/ }).click();
-  await page.getByText(/Missing value for attributes__color/).waitFor();
+  await page.getByText(/Missing value for attributes__color/).first().waitFor();
+  const colorWarnings = page.getByRole('list', { name: 'Warnings for attributes__color' });
+  await colorWarnings.waitFor();
+  assert.equal(await colorWarnings.locator('..').getAttribute('data-warning'), 'true');
   await page.getByRole('cell', { name: 'TestBrand USB Hub', exact: true }).waitFor();
   assert.equal(await page.getByRole('button', { name: 'Issues Only', exact: true }).count(), 0);
   const downloadPromise = page.waitForEvent('download');
@@ -364,6 +377,7 @@ try {
   assert.equal(workbook.worksheets[0].getRow(2).getCell(5).value, '001');
   assert.equal(workbook.worksheets[0].getRow(2).getCell(8).value, 'No');
   assert.equal(workbook.worksheets[0].getRow(2).getCell(headers.indexOf('attributes__lulu_product_type') + 1).value, 'Accessory');
+  assert.match(JSON.stringify(workbook.worksheets[0].getCell(2, headers.indexOf('attributes__color') + 1).note), /Missing value/);
   await files.getByText('1 validated row(s); 1 unfinished or failed row(s) omitted from the upload.', { exact: true }).waitFor();
   await mode.getByRole('button', { name: 'QA', exact: true }).click();
   assert.equal(await page.getByText('Catalog Results per SKU', { exact: true }).count(), 0);
@@ -386,6 +400,7 @@ try {
   await page.getByRole('button', { name: 'Notifications', exact: true }).click();
   additionalRuns[combinedJob.id].catalogHeaders = headers;
   for (const item of additionalRuns[combinedJob.id].items) item.result.catalog_state.headers = headers;
+  additionalRuns[combinedJob.id].items[0].result.catalog_state.cellWarnings = [{ header: 'name', message: 'Latest saved run: review the SAP model conflict.' }];
   const combinedDownloadPromise = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Export Selected (2)', exact: true }).click();
   const combinedDownload = await combinedDownloadPromise;
@@ -394,6 +409,7 @@ try {
   assert.equal(combinedWorkbook.worksheets[0].rowCount, 3, 'Combined exports deduplicate repeated SKUs');
   assert.equal(combinedWorkbook.worksheets[0].getRow(2).getCell(1).value, '00042');
   assert.equal(combinedWorkbook.worksheets[0].getRow(3).getCell(1).value, '00044');
+  assert.match(JSON.stringify(combinedWorkbook.worksheets[0].getCell(2, headers.indexOf('name') + 1).note), /Latest saved run/);
   await mode.getByRole('button', { name: 'QA', exact: true }).click();
   await mode.getByRole('button', { name: 'Catalog', exact: true }).click();
   assert.equal(await page.getByRole('button', { name: 'Export Selected (2)', exact: true }).count(), 0, 'Mode changes clear selected jobs');
@@ -416,29 +432,33 @@ try {
   await skuRow('qa-minimal').waitFor();
   assert.deepEqual(importModes, ['catalog', 'catalog', 'catalog', 'qa'], 'QA keeps accepting its existing input format');
 
-  // One pending job can contain two sets, with two templates and one shared shipping file.
+  // One pending parent has three category subjobs and one shared shipping file.
   await mode.getByRole('button', { name: 'Catalog', exact: true }).click();
   const hubHeaders = [...headers].reverse().concat('attributes__description');
   attributeSets.push({ id: 'hub', name: 'Hub', rulesMarkdown: rules, catalogHeaders: hubHeaders, createdAt: Date.now(), updatedAt: Date.now() });
-  const multiRows = [{ ...inputRow, sku: '00050' }, { ...inputRow, sku: '00051', attributes__attribute_set: 'Hub' }];
+  const phoneHeaders = [...headers, 'attributes__capacity'];
+  attributeSets.push({ id: 'phone', name: 'Phone', rulesMarkdown: rules, catalogHeaders: phoneHeaders, createdAt: Date.now(), updatedAt: Date.now() });
+  const multiRows = [{ ...inputRow, sku: '00050' }, { ...inputRow, sku: '00051', attributes__attribute_set: 'Hub' },
+    { ...inputRow, sku: '00052', attributes__attribute_set: 'Phone' }];
   await page.locator('input[type=file]').setInputFiles({ name: 'multi.csv', mimeType: 'text/csv',
     buffer: Buffer.from(inputHeaders.join(',') + '\n' + multiRows.map(row => inputHeaders.map(header => row[header as keyof typeof row]).join(',')).join('\n')) });
   await skuRow('00051').waitFor();
   await skuRow('00050').getByRole('cell').first().click();
   await skuRow('00051').getByRole('cell').first().click();
-  await page.getByRole('button', { name: 'Create Catalog Job (2)', exact: true }).click();
-  await page.getByRole('button', { name: 'Create Catalog Job (0)', exact: true }).waitFor();
+  await skuRow('00052').getByRole('cell').first().click();
+  await page.getByRole('button', { name: 'Create Catalog Job (3)', exact: true }).click();
+  await page.getByRole('dialog', { name: 'Job details' }).waitFor();
   const multiJob = jobs.at(-1)!;
-  assert.deepEqual(multiJob.attributeSets, ['TV', 'Hub']);
+  assert.deepEqual(multiJob.attributeSets, ['TV', 'Hub', 'Phone']);
   assert.equal(multiJob.attribute_set, '');
-  await page.getByRole('button', { name: 'Jobs', exact: true }).click();
-  await page.getByText(multiJob.name, { exact: true }).waitFor();
+  await page.getByRole('heading', { name: multiJob.name, exact: true }).first().waitFor();
   const multiCard = page.locator('div').filter({ has: page.getByRole('heading', { name: multiJob.name, exact: true }) })
     .filter({ has: page.getByRole('button', { name: 'View Results', exact: true }) }).last();
-  await multiCard.getByRole('button', { name: 'View Results', exact: true }).click();
   await files.getByRole('button', { name: 'Download Hub Template', exact: true }).waitFor();
-  assert.equal(await files.getByRole('button', { name: /Download .* Template/ }).count(), 2);
+  assert.equal(await files.getByRole('button', { name: /Download .* Template/ }).count(), 3);
   assert.equal(await files.getByRole('button', { name: 'Download Shipping File', exact: true }).count(), 1);
+  assert.equal(await files.getByRole('progressbar').count(), 3);
+  await files.getByRole('region', { name: 'Category Phone', exact: true }).getByText('pending · 0 completed · 0 failed · 0 cancelled', { exact: true }).waitFor();
   const hubTemplatePromise = page.waitForEvent('download');
   await files.getByRole('button', { name: 'Download Hub Template', exact: true }).click();
   const hubTemplate = await hubTemplatePromise;
@@ -454,17 +474,18 @@ try {
       const snapshot = structuredClone(catalog.find(sku => sku.sku === id)!);
       const mapping = getCatalogMapping(snapshot.attribute_set, attributeSets);
       const input = prepareCatalogInput(snapshot, mapping, 40000);
-      const generated = parseCatalogResponse({ choices: [{ message: { content: JSON.stringify({ row: { ...input.template, name: 'Generated TV' }, warnings: [] }) } }] }, input);
-      return { sku: id, snapshot, status: index ? 'failed' : 'completed', attempts: 1,
-        result: { ...snapshot, catalog_state: { ...generated, row: index ? undefined : generated.row,
-          status: index ? 'failed' : 'completed', headers: mapping.headers, revision: 0, jobId: multiJob.id,
-          error: index ? 'Generation failed' : null } } };
+      const generated = parseCatalogResponse({ choices: [{ message: { content: JSON.stringify({ row: { ...input.template, name: `Generated ${snapshot.attribute_set}` }, warnings: [], cellWarnings: [] }) } }] }, input);
+      return { sku: id, snapshot, status: index === 1 ? 'failed' : 'completed', attempts: 1,
+        result: { ...snapshot, catalog_state: { ...generated, row: index === 1 ? undefined : generated.row,
+          status: index === 1 ? 'failed' : 'completed', headers: mapping.headers, revision: 0, jobId: multiJob.id,
+          error: index === 1 ? 'Generation failed' : null } } };
     }) };
   multiJob.status = 'failed';
   await multiCard.getByText('Last run: failed', { exact: true }).waitFor();
   attributeSets[1].catalogHeaders = [...hubHeaders].reverse();
   await multiCard.getByRole('button', { name: 'View Results', exact: true }).click();
   await files.getByRole('button', { name: 'Download TV Upload', exact: true }).waitFor();
+  await files.getByRole('region', { name: 'Category Hub', exact: true }).getByText('failed · 0 completed · 1 failed · 0 cancelled', { exact: true }).waitFor();
   assert.equal(await files.getByRole('button', { name: 'Download Hub Upload', exact: true }).count(), 0, 'No empty upload file for a failed group');
   await files.getByText('0 validated row(s); 1 unfinished or failed row(s) omitted from the upload.', { exact: true }).waitFor();
   const savedTemplatePromise = page.waitForEvent('download');
@@ -476,14 +497,14 @@ try {
   await files.getByRole('button', { name: 'Download Shipping File', exact: true }).click();
   const failedShipping = await failedShippingPromise;
   const failedShippingBook = new ExcelJS.Workbook();await failedShippingBook.xlsx.load(await readFile((await failedShipping.path())!));
-  assert.equal(failedShippingBook.worksheets[0].rowCount, 3, 'Shipping includes both successful and failed Catalog SKUs');
+  assert.equal(failedShippingBook.worksheets[0].rowCount, 4, 'One shipping file includes every category, including failed Catalog SKUs');
   const hubItem = additionalRuns[multiJob.id].items[1];
   const hubInput = prepareCatalogInput(hubItem.snapshot, { attributeSet: 'Hub', rulesMarkdown: rules, headers: hubHeaders }, 40000);
-  const hubGenerated = parseCatalogResponse({ choices: [{ message: { content: JSON.stringify({ row: { ...hubInput.template, name: 'Generated Hub' }, warnings: [] }) } }] }, hubInput);
+  const hubGenerated = parseCatalogResponse({ choices: [{ message: { content: JSON.stringify({ row: { ...hubInput.template, name: 'Generated Hub' }, warnings: [], cellWarnings: [] }) } }] }, hubInput);
   Object.assign(hubItem.result.catalog_state, hubGenerated, { status: 'completed', error: null });
   hubItem.status = 'completed'; additionalRuns[multiJob.id].status = 'completed';multiJob.status = 'completed';
   await files.getByRole('button', { name: 'Download Hub Upload', exact: true }).waitFor();
-  assert.equal(await files.getByRole('button', { name: /Download .* Upload/ }).count(), 2);
+  assert.equal(await files.getByRole('button', { name: /Download .* Upload/ }).count(), 3);
   const hubUploadPromise = page.waitForEvent('download');
   await files.getByRole('button', { name: 'Download Hub Upload', exact: true }).click();
   const hubUpload = await hubUploadPromise;
@@ -496,7 +517,7 @@ try {
   await page.getByRole('button', { name: 'Export Selected (2)', exact: true }).click();
   const selectedFiles = page.getByRole('region', { name: 'Selected Catalog files' });
   await selectedFiles.getByRole('button', { name: 'Download Hub Upload', exact: true }).waitFor();
-  assert.equal(await selectedFiles.getByRole('button', { name: /Download .* Upload/ }).count(), 2);
+  assert.equal(await selectedFiles.getByRole('button', { name: /Download .* Upload/ }).count(), 3);
   const selectedTVPromise = page.waitForEvent('download');
   await selectedFiles.getByRole('button', { name: 'Download TV Upload', exact: true }).click();
   const selectedTV = await selectedTVPromise;

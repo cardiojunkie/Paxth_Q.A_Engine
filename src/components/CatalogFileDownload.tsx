@@ -7,7 +7,7 @@ import { populateCatalogFile } from '../lib/catalogFiles';
 import { useAppContext } from '../context/AppContext';
 
 export function CatalogFileDownload({ file, filename, label, sheetName = 'Catalog' }: {
-  file: Pick<CatalogFileGroup, 'headers' | 'rows'>; filename: string; label: string; sheetName?: string;
+  file: Pick<CatalogFileGroup, 'headers' | 'rows' | 'cellWarnings'>; filename: string; label: string; sheetName?: string;
 }) {
   const { addNotification } = useAppContext();
   const download = async () => {

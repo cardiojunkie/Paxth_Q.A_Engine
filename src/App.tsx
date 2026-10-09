@@ -23,6 +23,7 @@ type ModuleType = 'dashboard' | 'scraper' | 'attribute-sets' | 'jobs' | 'llm-set
 function MainLayout() {
   const { user, sessionLoading, workspaceMode, setWorkspaceMode } = useAppContext();
   const [activeModule, setActiveModule] = useState<ModuleType>('dashboard');
+  const [createdCatalogJobId, setCreatedCatalogJobId] = useState<string>();
   const [dbStatus, setDbStatus] = useState<'checking' | 'connected' | 'disconnected' | 'error'>('checking');
 
   useEffect(() => {
@@ -89,7 +90,7 @@ function MainLayout() {
             {navItems.map((item) => (
               <button
                 key={item.id}
-                onClick={() => setActiveModule(item.id as ModuleType)}
+                onClick={() => { setCreatedCatalogJobId(undefined); setActiveModule(item.id as ModuleType); }}
                 className={cn(
                   "px-3 sm:px-4 py-2 text-[11px] uppercase tracking-widest transition-colors rounded-sm flex items-center gap-1.5",
                   activeModule === item.id 
@@ -109,7 +110,7 @@ function MainLayout() {
           
           <div role="group" aria-label="Workspace mode" className="flex rounded-sm border border-[#E5E2DE] p-1 bg-[#F5F2EF]">
             {(['qa', 'catalog'] as const).map(mode => <button key={mode} aria-pressed={workspaceMode === mode}
-              onClick={() => setWorkspaceMode(mode)}
+              onClick={() => { setCreatedCatalogJobId(undefined); setWorkspaceMode(mode); }}
               className={cn('px-3 py-1.5 text-[11px] uppercase tracking-wider rounded-sm', workspaceMode === mode ? 'bg-[#1A1A1A] text-white' : 'text-[#8C8882] hover:text-[#1A1A1A]')}>
               {mode === 'qa' ? 'QA' : 'Catalog'}
             </button>)}
@@ -119,10 +120,10 @@ function MainLayout() {
         </div>
       </nav>
       <main className="flex-1 flex overflow-hidden">
-        {activeModule === 'dashboard' && <DashboardModule />}
+        {activeModule === 'dashboard' && <DashboardModule onCatalogJobCreated={id => { setCreatedCatalogJobId(id); setActiveModule('jobs'); }} />}
         {activeModule === 'scraper' && <ScraperModule />}
         {activeModule === 'attribute-sets' && <AttributeSetsModule />}
-        {activeModule === 'jobs' && <JobsModule />}
+        {activeModule === 'jobs' && <JobsModule initialJobId={createdCatalogJobId} />}
         {activeModule === 'llm-settings' && isSystemAdmin && <LLMSettingsModule />}
         {activeModule === 'users' && isSystemAdmin && <UsersModule />}
       </main>

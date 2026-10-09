@@ -100,6 +100,68 @@ try {
   const cloudResult = await scrapeProductPage('https://8.8.8.8/product', AbortSignal.timeout(5000), { ...settings, scraperModelName: 'z-ai/glm-5.3-flash' });
   assert.deepEqual(stages, ['cloud', 'model', 'model'], 'Cleanup retries retain the original cloud Markdown and release retrieval admission');
   assert.equal(cloudResult.method, 'cloud'); assert.equal(cloudResult.finalUrl, null); assert.equal(cloudResult.capturedAt, null);
+  const fallbackRequests: any[] = [];
+  let fallbackCollections = 0;
+  globalThis.fetch = async (_destination, init) => {
+    const input = JSON.parse(init!.body as string); fallbackRequests.push(input);
+    assert.equal(JSON.parse(input.messages[1].content).content, fullMarkdown);
+    assert.doesNotMatch(init!.body as string, /cloud-only-key|private-test-key|Private QA/);
+    assert.equal(new Headers(init?.headers).get('Authorization'), 'Bearer private-test-key');
+    return input.model === DEFAULT_SETTINGS.scraperModelName ? Response.json({}, { status: 500 }) : response();
+  };
+  const fallbackResult = await scrapeProductPage(url, AbortSignal.timeout(5000), { ...settings, scraperModelName: DEFAULT_SETTINGS.scraperModelName }, async () => {
+    fallbackCollections++; return { ...page, markdown: fullMarkdown };
+  });
+  assert.deepEqual(fallbackRequests.map(input => input.model), [DEFAULT_SETTINGS.scraperModelName, DEFAULT_SETTINGS.scraperModelName, DEFAULT_SETTINGS.modelName]);
+  assert.equal(fallbackCollections, 1, 'A model outage never repeats cloud collection');
+  assert.equal(fallbackResult.modelName, DEFAULT_SETTINGS.modelName, 'Evidence records the actual backup model');
+  assert.equal(fallbackResult.report.warnings.at(-1)?.code, 'MODEL_FALLBACK');
+  assert.equal(fallbackRequests[0].reasoning_effort, 'low');
+  assert.ok(!('reasoning_effort' in fallbackRequests[2]));
+  fallbackRequests.length = 0;
+  globalThis.fetch = async (_destination, init) => {
+    const input = JSON.parse(init!.body as string); fallbackRequests.push(input);
+    return input.model === settings.scraperModelName ? Response.json({}, { status: 503 }) : response();
+  };
+  assert.equal((await scrapeProductPage(url, AbortSignal.timeout(5000), settings, collect)).modelName, DEFAULT_SETTINGS.scraperModelName);
+  assert.deepEqual(fallbackRequests.map(input => input.model), [settings.scraperModelName, settings.scraperModelName, DEFAULT_SETTINGS.scraperModelName]);
+  assert.equal(fallbackRequests[2].reasoning_effort, 'low', 'A GLM backup also receives low effort');
+  for (const status of [400, 401, 402, 403, 429]) {
+    let calls = 0;
+    globalThis.fetch = async () => { calls++; return Response.json({ error: 'private-test-key' }, { status }); };
+    await assert.rejects(scrapeProductPage(url, AbortSignal.timeout(5000), settings, collect), error => error instanceof ScrapeError && error.code === 'CONVERSION_FAILED' && !error.message.includes('private-test-key'));
+    assert.equal(calls, status === 429 ? 2 : 1, 'Configuration, billing and rate-limit errors never switch models');
+  }
+  let unavailableCalls = 0;
+  globalThis.fetch = async () => { unavailableCalls++; return Response.json({}, { status: 500 }); };
+  await assert.rejects(scrapeProductPage(url, AbortSignal.timeout(5000), settings, collect), { code: 'CONVERSION_FAILED' });
+  assert.equal(unavailableCalls, 3, 'Both models failing cannot exceed the existing three-request limit');
+  const timeout = AbortSignal.timeout;
+  AbortSignal.timeout = ms => timeout(ms === 60_000 ? 20 : ms);
+  const timedModels: string[] = [];
+  globalThis.fetch = async (_destination, init) => {
+    const input = JSON.parse(init!.body as string); timedModels.push(input.model);
+    return input.model === settings.scraperModelName ? new Response(new ReadableStream({ start() {} })) : response();
+  };
+  try {
+    const recovered = await scrapeProductPage(url, timeout(5000), settings, collect);
+    assert.equal(recovered.modelName, DEFAULT_SETTINGS.scraperModelName);
+    assert.deepEqual(timedModels, [settings.scraperModelName, DEFAULT_SETTINGS.scraperModelName], 'A stalled primary leaves time for its backup');
+    let rateLimitedCalls = 0;
+    globalThis.fetch = async () => { rateLimitedCalls++; return Response.json({}, { status: 429, headers: { 'Retry-After': '1' } }); };
+    await assert.rejects(scrapeProductPage(url, timeout(5000), settings, collect), error => error instanceof ScrapeError && error.status === 429 && error.code === 'CONVERSION_FAILED');
+    assert.equal(rateLimitedCalls, 1, 'A rate-limit delay exceeding the primary deadline never switches models');
+    const cleanupDeadline = new AbortController();
+    AbortSignal.timeout = ms => ms === 120_000 ? cleanupDeadline.signal : timeout(ms === 60_000 ? 20 : ms);
+    globalThis.fetch = async (_destination, init) => {
+      const input = JSON.parse(init!.body as string);
+      if (input.model === settings.scraperModelName) return new Response(new ReadableStream({ start() {} }));
+      cleanupDeadline.abort();
+      assert.ok(init!.signal!.aborted, 'The backup shares the original cleanup deadline');
+      return response();
+    };
+    await assert.rejects(scrapeProductPage(url, timeout(5000), settings, collect), { code: 'CONVERSION_TIMEOUT' });
+  } finally { AbortSignal.timeout = timeout; }
 } finally {
   clearInterval(keepAlive); globalThis.fetch = originalFetch;
   if (originalUrl === undefined) delete process.env.LLM_BASE_URL; else process.env.LLM_BASE_URL = originalUrl;

@@ -32,7 +32,7 @@ let calls=0, providerMode='success';
 const providerRequests:any[]=[];
 const conversionRequests:any[]=[];
 const scrapeRequests:string[]=[];
-let scrapeBlocked=false, scrapePartial=false, conversionFailed=false;
+let scrapeBlocked=false, scrapePartial=false, conversionFailed=false, conversionUnavailable=false;
 let duringScrape: (()=>Promise<void>) | undefined;
 const collect=async(rawUrl:string, signal:AbortSignal):Promise<ScrapePreview>=>{
   const {url}=validateScrapeInput({url:rawUrl});signal.throwIfAborted();scrapeRequests.push(url);
@@ -50,6 +50,7 @@ const provider=createServer(async(req,res)=>{
     conversionRequests.push(payload);
     const evidence=JSON.parse(payload.messages[1].content);
     res.setHeader('Content-Type','application/json');
+    if(conversionUnavailable && payload.model===DEFAULT_SETTINGS.scraperModelName){res.writeHead(500);res.end('{}');return;}
     if(conversionFailed){res.end(JSON.stringify({choices:[{finish_reason:'length',message:{content:'Incomplete conversion'}}]}));return;}
     res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:evidence.content}}]}));return;
   }
@@ -68,7 +69,7 @@ const provider=createServer(async(req,res)=>{
     const row = { ...catalogInput.template, name: 'TestBrand USB Hub', attributes__fallback: 'No',
       ...Object.fromEntries(CATALOG_PASS_THROUGH_HEADERS.map(header=>[header,'MODEL MUST NOT CHANGE THIS'])) };
     const result = providerMode === 'catalog-mixed' && ['cat-b','multi-b'].includes(catalogInput.sku)
-      ? { row: { sku: catalogInput.sku }, warnings: [] } : { row, warnings: [] };
+      ? { row: { sku: catalogInput.sku }, warnings: [], cellWarnings: [] } : { row, warnings: [], cellWarnings: [{ header: 'name', message: 'Review the generated name against SAP product identity.' }] };
     res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify(result)}}],usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}}));return;
   }
   if(payload.search_domain_filter) {
@@ -234,6 +235,21 @@ try {
   const preserved=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='scrape-check');
   assert.equal(preserved.scraped_markdown,scraped.body.scraped_markdown);assert.equal(preserved.revision,1);
   assert.deepEqual(preserved.scrape_metadata,scraped.body.scrape_metadata);
+  await request('/api/catalog','POST',[{...sku('fallback-check'),source:{url:'https://8.8.8.8/fallback'}}],user);
+  conversionUnavailable=true;
+  const beforeFallbackCollection=scrapeRequests.length;
+  const fallbackSaved=await request('/api/catalog/fallback-check/scrape','POST',{expectedRevision:0},user);
+  assert.equal(fallbackSaved.status,200);assert.equal(fallbackSaved.body.revision,1);
+  assert.equal(scrapeRequests.length,beforeFallbackCollection+1,'A saved fallback makes one collection');
+  assert.equal(fallbackSaved.body.scrape_metadata.modelName,DEFAULT_SETTINGS.modelName);
+  conversionFailed=true;
+  const fallbackFailed=await request('/api/catalog/fallback-check/scrape','POST',{expectedRevision:1},user);
+  conversionUnavailable=false;conversionFailed=false;
+  assert.equal(fallbackFailed.status,502);assert.equal(fallbackFailed.body.code,'CONVERSION_FAILED');
+  const fallbackPreserved=(await request('/api/catalog','GET',undefined,user)).body.find((row:any)=>row.sku==='fallback-check');
+  assert.equal(fallbackPreserved.revision,1);assert.equal(fallbackPreserved.scraped_markdown,fallbackSaved.body.scraped_markdown);
+  assert.deepEqual(fallbackPreserved.scrape_metadata,fallbackSaved.body.scrape_metadata,'A refused/truncated backup cannot overwrite saved evidence');
+  await pool.query("DELETE FROM sku_data WHERE sku='fallback-check'");
   scrapePartial=true;
   const partialPreview=await request('/api/scrape/preview','POST',{url:'https://8.8.8.8/product?variant=42'},user);
   assert.equal(partialPreview.status,200);assert.equal(partialPreview.body.status,'partial');
@@ -564,6 +580,7 @@ try {
   const beforeCatalog=await unchangedQa();
   const startCatalog=(mode='unfinished',selectedSku?:string,id='catalog-job')=>request(`/api/jobs/${id}/runs`,'POST',
     {requestId:randomUUID(),mode,...(selectedSku?{sku:selectedSku}:{})},user);
+  assert.equal((await request('/api/provider-settings','PUT',configured,admin)).status,200);
   const firstCatalog=await startCatalog();assert.equal(firstCatalog.status,202);
   assert.equal(firstCatalog.body.jobType,'catalog');assert.deepEqual(firstCatalog.body.catalogHeaders,catalogHeaders);
   await saveCatalogRules(catalogRules.replace('USB Hub','Changed Mapping Example'),[...catalogHeaders].reverse());
@@ -577,6 +594,7 @@ try {
   assert.ok(providerRequests[catalogOffset].messages[0].content.includes(catalogRules),'Mapping updates do not change admitted runs');
   assert.deepEqual(await unchangedQa(),beforeCatalog,'Catalog commits never overwrite QA state or original upload data');
   assert.equal((await pool.query("SELECT status FROM jobs WHERE id='catalog-job'")).rows[0].status,'completed');
+  assert.ok(providerRequests.slice(catalogOffset).every(payload=>payload.reasoning_effort==='none'),'DeepSeek Catalog disables thinking while QA retains low effort');
   for(const item of generatedCatalog.items) {
     assert.equal(item.result.catalog_state.row.attributes__lulu_ean,'0001234567890');
     assert.equal(item.result.catalog_state.row.attributes__Shipping_Attribute,'001');
@@ -587,6 +605,8 @@ try {
     for(const header of ['attributes__shipping_weight','attributes__brand']) assert.equal(item.result.catalog_state.row[header],'','Blank pass-through values remain blank despite model changes');
     assert.equal(item.result.catalog_state.row.attributes__lulu_product_type,item.sku==='cat-a'?' 000Legacy Hub ':'','Renamed product types preserve legacy values and blanks despite model changes');
     assert.ok(item.result.catalog_state.warnings.some((warning:string)=>warning.includes('attributes__color')));
+    assert.ok(item.result.catalog_state.cellWarnings.some((warning:any)=>warning.header==='attributes__color'));
+    assert.ok(item.result.catalog_state.cellWarnings.some((warning:any)=>warning.header==='name'&&warning.message.includes('SAP')));
     assert.equal(item.result.qa_result,undefined);
   }
   await saveCatalogRules(catalogRules,catalogHeaders);
@@ -601,6 +621,14 @@ try {
   providerMode='success';stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await catalogRun(legacyPassThrough.body.id)).status==='completed','catalog legacy pass-through correction');
   await stopWorker();stopWorker=undefined;
+  await pool.query("UPDATE job_run_items SET result=result #- '{catalog_state,cellWarnings}' WHERE run_id=$1 AND sku='cat-a'",[legacyPassThrough.body.id]);
+  const legacyCellFindings=await startCatalog();
+  assert.deepEqual(legacyCellFindings.body.items.map((item:any)=>item.status),['queued','skipped'],'Rows without structured cell findings regenerate once');
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(legacyCellFindings.body.id)).status==='completed','catalog legacy cell findings regeneration');
+  await stopWorker();stopWorker=undefined;
+  assert.ok(Array.isArray((await catalogRun(legacyCellFindings.body.id)).items[0].result.catalog_state.cellWarnings));
+  assert.equal((await catalogRun(legacyPassThrough.body.id)).items[0].result.catalog_state.cellWarnings,undefined,'Legacy history stays readable and unchanged');
   await saveCatalogRules(catalogRules,[...catalogHeaders].reverse());
   const reorderedCatalog=await startCatalog();assert.ok(reorderedCatalog.body.items.every((item:any)=>item.status==='queued'),'Header-only changes invalidate completed result reuse');
   providerMode='success';stopWorker=startJobWorker(pool,scrape);
@@ -751,6 +779,39 @@ try {
   providerMode='success';stopWorker=startJobWorker(pool,scrape);
   await waitFor(async()=>(await catalogRun(groupResume.body.id)).status==='completed','group cancelled-row resume');
   await stopWorker();stopWorker=undefined;
+
+  const phoneHeaders=[...catalogHeaders,'attributes__capacity'];
+  assert.equal((await request('/api/attribute-sets','POST',{name:'Phone',rulesMarkdown:catalogRules,catalogHeaders:phoneHeaders},admin)).status,201);
+  assert.equal((await request('/api/catalog?mode=catalog','POST',[shippingSku('three-tv','TestSet'),shippingSku('three-hub','Hub'),shippingSku('three-phone','Phone')],user)).status,200);
+  const beforeThreeCalls=calls,beforeThreeScrapes=scrapeRequests.length;
+  const threeJob={id:'three-category-job',name:'Three categories',jobType:'catalog',skus:['three-tv','three-hub','three-phone']};
+  assert.equal((await request('/api/jobs','POST',threeJob,user)).status,201);
+  assert.equal(calls,beforeThreeCalls);assert.equal(scrapeRequests.length,beforeThreeScrapes,'Creation makes no paid requests');
+  const threePrepared=(await request('/api/jobs/three-category-job/outputs','GET',undefined,user)).body;
+  assert.equal(threePrepared.groups.length,3);
+  assert.deepEqual(threePrepared.groups.map((group:any)=>group.rows.map((row:any)=>row.sku)),[['three-tv'],['three-hub'],['three-phone']]);
+  assert.deepEqual(threePrepared.shipping.rows.map((row:any)=>row.sku),threeJob.skus);
+  assert.equal(threePrepared.shipping.headers.length,16);
+  const threeRun=await startCatalog('all',undefined,threeJob.id);assert.equal(threeRun.status,202);
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(threeRun.body.id)).status==='completed','three-category parent execution');
+  await stopWorker();stopWorker=undefined;
+  const threeCompleted=await catalogRun(threeRun.body.id);
+  assert.equal(threeCompleted.catalogGroups.length,3);
+  assert.equal(threeCompleted.items.filter((item:any)=>item.result.catalog_state.status==='completed').length,3);
+  assert.deepEqual(threeCompleted.items[2].result.catalog_state.headers,phoneHeaders);
+  assert.equal(threeCompleted.catalogOutputs.shipping.rows.length,3);
+  assert.ok(threeCompleted.items.every((item:any)=>Array.isArray(item.result.catalog_state.cellWarnings)));
+  assert.equal((await request('/api/provider-settings','PUT',{...configured,modelName:'custom/catalog'},admin)).status,200);
+  const customCatalogOffset=providerRequests.length;
+  const customCatalogRun=await startCatalog('single','three-phone',threeJob.id);assert.equal(customCatalogRun.status,202);
+  stopWorker=startJobWorker(pool,scrape);
+  await waitFor(async()=>(await catalogRun(customCatalogRun.body.id)).status==='completed','custom Catalog model execution');
+  await stopWorker();stopWorker=undefined;
+  assert.equal(providerRequests[customCatalogOffset].model,'custom/catalog');
+  assert.equal(providerRequests[customCatalogOffset].reasoning_effort,undefined,'Custom models receive no DeepSeek-specific reasoning option');
+  assert.equal((await request('/api/provider-settings','PUT',configured,admin)).status,200);
+  assert.equal((await request('/api/jobs/three-category-job','DELETE',undefined,admin)).status,200);
 
   // Legacy regionless and mixed-region definitions can still generate Catalog files.
   await pool.query("INSERT INTO jobs(id,name,created_at,job_type,attribute_set,skus) VALUES('legacy-shipping','Legacy', $1,'catalog','Hub',$2)",[new Date().toISOString(),JSON.stringify(['multi-missing','multi-qtr'])]);

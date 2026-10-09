@@ -148,7 +148,7 @@ export function registerJobRunRoutes(app: Express, pool: Pool) {
           const previous = priorBySku.get(sku);
           const mapping = prepared?.mappings.find(mapping => mapping.attributeSet === snapshot.attribute_set);
           const previousMapping = previous && catalogMappings(previous.configuration).find(mapping => mapping.attributeSet === snapshot.attribute_set);
-          const catalogResult = previous?.result && previousMapping?.rulesMarkdown === mapping?.rulesMarkdown &&
+          const catalogResult = previous?.result && Array.isArray(previous.result.catalog_state?.cellWarnings) && previousMapping?.rulesMarkdown === mapping?.rulesMarkdown &&
             previous.result.attribute_set === snapshot.attribute_set &&
             previousMapping?.attributeSet === mapping?.attributeSet &&
             JSON.stringify(previousMapping?.headers) === JSON.stringify(mapping?.headers) &&
@@ -331,7 +331,10 @@ async function executeRun(client: PoolClient, pool: Pool, run: any, owner: strin
       const input = isCatalog
         ? prepareCatalogInput(snapshot, catalogMappingFor(run.configuration, snapshot.attribute_set), settings.maxPageContentLength)
         : prepareQaInput(snapshot, run.configuration.attributeSets, run.configuration.qaAgentMemory, settings.maxPageContentLength);
-      const response = await completeQa(buildQaRequest(settings, input).payload, execution, {
+      const payload = buildQaRequest(settings, input).payload;
+      // DeepSeek thinking produced 30-second gateway failures for catalog rows; QA keeps its existing effort.
+      if (isCatalog && payload.model === 'deepseek/deepseek-v4.1-flash') payload.reasoning_effort = 'none';
+      const response = await completeQa(payload, execution, {
         taskLabel: isCatalog ? 'Catalog' : 'QA',
         attempts: item.attempts,
         lastError: item.error,
